@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.4...3.18)
+project(compute)
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
+find_package(pybind11 REQUIRED)
+pybind11_add_module(compute compute.cpp)
