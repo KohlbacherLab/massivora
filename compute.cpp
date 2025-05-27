@@ -1,13 +1,138 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <pybind11/eigen.h>
+#include <Eigen/Dense>
+#include <unsupported/Eigen/CXX11/Tensor>
+
+#include <iostream>
 #include <string>
 #include <vector>
 #include <thread>
-#include <iostream>
+#include <chrono>
+#include <omp.h>
 
 namespace py = pybind11;
+using PLMV = double;
 
-py::array_t<char[1]> numpylize_alignment(const std::string& alignment, size_t seq_length, size_t align_length) {
+
+Eigen::VectorXf getEnergies(
+    const Eigen::VectorXf& x,
+    int r,
+    int q, 
+    int N,
+    int b,
+    const Eigen::MatrixXi& MSA) {
+
+    Eigen::VectorXf energies = Eigen::VectorXf::Zero(q);
+
+    Eigen::Map<const Eigen::VectorXf> h(x.data(), q);
+    Eigen::TensorMap<const Eigen::Tensor<float, 3>> Jr(x.data() + q, q, q, N-1);
+
+    // #pragma omp parallel for
+    for (int l = 0; l < q; l++) {
+        PLMV sum_Jri = 0.0;
+
+        for (int i = 0; i < r; i++) {
+            int k = MSA(b, i);
+            sum_Jri += Jr(l, k, i);
+        }
+        for (int i = r + 1; i < N; i++) {
+            int k = MSA(b, i);
+            sum_Jri += Jr(l, k, i-1);
+        }
+
+        energies(l) = h(l) + sum_Jri;
+    }
+
+    return energies;
+}
+
+PLMV mergeEnergyTerm(const Eigen::VectorXf& energies) {
+    PLMV max = energies.maxCoeff();
+    return max + std::log((energies.array() - max).exp().sum());
+}
+
+PLMV l2Regularization(
+    const Eigen::VectorXf& vec, 
+    int q,
+    PLMV lambdaH,
+    PLMV lambdaJ) {
+
+    PLMV reg_h = vec.head(q).array().square().sum() * lambdaH;
+    PLMV reg_J = vec.tail(vec.size() - q).array().square().sum() * 0.5 * lambdaJ;
+
+    return reg_h + reg_J;
+}
+
+std::tuple<PLMV, Eigen::VectorXf> perSitePllGradient(
+    const Eigen::VectorXf& x, 
+    int r,
+    int q,
+    int N,
+    int B,
+    const Eigen::MatrixXi& MSA,
+    const Eigen::VectorXf& W,
+    PLMV lambdaH,
+    PLMV lambdaJ) {
+
+    PLMV pll = 0.0;
+    Eigen::VectorXf gradients = Eigen::VectorXf::Zero(x.size());
+    Eigen::TensorMap<Eigen::Tensor<float, 3>> Tgradients(gradients.data() + q, q, q, N - 1);
+
+    #pragma omp parallel for
+    for (int b = 0; b < B; b++) {
+        Eigen::VectorXf energies = getEnergies(x, r, q, N, b, MSA);
+        PLMV lnorm = mergeEnergyTerm(energies);
+        pll -= W(b) * (energies(MSA(b, r)) - lnorm);
+        
+        Eigen::VectorXf Ps = energies.array() - lnorm;
+        Ps = Ps.array().exp();
+        
+        for (int s = 0; s < q; s++) {
+            int indicator = (s == MSA(b, r)) ? 1 : 0;
+            gradients(s) -= W(b) * (indicator - Ps(s));
+        }
+        for (int i = 0; i < r; i++) {
+            int s_ib = MSA(b, i);
+            for (int s = 0; s < q; s++) {
+                int indicator = (s == MSA(b, r)) ? 1 : 0;
+                Tgradients(s, s_ib, i) -= W(b) * (indicator - Ps(s));
+            }
+        }
+        for (int i = r+1; i < N; i++) {
+            int s_ib = MSA(b, i);
+            for (int s = 0; s < q; s++) {
+                int indicator = (s == MSA(b, r)) ? 1 : 0;
+                Tgradients(s, s_ib, i-1) -= W(b) * (indicator - Ps(s));
+            }
+        }
+    }
+
+    gradients.head(q) = 2.0f * lambdaH * x.head(q);
+    gradients.tail(x.size() - q) = lambdaJ * x.tail(x.size() - q);
+
+    pll += l2Regularization(x, q, lambdaH, lambdaJ);
+    return std::make_tuple(pll, gradients);
+}
+
+void applyIsingGauge(Eigen::MatrixXf& J, int q) {
+    // Iterate over each site
+    for (int i = 0; i < J.rows(); i=i+q*q) {
+        Eigen::Map<Eigen::MatrixXf> Jij = Eigen::Map<Eigen::MatrixXf>(J.data() + i, q, q);
+        Eigen::VectorXf row_mean = Jij.rowwise().mean();
+        Eigen::VectorXf col_mean = Jij.colwise().mean();
+        double total_mean = row_mean.mean();
+
+        // Apply Ising gauge transformation
+        for (int k = 0; k < q; ++k) {
+            for (int l = 0; l < q; ++l) {
+                Jij(k, l) = Jij(k, l) - row_mean(k) - col_mean(l) + total_mean;
+            }
+        }
+    }
+}
+
+py::array_t<char[1]> getAlignmentInNumpy(const std::string& alignment, size_t seq_length, size_t align_length) {
     py::array_t<char[1]> result({align_length, seq_length});
     auto buf = result.request();
     char* ptr = static_cast<char*>(buf.ptr);
@@ -38,6 +163,19 @@ py::array_t<char[1]> numpylize_alignment(const std::string& alignment, size_t se
 }
 
 PYBIND11_MODULE(compute, m) {
-    m.def("numpylize_alignment", &numpylize_alignment);
+    m.def("getAlignmentInNumpy", &getAlignmentInNumpy);
+    m.def("perSitePllGradient", &perSitePllGradient,
+        py::arg("x"),
+        py::arg("r"),
+        py::arg("q"),
+        py::arg("N"),
+        py::arg("B"),
+        py::arg("MSA"),
+        py::arg("W"),
+        py::arg("lambdaH"),
+        py::arg("lambdaJ"));
+    m.def("applyIsingGauge", &applyIsingGauge,
+        py::arg("J"),
+        py::arg("q"));
 }
 
