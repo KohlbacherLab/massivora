@@ -105,11 +105,15 @@ class TextAlignment(MultipleSeqAlignment):
 
     def Get_Numpy_Array(self, mapped=False, string=None):
         if not string: string = ''.join([str(record.seq) for record in self])
-        matrix = compute.numpylize_alignment(string, self.sequenceLength, self.sequenceCount)
+        matrix = compute.getAlignmentInNumpy(string, self.sequenceLength, self.sequenceCount)
         if mapped:
+            # First change all the '.' to '-'
+            matrix[matrix == b'.'] = b'-'
+            # Then map the characters to numbers
+            # All the invalid characters are mapped to 21
             mapping = np.full(128, 21, dtype=np.uint8)
-            valid_chars = 'ACDEFGHIKLMNPQRSTVWY'
-            values = np.arange(1, 21, dtype=np.uint8)
+            valid_chars = 'ACDEFGHIKLMNPQRSTVWY-'
+            values = np.arange(0, 21, dtype=np.uint8)
             for char, value in zip(valid_chars, values): mapping[ord(char)] = value
             ascii_codes = np.frombuffer(matrix.tobytes(), dtype=np.uint8)
             mapped_flat = mapping[ascii_codes]
@@ -117,6 +121,9 @@ class TextAlignment(MultipleSeqAlignment):
         return matrix
 
     def Filtering_MSA_Gap(self, row_keep_percentage, col_keep_percentage):
+        # NOTE: this function is not going to filter out the invalid characters
+        # The invalid characters are only removed when converting to zarr
+        
         row_keep_percentage /= 100
         col_keep_percentage /= 100
         logger.debug("Calculate columns to keep")
@@ -135,9 +142,15 @@ class TextAlignment(MultipleSeqAlignment):
         L = matrix.shape[0]
         logger.debug("Calculate columns to lowercase")
         col_ratios = np.sum(matrix == b'-', axis=0) / L
-        col_indices_to_lowercase = np.where(col_ratios >= col_keep_percentage)[0]
-        for col_idx in col_indices_to_lowercase:
-            matrix[:, col_idx] = np.char.lower(matrix[:, col_idx])
+        cols_to_keep = np.where(col_ratios < col_keep_percentage)[0]
+        self.saved_columns = cols_to_keep
+        matrix = matrix[:, cols_to_keep]
+        ############
+        # The EVcouplings version: make the invalid columns lowercase and remove them in PLMC
+        # col_indices_to_lowercase = np.where(col_ratios >= col_keep_percentage)[0]
+        # for col_idx in col_indices_to_lowercase:
+        #     matrix[:, col_idx] = np.char.lower(matrix[:, col_idx])
+        ############
         logger.debug("Reconstructing alignment")
         for i in sorted(indices_to_delete, reverse=True):
             del self._records[i]
@@ -269,6 +282,16 @@ class TextAlignment(MultipleSeqAlignment):
         logger.info(f'Alignment merged: {len(merged)} sequences, {len(merged[0])} positions')
         return TextAlignment(merged)
 
+    def Downsample_Randomly(self, to):
+        if to >= self.sequenceCount:
+            logger.error(f"Downsampling to {to} is not possible, as the alignment has only {self.sequenceCount} sequences")
+            return
+        chosen_indices = np.random.choice(range(1, self.sequenceCount), to-1, replace=False)
+        chosen_indices = np.insert(chosen_indices, 0, 0)
+        chosen_records = [self._records[i] for i in chosen_indices]
+        super().__init__(chosen_records)
+        self._update_info()
+
     def To_Zarr(self, filename=None):
         if not filename: filename = f'{self.alignmentName}'
         species_list = ['Query']
@@ -304,10 +327,14 @@ class TextAlignment(MultipleSeqAlignment):
             species_list.append(species)
             p_seq += sequence_count
         matrix = self.Get_Numpy_Array(mapped=True, string=tempstr)
+        # Remove invalid characters from the alignment
+        rows_to_keep = np.max(matrix, axis=1) <= 20
+        matrix = matrix[rows_to_keep]
         z = zarr.create_array(store=filename,shape=(self.sequenceCount, self.sequenceLength), dtype='uint8')
         metadata = {
             'species_list': species_list, 
-            'species_index_map': species_index_map
+            'species_index_map': species_index_map,
+            'saved_columns': list(self.saved_columns)
         }
         with open(os.path.join(filename, 'metadata.pkl'), 'wb') as f:
             pickle.dump(metadata, f)
@@ -319,6 +346,7 @@ class ZarrAlignment(object):
         self.matrix = np.zeros((0, 0), dtype=np.uint8)
         self.metadata = {}
         self.species_list_map = {}
+        self.saved_columns = []
 
         if isinstance(filename, str):
             try:
@@ -333,6 +361,7 @@ class ZarrAlignment(object):
                 logger.error(f"Error loading Zarr file {filename}, {e}")
                 raise FileNotFoundError(f"Error loading Zarr file {filename}")
             self.species_list_map = {species: i for i, species in enumerate(self.metadata['species_list'])}
+            self.saved_columns = self.metadata.get('saved_columns', [])
 
     def __repr__(self):
         return "<%s instance (%i records of length %i) at %x>" % (
@@ -378,20 +407,28 @@ if __name__ == '__main__':
     FORMAT = '%(asctime)s %(levelname)s From %(name)s: %(message)s'
     logging.basicConfig(format=FORMAT, stream=sys.stderr, level=logging.DEBUG)
 
-    start_time = time.time()
-    alignment1 = TextAlignment("/Users/simon/research/EVcouplings/test_run/MSA/MYC_HUMAN_1-454_b0.2/align/MYC_HUMAN_1-454_b0.2.sto")
-    alignment1.Filtering_MSA_Gap(50, 50)
-    alignment2 = TextAlignment("/Users/simon/research/EVcouplings/test_run/MSA/S15A1_HUMAN_1-708_b0.2/align/S15A1_HUMAN_1-708_b0.2.sto")
-    alignment2.Filtering_MSA_Gap(50, 50)
-    logger.info(f"Time taken for reducing: {time.time() - start_time:.2f}s")
-    start_time = time.time()
-    merged_alignment = alignment1 + alignment2
-    matrix = merged_alignment.Get_Numpy_Array(mapped=True)
-    logger.info(f"Time taken for concatenating: {time.time() - start_time:.2f}s")
+    # start_time = time.time()
+    # alignment1 = TextAlignment("/Users/simon/research/EVcouplings/test_run/MSA/MYC_HUMAN_1-454_b0.2/align/MYC_HUMAN_1-454_b0.2.sto")
+    # alignment1.Filtering_MSA_Gap(50, 50)
+    # alignment2 = TextAlignment("/Users/simon/research/EVcouplings/test_run/MSA/S15A1_HUMAN_1-708_b0.2/align/S15A1_HUMAN_1-708_b0.2.sto")
+    # alignment2.Filtering_MSA_Gap(50, 50)
+    # logger.info(f"Time taken for reducing: {time.time() - start_time:.2f}s")
+    # start_time = time.time()
+    # merged_alignment = alignment1 + alignment2
+    # matrix = merged_alignment.Get_Numpy_Array(mapped=True)
+    # logger.info(f"Time taken for concatenating: {time.time() - start_time:.2f}s")
     
     # for d in os.listdir('/Users/simon/Dev/EVsnap/ecoli'):
     #     align = ZarrAlignment(f'/Users/simon/Dev/EVsnap/ecoli/{d}')
 
-    # align = TextAlignment("/Users/simon/research/EVcouplings/test_run/MSA/S15A1_HUMAN_1-708_b0.2/align/S15A1_HUMAN_1-708_b0.2.sto")
+    align = TextAlignment("/Users/simon/research/EVcouplings/MSA_subset_evaluation/PDXH_ECOLI_1-218_b0.5.a2m")
+
+    matrix = align.Get_Numpy_Array(mapped=True)
+    
+
+
+    print(matrix.shape)
     # align.Filtering_MSA_Gap(50, 50)
     # align.Filtering_MSA_Identity(0.8)
+    # align.Downsample_Randomly(10000)
+    # SeqIO.write(align, "PF00028_10k.fasta", "fasta")
