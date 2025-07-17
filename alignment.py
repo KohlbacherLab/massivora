@@ -111,11 +111,11 @@ class TextAlignment(MultipleSeqAlignment):
             matrix[matrix == b'.'] = b'-'
             # Then map the characters to numbers
             # All the invalid characters are mapped to 21
-            mapping = np.full(128, 21, dtype=np.uint8)
-            valid_chars = 'ACDEFGHIKLMNPQRSTVWY-'
-            values = np.arange(0, 21, dtype=np.uint8)
+            mapping = np.full(128, 21, dtype=np.int8)
+            valid_chars = 'acdefghiklmnpqrstvwyACDEFGHIKLMNPQRSTVWY-'
+            values = np.arange(-20, 21, dtype=np.int8)
             for char, value in zip(valid_chars, values): mapping[ord(char)] = value
-            ascii_codes = np.frombuffer(matrix.tobytes(), dtype=np.uint8)
+            ascii_codes = np.frombuffer(matrix.tobytes(), dtype=np.int8)
             mapped_flat = mapping[ascii_codes]
             matrix = mapped_flat.reshape(matrix.shape)
         return matrix
@@ -327,10 +327,10 @@ class TextAlignment(MultipleSeqAlignment):
             species_list.append(species)
             p_seq += sequence_count
         matrix = self.Get_Numpy_Array(mapped=True, string=tempstr)
-        # Remove invalid characters from the alignment
+        # Remove sequences with invalid characters from the alignment
         rows_to_keep = np.max(matrix, axis=1) <= 20
         matrix = matrix[rows_to_keep]
-        z = zarr.create_array(store=filename,shape=(self.sequenceCount, self.sequenceLength), dtype='uint8')
+        z = zarr.create_array(store=filename,shape=(self.sequenceCount, self.sequenceLength), dtype='int8')
         metadata = {
             'species_list': species_list, 
             'species_index_map': species_index_map,
@@ -343,7 +343,7 @@ class TextAlignment(MultipleSeqAlignment):
 
 class ZarrAlignment(object):
     def __init__(self, filename=None):
-        self.matrix = np.zeros((0, 0), dtype=np.uint8)
+        self.matrix = np.zeros((0, 0), dtype=np.int8)
         self.metadata = {}
         self.species_list_map = {}
         self.saved_columns = []
@@ -378,7 +378,7 @@ class ZarrAlignment(object):
         common_species = set(self.metadata['species_list']) & set(other.metadata['species_list'])
 
         new_instance = ZarrAlignment()
-        new_instance.matrix = np.zeros((len(common_species), self.matrix.shape[1] + other.matrix.shape[1]), dtype=np.uint8)
+        new_instance.matrix = np.zeros((len(common_species), self.matrix.shape[1] + other.matrix.shape[1]), dtype=np.int8)
         new_instance.metadata = {
             'species_list': list(common_species),
             'species_index_map': list(range(len(common_species)))
@@ -427,8 +427,8 @@ if __name__ == '__main__':
     
 
 
-    print(matrix.shape)
-    # align.Filtering_MSA_Gap(50, 50)
-    # align.Filtering_MSA_Identity(0.8)
+    align.Filtering_MSA_Gap(50, 50)
+    align.Filtering_MSA_Identity(0.8)
+    print(align.Get_Numpy_Array(mapped=True).shape)
     # align.Downsample_Randomly(10000)
     # SeqIO.write(align, "PF00028_10k.fasta", "fasta")
