@@ -82,6 +82,8 @@ class BaseBenchmarker(object):
         return data
 
     def TruePositiveCount(self, interface, couplings):
+        if not couplings:
+            return 0
         TP = 0
         for pos1, pos2 in couplings.keys():
             if f'{pos1}' in interface.index and f'{pos2}' in interface.columns:
@@ -93,6 +95,8 @@ class BaseBenchmarker(object):
         return new_cp / baseline_cp
 
     def TruePositiveRate(self, nTP, nCouplings):
+        if not nCouplings:
+            return 0
         return nTP / nCouplings
 
     def BenchmarkIndex(self, TPRfull, TPR):
@@ -123,7 +127,9 @@ class MonomerBenchmarker(BaseBenchmarker):
         else:
             self.raw_couplings = {}
         self.positive_couplings = self.AnalyzeCouplings()
-        if not self.positive_couplings: raise RuntimeError(f'No couplings found under the threshold {self.EC_threshold}')
+        if not self.positive_couplings: 
+            self.positive_couplings = {}
+            print(f'No couplings found under the threshold {self.EC_threshold}')
 
     def AnalyzeCouplings(self):
         positives = {}
@@ -199,7 +205,7 @@ class MonomerBenchmarker(BaseBenchmarker):
         plt.grid(True, alpha=0.3)
         
         # Set fixed x-axis range from -0.1 to 1.8
-        # plt.xlim(-0.1, 1.8)
+        plt.xlim(-0.1, 1.8)
 
         return plt.gcf()
 
@@ -254,18 +260,18 @@ class ComplexBenchmarker(BaseBenchmarker):
         return {'TP Baseline': self.TP_Baseline, 'TP Query': TP_Query, 'TPRfull': TPRfull, 'TPR': TPR, 'BI': BI}
 
 if __name__ == '__main__':
-    bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/MSA_subset_evaluation/coupling/PDXH_ECOLI_1-218_b0.5_Full_ECs.txt', min_seq_length=5)
-    fig = bm.PlotCouplings()
-    fig.savefig('/Users/simon/Dev/CoevoFlash/1g79_couplings_plmc.png', dpi=300, bbox_inches='tight')
-    print("PLMC:", bm.TruePositiveCount(), f"{bm.TruePositiveRate():.2%}")
-    bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/Dev/CoevoFlash/PDXH_ECOLI_AplmJulia.csv', min_seq_length=5)
+    # bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/MSA_subset_evaluation/coupling/PDXH_ECOLI_1-218_b0.5_Full_ECs.txt', min_seq_length=5)
+    # fig = bm.PlotCouplings()
+    # fig.savefig('/Users/simon/Dev/CoevoFlash/1g79_couplings_plmc.png', dpi=300, bbox_inches='tight')
+    # print("PLMC:", bm.TruePositiveCount(), f"{bm.TruePositiveRate():.2%}")
+    bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/Algorithm benchmark/Intra chain/PDXH_ECOLI_AplmJulia.csv', min_seq_length=5)
     fig = bm.PlotCouplings()
     fig.savefig('/Users/simon/Dev/CoevoFlash/1g79_couplings_aplm.png', dpi=300, bbox_inches='tight')
     print("AsymJulia:", bm.TruePositiveCount(), f"{bm.TruePositiveRate():.2%}")
-    bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/Dev/CoevoFlash/GaussDCA_PDXH_ECOLI.csv', min_seq_length=5)
-    fig = bm.PlotCouplings()
-    fig.savefig('/Users/simon/Dev/CoevoFlash/1g79_couplings_gauss.png', dpi=300, bbox_inches='tight')
-    print("GaussDCA:", bm.TruePositiveCount(), f"{bm.TruePositiveRate():.2%}")
+    # bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/Algorithm benchmark/Intra chain/GaussDCA_PDXH_ECOLI.csv', min_seq_length=5)
+    # fig = bm.PlotCouplings()
+    # fig.savefig('/Users/simon/Dev/CoevoFlash/1g79_couplings_gauss.png', dpi=300, bbox_inches='tight')
+    # print("GaussDCA:", bm.TruePositiveCount(), f"{bm.TruePositiveRate():.2%}")
     bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/Dev/CoevoFlash/Jmat_PDXH_ECOLI.npy', min_seq_length=5)
     fig = bm.PlotCouplings()
     print("AsymC++:", bm.TruePositiveCount(), f"{bm.TruePositiveRate():.2%}")
