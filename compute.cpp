@@ -73,43 +73,64 @@ std::tuple<PLMV, Eigen::VectorXf> perSitePllGradient(
     const Eigen::MatrixXi& MSA,
     const Eigen::VectorXf& W,
     PLMV lambdaH,
-    PLMV lambdaJ) {
+    PLMV lambdaJ,
+    int num_threads = 0) {
+
+    if (num_threads > 0) {
+        omp_set_num_threads(num_threads);
+    }
 
     PLMV pll = 0.0;
     Eigen::VectorXf gradients = Eigen::VectorXf::Zero(x.size());
     Eigen::TensorMap<Eigen::Tensor<float, 3>> Tgradients(gradients.data() + q, q, q, N - 1);
 
-    #pragma omp parallel for
-    for (int b = 0; b < B; b++) {
-        Eigen::VectorXf energies = getEnergies(x, r, q, N, b, MSA);
-        PLMV lnorm = mergeEnergyTerm(energies);
-        pll -= W(b) * (energies(MSA(b, r)) - lnorm);
-        
-        Eigen::VectorXf Ps = energies.array() - lnorm;
-        Ps = Ps.array().exp();
-        
-        for (int s = 0; s < q; s++) {
-            int indicator = (s == MSA(b, r)) ? 1 : 0;
-            gradients(s) -= W(b) * (indicator - Ps(s));
+    #pragma omp parallel
+    {
+        PLMV local_pll = 0.0;
+        Eigen::VectorXf local_gradients = Eigen::VectorXf::Zero(x.size());
+        Eigen::TensorMap<Eigen::Tensor<float, 3>> local_Tgradients(
+            local_gradients.data() + q, q, q, N - 1);
+
+        #pragma omp for
+        for (int b = 0; b < B; b++) {
+            Eigen::VectorXf energies = getEnergies(x, r, q, N, b, MSA);
+            PLMV lnorm = mergeEnergyTerm(energies);
+            local_pll -= W(b) * (energies(MSA(b, r)) - lnorm);
+
+            Eigen::VectorXf Ps = energies.array() - lnorm;
+            Ps = Ps.array().exp();
+
+            Eigen::VectorXf vGrad = Eigen::VectorXf::Zero(q);
+                for (int s = 0; s < q; s++) {
+                    int indicator = (s == MSA(b, r)) ? 1 : 0;
+                    vGrad(s) = W(b) * (indicator - Ps(s));
+                }
+
+                local_gradients -= vGrad;
+
+                for (int i = 0; i < r; i++) {
+                    int s_ib = MSA(b, i);
+                    for (int s = 0; s < q; s++) {
+                        local_Tgradients(s, s_ib, i) -= vGrad(s);
+                    }
+                }
+                for (int i = r+1; i < N; i++) {
+                    int s_ib = MSA(b, i);
+                    for (int s = 0; s < q; s++) {
+                        local_Tgradients(s, s_ib, i-1) -= vGrad(s);
+                    }
+                }
         }
-        for (int i = 0; i < r; i++) {
-            int s_ib = MSA(b, i);
-            for (int s = 0; s < q; s++) {
-                int indicator = (s == MSA(b, r)) ? 1 : 0;
-                Tgradients(s, s_ib, i) -= W(b) * (indicator - Ps(s));
-            }
-        }
-        for (int i = r+1; i < N; i++) {
-            int s_ib = MSA(b, i);
-            for (int s = 0; s < q; s++) {
-                int indicator = (s == MSA(b, r)) ? 1 : 0;
-                Tgradients(s, s_ib, i-1) -= W(b) * (indicator - Ps(s));
-            }
+
+        #pragma omp critical
+        {
+            pll += local_pll;
+            gradients += local_gradients;
         }
     }
 
-    gradients.head(q) = 2.0f * lambdaH * x.head(q);
-    gradients.tail(x.size() - q) = lambdaJ * x.tail(x.size() - q);
+    gradients.head(q) += 2.0f * lambdaH * x.head(q);
+    gradients.tail(x.size() - q) += lambdaJ * x.tail(x.size() - q);
 
     pll += l2Regularization(x, q, lambdaH, lambdaJ);
     return std::make_tuple(pll, gradients);
@@ -173,7 +194,8 @@ PYBIND11_MODULE(compute, m) {
         py::arg("MSA"),
         py::arg("W"),
         py::arg("lambdaH"),
-        py::arg("lambdaJ"));
+        py::arg("lambdaJ"),
+        py::arg("num_threads") = 0);
     m.def("applyIsingGauge", &applyIsingGauge,
         py::arg("J"),
         py::arg("q"));
