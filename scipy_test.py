@@ -3,12 +3,75 @@ import multiprocessing as mp
 from scipy.optimize import minimize
 import time
 import tracemalloc
-from functools import cache, partial
+from functools import partial
 import compute
 from alignment import TextAlignment
-import torch
+from concurrent.futures import ThreadPoolExecutor
+import numba
+import math
+from numba import cuda
+# import cupy as cp
 
-num_gpus = torch.cuda.device_count()
+# # num_gpus = torch.cuda.device_count()
+# data_type_cpu = np.float32
+# data_type_gpu = cp.float32
+
+def compute_similarity_matrix_CPPKernel(MSA, x=0.8):
+    B, N = MSA.shape
+    identical_threshold = x * N
+    simM = np.full((B, B), N, dtype=np.int16)
+    compute.compute_similarity_matrix(MSA, B, N, simM)
+
+    # Calculate weights
+    m = np.sum(simM >= identical_threshold, axis=0)
+    w = 1.0 / m.astype(np.float32)
+    Beff = np.sum(w)
+
+    return w, Beff
+
+@cuda.jit
+def similarity_matrix_kernel(msa, simM, B, N):
+    b = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+
+    if b < B - 1:
+        # Process all sequences after the current one
+        for i in range(b + 1, B):
+            identical_count = 0
+
+            # Compare sequences using equality checks (Numba optimizes this)
+            for j in range(N):
+                if msa[b, j] == msa[i, j]:  # Equivalent to XOR == 0
+                    identical_count += 1
+
+            # Fill similarity matrix (symmetric)
+            simM[b, i] = identical_count
+            simM[i, b] = identical_count
+
+
+def reweight_sequence_numba(MSA, x=0.8):
+    cuda.select_device(0)
+    MSAkernel = cuda.as_cuda_array(MSA)
+    B, N = MSA.shape
+    identical_threshold = x * N
+
+    # Initialize similarity matrix with N on diagonal
+    simM = cp.full((B, B), N, dtype=cp.int16)
+    simMkernel = cuda.as_cuda_array(simM)
+
+    # Launch kernel with appropriate block/grid dimensions
+    threads_per_block = 128
+    blocks_per_grid = math.ceil(B / threads_per_block)
+
+    similarity_matrix_kernel[blocks_per_grid, threads_per_block](MSAkernel, simMkernel, B, N)
+
+    # Calculate weights
+    m = cp.sum(simM >= identical_threshold, axis=0)
+    w = 1.0 / m.astype(cp.float32)
+    Beff = cp.sum(w)
+
+    # cuda.close()
+
+    return w, Beff
 
 def reweight_sequence(MSA, x=0.8):
     B = MSA.shape[0]
@@ -31,7 +94,7 @@ def reweight_sequence(MSA, x=0.8):
     print(f"Effective weights: {w}")
     return w, Beff
 
-def reweight_sequence_cuda(MSA, x=0.8, tocpu=True):
+def reweight_sequence_torch_cuda(MSA, x=0.8, tocpu=True):
     if isinstance(MSA, np.ndarray):
         MSA = torch.from_numpy(MSA).cuda()
     else:
@@ -59,7 +122,7 @@ def reweight_sequence_cuda(MSA, x=0.8, tocpu=True):
         Beff = Beff.cpu()
     return w, Beff
 
-def reweight_sequence_cuda_memory_efficient(MSA, x=0.8, tocpu=True):
+def reweight_sequence_torch_cuda_memory_efficient(MSA, x=0.8, tocpu=True):
     """Memory efficient version of reweight_sequence_cuda. 
     40% slower than the original, but saves 80% of memory."""
     
@@ -92,74 +155,93 @@ def reweight_sequence_cuda_memory_efficient(MSA, x=0.8, tocpu=True):
         Beff = Beff.cpu()
     return w, Beff
 
-def distribute_upper_triangle_work(B, num_gpus):
-    total_elements = (B * (B - 1)) // 2
-    elements_per_gpu = total_elements / num_gpus
-    gpu_assignments = []
-    current_elements = 0
-    start_row = 0
-    
-    for b in range(B-1):
-        current_elements += (B - b - 1)
-        if current_elements >= elements_per_gpu:
-            gpu_assignments.append((start_row, b))
-            start_row = b + 1
-            current_elements = 0
-    gpu_assignments.append((start_row, B-1))
-    
-    return gpu_assignments
-
-def compute_sim_count_on_gpu(rank, MSA, x, start, end, return_dict):
-    device = torch.device(f'cuda:{rank}')
-    MSA = MSA.to(device)
+@cuda.jit
+def calc_grad_pll_kernel(J, h, MSA, r, pll, W, gradients, Jgradients):
     B, N = MSA.shape
-    identical_threshold = x * N
+    _, q = J.shape[0], J.shape[1]
 
-    m = torch.ones(end-start+1, device=device)
+    b = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+    if b < B:
+        energies = numba.cuda.local.array(32, dtype=numba.float64)
+        for l in range(q):
+            sum_val = 0.0
+            for i in range(r):
+                k = MSA[b, i]
+                sum_val += J[i, k, l]
+            for i in range(r+1, N):
+                k = MSA[b, i]
+                sum_val += J[i-1, k, l]
 
-    for b in range(start, end+1):
-        current_seq = MSA[b].unsqueeze(0).unsqueeze(0)
-        remaining = MSA[b+1:].unsqueeze(0)
-        identical_positions = (current_seq == remaining)
-        identity_scores = identical_positions.sum(dim=-1).squeeze(0)
-        similar_seqs = (identity_scores >= identical_threshold)
-        m[b - start] += similar_seqs.sum()
-        indices = torch.where(similar_seqs)[0] + b + 1
-        m.index_add_(0, indices-start, torch.ones(len(indices), device=device))
+            energies[l] = h[l] + sum_val
+        max_energy = energies[0]
+        for l in range(1, q):
+            if energies[l] > max_energy:
+                max_energy = energies[l]
+        sum_exp = 0.0
+        for l in range(q):
+            sum_exp += numba.cuda.libdevice.exp(energies[l])
 
-    return_dict[rank] = m.cpu()
+        lnorm = max_energy + numba.cuda.libdevice.log(sum_exp - max_energy)
 
-def reweight_sequence_multi_gpu(MSA, x=0.8, num_gpus=num_gpus):
-    if isinstance(MSA, np.ndarray):
-        MSA = torch.from_numpy(MSA)
-    MSA = MSA.pin_memory()
+        pll_contrib = -W[b] * (energies[MSA[b, r]] - lnorm)
+        cuda.atomic.add(pll, 0, pll_contrib)
 
-    B = MSA.shape[0]
-    ctx = mp.get_context('spawn')
+        vGrad = numba.cuda.local.array(32, dtype=numba.float64)
+        for l in range(q):
+            Ps = numba.cuda.libdevice.exp(energies[l] - lnorm)
+            indicator = 1 if MSA[b, r] == l else 0
+            vGrad[l] = W[b] * (indicator - Ps)
 
-    job_ranges = distribute_upper_triangle_work(B, num_gpus)
-    manager = ctx.Manager()
-    return_dict = manager.dict()
-    processes = []
+        for i in range(q):
+            cuda.atomic.add(gradients, i, -vGrad[i])
+        for i in range(r):
+            s_ib = MSA[b, i]
+            for l in range(q):
+                cuda.atomic.add(Jgradients, (i, s_ib, l), -vGrad[l])
+        for i in range(r+1, N):
+            s_ib = MSA[b, i]
+            for l in range(q):
+                cuda.atomic.add(Jgradients, (i-1, s_ib, l), -vGrad[l])
+@cuda.jit
+def normalization_kernel(x, gradients, lambdaH, lambdaJ, nParams, q, reg):
+    i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
 
-    for rank in range(num_gpus):
-        p = ctx.Process(target=compute_sim_count_on_gpu, args=(rank, MSA, x, job_ranges[rank][0], job_ranges[rank][1], return_dict))
-        p.start()
-        processes.append(p)
+    if i < nParams:
+        if i < q:
+            gradients[i] += 2.0 * lambdaH * x[i]
+            cuda.atomic.add(reg, 0, x[i] ** 2)
+        else:
+            gradients[i] += lambdaJ * x[i]
+            cuda.atomic.add(reg, 1, x[i] ** 2)
 
-    for p in processes:
-        p.join()
+def compute_gradients(x, MSA, r, W, lambdaH, lambdaJ):
+    B, N = MSA.shape
+    pll = cp.zeros(1, dtype=data_type_gpu)
+    gradients = cp.zeros_like(x)
+    Jgradients = gradients[q:].reshape((N-1, q, q))
 
-    all_counts = torch.cat([return_dict[i] for i in range(num_gpus)], dim=0)
-    w = 1.0 / all_counts.float()
-    Beff = w.sum()
-    return w, Beff
+    threads_per_block = 128
+    blocks_per_grid = math.ceil(B / threads_per_block)
+
+    calc_grad_pll_kernel[blocks_per_grid, threads_per_block](
+        cuda.as_cuda_array(x[q:].reshape((N-1, q, q))), cuda.as_cuda_array(x), MSA, r, pll, W,
+        cuda.as_cuda_array(gradients), cuda.as_cuda_array(Jgradients)
+    )
+    reg = cp.zeros(2, dtype=data_type_gpu)
+    blocks_for_norm = math.ceil(len(x) / threads_per_block)
+    normalization_kernel[blocks_for_norm, threads_per_block](
+        x, cuda.as_cuda_array(gradients), lambdaH, lambdaJ, len(x), q, reg
+    )
+    pll[0] += lambdaH * reg[0] + lambdaJ * reg[1] * 0.5
+    
+    return pll[0], gradients
+
 
 def compute_score(J, q=21, gap_idx=20):
     # Average the J matrix out at main diagonal
     N = J.shape[1]
-    J = J.flatten(order='F').reshape((N, N, q, q), order='C').transpose(1, 0, 2, 3)
-    J = (J + J.swapaxes(0, 1)) / 2
+    J = J.T.reshape((N, N, q, q))
+    J = (J + J.transpose(1, 0, 3, 2)) / 2
 
     # Gap exclude Frobenius norm
     mask = np.ones((q, q), dtype=bool)
@@ -169,13 +251,28 @@ def compute_score(J, q=21, gap_idx=20):
     FN = np.sqrt(np.sum(J_filtered ** 2, axis=-1))
 
     # Average Product Correction of Frobenius norm
-    row_mean = FN.mean(axis=1, keepdims=True)
-    col_mean = FN.mean(axis=0, keepdims=True)
-    total_mean = row_mean.mean()
+    row_mean = np.sum(FN, axis=1, keepdims=True) / (N - 1)
+    col_mean = np.sum(FN, axis=0, keepdims=True) / (N - 1)
+    total_mean = np.sum(FN) / (N * (N - 1))
     FN_APC = FN - (row_mean @ col_mean) / total_mean
 
     return FN_APC
 
+
+def target_func(r, x0, opt, q, N, B, MSA, W, lambdaH, lambdaJ):
+    result = minimize(
+        partial(compute.perSitePllGradient, r=r, q=q, N=N, B=B, MSA=MSA, W=W, lambdaH=lambdaH, lambdaJ=lambdaJ, num_threads=1),
+        x0,
+        jac=True,
+        method='L-BFGS-B',
+        options={
+            'ftol': opt["epsconv"],
+            'gtol': opt["epsconv"],
+            'maxiter': opt["maxit"],
+            'disp': False
+        }
+    )
+    return r, result
 def minimize_pl_asym(opt, q, N, B, MSA, W, lambdaH, lambdaJ):
     nParamsh = q
     nParamsJ = (N - 1) * q * q
@@ -184,11 +281,90 @@ def minimize_pl_asym(opt, q, N, B, MSA, W, lambdaH, lambdaJ):
     pll = np.zeros(N, dtype=np.float32)
     J = np.zeros((nParamsJ + q*q, N), dtype=np.float32)
 
-    # In Python we'll iterate through sites sequentially
-    # For parallel processing, you could use concurrent.futures or joblib
+
+    # for r in range(N):
+    with mp.Pool(processes=mp.cpu_count()) as pool:
+        results = pool.starmap(target_func, [(r, x0, opt, q, N, B, MSA, W, lambdaH, lambdaJ) for r in range(N)])
+        # minf = result.fun
+        # minx = result.x
+        # minJ = minx[q:]
+        # compute.applyIsingGauge(minJ, q)
+        # # insert zeros for speeding up tensor mapping
+        # minJ = np.insert(minJ, r * q * q, np.zeros(q * q, dtype=minJ.dtype))
+        # pll[r] = minf
+        # J[:, r] = minJ
+        total_nits = 0
+        for r, result in results:
+            print(f"Finished site {r+1}/{N} after {result.nit} iterations with pseudolikelihood {result.fun}")
+            total_nits += result.nit
+    print(f"Total iterations for all sites: {total_nits}")
+    return J, pll
+def minimize_pl_asym_threaded(opt, q, N, B, MSA, W, lambdaH, lambdaJ):
+    """Use threading instead of multiprocessing to avoid data copying"""
+    nParamsh = q
+    nParamsJ = (N - 1) * q * q
+    nParams = nParamsh + nParamsJ
+    x0 = np.zeros(nParams, dtype=np.float32)
+    pll = np.zeros(N, dtype=np.float32)
+    J = np.zeros((nParamsJ + q*q, N), dtype=np.float32)
+    
+    # Build index map once
+    index_map = compute.buildIndexMap(q, N)
+    
+    def optimize_site(r):
+        """Optimize single site with C++ OpenMP threading"""
+        result = minimize(
+            partial(compute.perSitePllGradient,
+                    r=r, q=q, N=N, B=B, MSA=MSA, W=W,
+                    lambdaH=lambdaH, lambdaJ=lambdaJ,
+                    num_threads=1),  # Each C++ call uses 1 thread
+            x0,
+            jac=True,
+            method='L-BFGS-B',
+            options={
+                'ftol': opt["epsconv"],
+                'gtol': opt["epsconv"],
+                'maxiter': opt["maxit"]
+            }
+        )
+        
+        minf = result.fun
+        minx = result.x
+        minJ = minx[q:]
+        compute.applyIsingGauge(minJ, q)
+        minJ = np.insert(minJ, r * q * q, np.zeros(q * q, dtype=minJ.dtype))
+        
+        return r, minf, minJ, result.nit
+    
+    # Use thread pool (shared memory, no data copying)
+    max_workers = mp.cpu_count()
+    total_nits = 0
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(optimize_site, r) for r in range(N)]
+        
+        for future in futures:
+            r, minf, minJ, nit = future.result()
+            pll[r] = minf
+            J[:, r] = minJ
+            total_nits += nit
+            print(f"Finished site {r+1}/{N} after {nit} iterations with pseudolikelihood {minf}")
+    
+    print(f"Total iterations for all sites: {total_nits}")
+    return J, pll
+def minimize_pl_asym_new(opt, q, N, B, MSA, W, lambdaH, lambdaJ):
+    nParamsh = q
+    nParamsJ = (N - 1) * q * q
+    nParams = nParamsh + nParamsJ
+    print(f"Total number of parameters: {nParams}")
+    x0 = np.zeros(nParams, dtype=np.float32)
+    pll = np.zeros(N, dtype=np.float32)
+    J = np.zeros((nParamsJ + q*q, N), dtype=np.float32)
+    index_map = compute.buildIndexMap(q, N)
+    
     for r in range(N):
         result = minimize(
-            partial(compute.perSitePllGradient, r=r, q=q, N=N, B=B, MSA=MSA, W=W, lambdaH=lambdaH, lambdaJ=lambdaJ),
+            partial(compute.perSitePllGradientNew, r=r, q=q, N=N, B=B, MSA=MSA, W=W, lambdaH=lambdaH, lambdaJ=lambdaJ, index_map=index_map),
             x0,
             jac=True,
             method='L-BFGS-B',
@@ -208,8 +384,8 @@ def minimize_pl_asym(opt, q, N, B, MSA, W, lambdaH, lambdaJ):
         minJ = np.insert(minJ, r * q * q, np.zeros(q * q, dtype=minJ.dtype))
         pll[r] = minf
         J[:, r] = minJ
-        print(f"Finished site {r+1}/{N} with pseudolikelihood {minf}")
-    np.save('/Users/simon/Dev/CoevoFlash/Jmat_withoutIsing.npy', J, allow_pickle=True)
+        print(f"Finished site {r+1}/{N} after {result.nit} iterations with pseudolikelihood {minf}")
+
     return J, pll
 
 
@@ -221,6 +397,9 @@ if __name__ == "__main__":
     }
     # align = TextAlignment('/Users/simon/research/EVcouplings/test_run/couplings/output/mycsep_00000025/align_1/mycsep_00000025.a2m')
     align = TextAlignment('/Users/simon/research/EVcouplings/MSA_subset_evaluation/PDXH_ECOLI_1-218_b0.5.a2m')
+    align.Filtering_MSA_Invalid()
+    align.Filtering_MSA_Gap(50, 50)
+    align.Downsample_Randomly(26809)
     MSA = align.Get_Numpy_Array(mapped=True)
     print(MSA.shape)
 
@@ -229,7 +408,7 @@ if __name__ == "__main__":
     lambdaJ = 0.01
     lambdaH = 0.01
     start = time.time()
-    if torch.cuda.is_available():
+    if cuda.is_available():
         W, Beff = reweight_sequence_cuda(MSA, x=0.8)
     else:
         W, Beff = reweight_sequence(MSA)
@@ -240,9 +419,9 @@ if __name__ == "__main__":
     # Run a small test
     start_time = time.time()
     tracemalloc.start()
-    
+
     # Run minimization
-    J, pll = minimize_pl_asym(opt, q, N, B, MSA, W, lambdaH, lambdaJ)
+    J, pll = minimize_pl_asym_threaded(opt, q, N, B, MSA, W, lambdaH, lambdaJ)
     # np.save('/Users/simon/Dev/CoevoFlash/Jmat.npy', J, allow_pickle=True)
     current, peak = tracemalloc.get_traced_memory()
     print(f"Current memory usage is {current / 10**6}MB; Peak was {peak / 10**6}MB")
@@ -255,4 +434,4 @@ if __name__ == "__main__":
     score = compute_score(J)
     end_time = time.time()
     print(f"Score calculation took {end_time - start_time} seconds")
-    np.save('/Users/simon/Dev/CoevoFlash/Jmat.npy', score, allow_pickle=True)
+    # np.save('/Users/simon/Dev/CoevoFlash/Jmat.npy', score, allow_pickle=True)
