@@ -1,0 +1,43 @@
+[project]
+name = "massivora"
+version = "0.1.0"
+description = "A scalable framework for massive sequence co-evolution analysis"
+authors = [
+    { name = "Haoran Sun", email = "simonhrsun@gmail.com" }
+]
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas",
+    "numpy",
+    "biopython",
+    "rich",
+    "zarr",
+    "pybind11",
+    "psutil",
+    "numba",
+    "scipy",
+    "statsmodels",
+    "PyYAML"
+]
+
+[project.optional-dependencies]
+gpu = [
+    "cupy-cuda12x"
+]
+
+[project.scripts]
+massivora = "massivora:massivora"
+massiworker = "massivora:massiworker"
+massiveilance = "massivora:massiveilance"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
