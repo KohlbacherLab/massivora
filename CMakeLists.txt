@@ -43,7 +43,7 @@ set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-pybind11_add_module(compute compute.cpp)
+pybind11_add_module(compute src/massivora/compute.cpp)
 
 # CUDA library (only if CUDA is enabled)
 if(ENABLE_CUDA)
