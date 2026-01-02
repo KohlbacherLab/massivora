@@ -6,7 +6,7 @@ import pickle
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.stats import spearmanr
+from scipy.stats import spearmanr, ecdf
 from ost import io
 from ost.geom import MinDistance, Vec3List
 
@@ -42,26 +42,47 @@ class BaseBenchmarker(object):
         return df
 
     def ParsePLMCOutput(self, ECfile):
-        with open(ECfile, 'r') as f:
-            lines = f.readlines()
-            data = {}
-            for line in lines:
-                parts = line.strip().split()
-                if len(parts) == 6:
-                    pos1, aa1, pos2, aa2, _, score = parts
-                    pos1, pos2, score = int(pos1), int(pos2), float(score)
-                data[pos1, pos2] = score
-        return data
+        long_df = pd.read_csv(ECfile, sep="\s+", header=None, names=["pos1", "aa1", "pos2", "aa2", "dummy", "score"])
+        positions = np.sort(
+            pd.unique(pd.concat([long_df["pos1"], long_df["pos2"]], ignore_index=True))
+        )
+        df = pd.DataFrame(0, index=positions, columns=positions, dtype=float)
+        diff = np.diff(long_df['pos2'])
+        decrease_indices = np.where(diff < 0)[0]
+        df.iloc[0,1:] = long_df.iloc[0:decrease_indices[0] + 1]["score"].to_numpy()
+        for i in range(len(decrease_indices)-1):
+            df.iloc[i+1, i+2:] = long_df.iloc[decrease_indices[i] + 1:decrease_indices[i + 1] + 1]["score"].to_numpy()
+        df.iloc[i+2, i+3:] = long_df.iloc[decrease_indices[i+1]+1:decrease_indices[i+1]+3]["score"].to_numpy()
+        df.iloc[i+3, i+4] = long_df.iloc[-1]["score"]
+        for i in range(len(positions)):
+            for j in range(i + 1, len(positions)):
+                df.iloc[j, i] = df.iloc[i, j]
+        return df
 
     def ParseCSVOutput(self, ECfile):
-        with open(ECfile, 'r') as f:
-            lines = f.readlines()
-            data = {}
-            for line in lines[1:]:
-                parts = line.strip().split(',')
-                pos1, pos2, score = int(parts[0]), int(parts[1]), float(parts[2])
-                data[pos1, pos2] = score
-        return data
+        # CSV format: res1,res2,score
+        long_df = pd.read_csv(ECfile)
+        if long_df.empty:
+            return {}
+
+        required = {"res1", "res2", "score"}
+        if not required.issubset(long_df.columns):
+            raise ValueError(f"CSV must contain columns {sorted(required)} (got {list(long_df.columns)})")
+
+        long_df["res1"] = long_df["res1"].astype(int)
+        long_df["res2"] = long_df["res2"].astype(int)
+        long_df["score"] = long_df["score"].astype(float)
+
+        positions = np.sort(
+            pd.unique(pd.concat([long_df["res1"], long_df["res2"]], ignore_index=True))
+        )
+        df = pd.DataFrame(0, index=positions, columns=positions, dtype=float)
+        for _, row in long_df.iterrows():
+            df.at[row["res1"], row["res2"]] = row["score"]
+        for i in range(len(positions)):
+            for j in range(i + 1, len(positions)):
+                df.iloc[j, i] = df.iloc[i, j]
+        return df
 
     def ParseNumpyOutput(self, ECfile):
         arr = np.load(ECfile, allow_pickle=True)
@@ -115,6 +136,10 @@ class BaseBenchmarker(object):
         new_scores = [score for _, score in new_cp.items()]
         res = spearmanr(baseline_scores, new_scores)
         return res.statistic, res.pvalue
+
+    def EmpiricalDistribution(self, couplings):
+        res = ecdf(couplings)
+        return res
 
 class MonomerBenchmarker(BaseBenchmarker):
     def __init__(self, structure_file=None, chain_name=None, ECfile_baseline=None, EC_threshold=0.7, distance_cutoff=8, min_seq_length=1):
@@ -181,10 +206,17 @@ class MonomerBenchmarker(BaseBenchmarker):
         Tuple[float, float]
             The Spearman correlation coefficient and p-value.
         """
+        if not query_benchmarker:
+            return 0, 0
         ranked_baseline = dict(sorted(self.raw_couplings.items(), key=lambda item: (item[0][0], item[0][1])))
         ranked_query = dict(sorted(query_benchmarker.raw_couplings.items(), key=lambda item: (item[0][0], item[0][1])))
         corr, pval = super().SpearmanCorrelation(ranked_baseline, ranked_query)
         return float(corr), float(pval)
+
+    def EmpiricalDistribution(self):
+        scores = list(self.raw_couplings.values())
+        res = super().EmpiricalDistribution(scores)
+        return res
 
     def GetBenchmarkIndex(self, query_benchmarker):
         if type(self.interface) == None or not self.positive_couplings: raise RuntimeError('No interface or couplings found')
@@ -214,9 +246,8 @@ class MonomerBenchmarker(BaseBenchmarker):
         for pair, score in self.raw_couplings.items():
             pos1, pos2 = pair
             if abs(pos1 - pos2) >= self.min_seq_length:
-                distance = 50
+                distance = self.interface.loc[f'{pos1}', f'{pos2}']
                 if f'{pos1}' in self.interface.index and f'{pos2}' in self.interface.columns:
-                    distance = self.interface.loc[f'{pos1}', f'{pos2}']
                     if score > self.EC_threshold and distance > self.distance_cutoff:
                         scores_fp.append(score)
                         distances_fp.append(distance)
@@ -248,7 +279,7 @@ class ComplexBenchmarker(BaseBenchmarker):
     def __init__(self, structure_file=None, chain1_name="A", chain1_length=None, chain2_name=None, ECfile_baseline=None, EC_threshold=0.7, distance_cutoff=8):
         super().__init__(EC_threshold, distance_cutoff)
         self.nTP = None
-        self.positive_couplings = None
+        self.positive_couplings = pd.DataFrame()
         if structure_file is not None:
             self.ReadStructure(structure_file, chain1_name, chain2_name)
         if ECfile_baseline is not None:
@@ -268,40 +299,76 @@ class ComplexBenchmarker(BaseBenchmarker):
         elif ECfile_baseline.endswith('.npy'):
             self.raw_couplings = self.ParseNumpyOutput(ECfile_baseline)
         else:
-            self.raw_couplings = {}
+            self.raw_couplings = pd.DataFrame()
         # Analyze the interface and the couplings
         self.interprotein_couplings = self.AnalyzeCouplings(chain1_length)
-        self.positive_couplings = {k:v for k, v in self.interprotein_couplings.items() if v >= self.EC_threshold}
-        if not self.positive_couplings: 
-            self.positive_couplings = {}
+        inter = self.interprotein_couplings.apply(pd.to_numeric, errors="coerce")
+        self.positive_couplings = inter.where(inter >= self.EC_threshold)
+        if self.positive_couplings.notna().sum().sum() == 0:
+            self.positive_couplings = pd.DataFrame()
             print(f'No couplings found under the threshold {self.EC_threshold}')
 
     def SumUpRawCouplings(self):
-        if self.raw_couplings:
-            total_score = sum(self.raw_couplings.values())
-            return total_score
-        raise RuntimeError('No raw couplings found')
+        if self.raw_couplings.empty:
+            raise RuntimeError('No raw couplings found')
+        vals = pd.to_numeric(self.raw_couplings.values.ravel(), errors="coerce")
+        if np.isnan(vals).all():
+            raise RuntimeError('No raw couplings found')
+        return float(np.nansum(vals))
 
     def SumUpNormalizedCouplings(self, N_eff, L):
-        if self.interprotein_couplings:
-            min_score = min(self.interprotein_couplings.values())
-            abs_min = abs(min_score)
-            constant = 1 + (N_eff / L) ** -0.5
-            normalized_scores = [(score / abs_min) / constant for score in self.interprotein_couplings.values()]
-            return max(normalized_scores)
-        raise RuntimeError('No interprotein couplings found')
+        if self.raw_couplings.empty:
+            raise RuntimeError('No raw couplings found')
+        constant = 1 + (N_eff / L) ** -0.5
+        vals = pd.to_numeric(self.raw_couplings.values.ravel(), errors="coerce")
+        vals = vals[~np.isnan(vals)]
+        if vals.size == 0:
+            raise RuntimeError('No raw couplings found')
+        abs_min = abs(np.nanmin(vals))
+        if abs_min == 0:
+            raise RuntimeError('Cannot normalize: minimum absolute score is 0')
+        return float(np.sum((vals / abs_min) / constant))
 
-    def AnalyzeCouplings(self, chain1_length):
-        inter = {}
-        for pair, score in self.raw_couplings.items():
-            pos1, pos2 = pair
-            # skip intra-chain couplings
-            if pos2 < chain1_length or pos1 > chain1_length:
-                continue
-            # for inter-chain couplings, adjust the positions
-            pos2 = pos2 - chain1_length
-            inter[(pos1, pos2)] = score
-        if not inter: return None
+    def SumUpNormalizedInterProtCouplings(self, N_eff, L):
+        if self.interprotein_couplings.empty:
+            raise RuntimeError('No interprotein couplings found')
+        constant = 1 + (N_eff / L) ** -0.5
+        vals = pd.to_numeric(self.interprotein_couplings.values.ravel(), errors="coerce")
+        vals = vals[~np.isnan(vals)]
+        if vals.size == 0:
+            raise RuntimeError('No interprotein couplings found')
+        abs_min = abs(np.nanmin(vals))
+        if abs_min == 0:
+            raise RuntimeError('Cannot normalize: minimum absolute score is 0')
+        return float(np.sum((vals / abs_min) / constant))
+
+    def MaxNormalizedInterProtCouplings(self, N_eff, L):
+        if self.interprotein_couplings.empty:
+            raise RuntimeError('No interprotein couplings found')
+        constant = 1 + (N_eff / L) ** -0.5
+        vals = pd.to_numeric(self.interprotein_couplings.values.ravel(), errors="coerce")
+        vals = vals[~np.isnan(vals)]
+        if vals.size == 0:
+            raise RuntimeError('No interprotein couplings found')
+        abs_min = abs(np.nanmin(vals))
+        if abs_min == 0:
+            raise RuntimeError('Cannot normalize: minimum absolute score is 0')
+        return float(np.nanmax((vals / abs_min) / constant))
+
+    def AnalyzeCouplings(self, saved_columns):
+        if type(saved_columns) == int:
+            inter = self.raw_couplings.loc[:saved_columns, saved_columns:]
+            inter.columns -= saved_columns
+        else:
+            if len(saved_columns) != len(self.raw_couplings.index):
+                raise RuntimeError('Saved columns length does not match raw couplings length')
+            diff = np.diff(saved_columns)
+            prot2_start = np.where(diff < 0)[0][0]+1
+            inter = self.raw_couplings.iloc[:prot2_start, prot2_start:]
+            inter.index = saved_columns[:prot2_start]
+            inter.columns = saved_columns[prot2_start:]
+            inter.index += 1
+            inter.columns += 1
         return inter
 
     def GetBenchmarkIndex(self, ECfile_query):
@@ -331,10 +398,35 @@ class ComplexBenchmarker(BaseBenchmarker):
         Tuple[float, float]
             The Spearman correlation coefficient and p-value.
         """
-        ranked_baseline = dict(sorted(self.interprotein_couplings.items(), key=lambda item: (item[0][0], item[0][1])))
-        ranked_query = dict(sorted(query_benchmarker.interprotein_couplings.items(), key=lambda item: (item[0][0], item[0][1])))
+        def _df_to_pair_dict(df):
+            dfn = df.apply(pd.to_numeric, errors="coerce")
+            stacked = dfn.stack(future_stack=True)
+            return {(i, j): float(v) for (i, j), v in stacked.items()}
+
+        ranked_baseline = dict(
+            sorted(
+                _df_to_pair_dict(self.interprotein_couplings).items(),
+                key=lambda item: (item[0][0], item[0][1]),
+            )
+        )
+        ranked_query = dict(
+            sorted(
+                _df_to_pair_dict(query_benchmarker.interprotein_couplings).items(),
+                key=lambda item: (item[0][0], item[0][1]),
+            )
+        )
         corr, pval = super().SpearmanCorrelation(ranked_baseline, ranked_query)
         return float(corr), float(pval)
+
+    def EmpiricalDistribution(self):
+        if self.interprotein_couplings.empty:
+            raise RuntimeError('No interprotein couplings found')
+        vals = pd.to_numeric(self.interprotein_couplings.values.ravel(), errors="coerce")
+        vals = vals[~np.isnan(vals)]
+        if vals.size == 0:
+            raise RuntimeError('No interprotein couplings found')
+        res = super().EmpiricalDistribution(vals)
+        return res
 
     def PlotCouplings(self):
         plt.figure(figsize=(10, 6))
@@ -382,6 +474,49 @@ class ComplexBenchmarker(BaseBenchmarker):
 
         return plt.gcf()
 
+    def TopKInterproteinPairOverlap(self, query_benchmarker, k):
+        """
+        Count how many top-k interprotein coupling pairs are shared with query_benchmarker.
+
+        Parameters
+        ----------
+        `query_benchmarker` — ComplexBenchmarker
+            The query benchmarker instance to compare against.
+        `k` — int
+            The number of top interprotein coupling pairs to consider.
+
+        Returns
+        -------
+        `int`
+            The number of shared top-k interprotein coupling pairs.
+
+        Raises
+        ------
+        `TypeError`
+            If `query_benchmarker` is not a ComplexBenchmarker instance.
+        `ValueError`
+            If `k` is not a positive integer.
+        """
+        if query_benchmarker is None:
+            raise TypeError('query_benchmarker must be a ComplexBenchmarker instance')
+        if not isinstance(k, int) or k <= 0:
+            raise ValueError('k must be a positive integer')
+        if self.interprotein_couplings.empty or query_benchmarker.interprotein_couplings.empty:
+            return 0
+
+        def _topk_pairs(df, k_):
+            dfn = df.apply(pd.to_numeric, errors="coerce")
+            stacked = dfn.stack(future_stack=True)
+            if stacked.empty:
+                return set()
+            # Select top-k by score (descending)
+            top = stacked.nlargest(k_)
+            return set(top.index.tolist())  # (row_index, col_index)
+
+        top_self = _topk_pairs(self.interprotein_couplings, k)
+        top_query = _topk_pairs(query_benchmarker.interprotein_couplings, k)
+        return int(len(top_self.intersection(top_query)))
+
 if __name__ == '__main__':
     # bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/MSA_subset_evaluation/coupling/PDXH_ECOLI_1-218_b0.5_Full_ECs.txt', min_seq_length=5)
     # fig = bm.PlotCouplings()
@@ -427,8 +562,17 @@ if __name__ == '__main__':
     # bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/Algorithm benchmark/Intra chain/PDXH_ECOLI_1-218_b0.2_old.txt', min_seq_length=5)
     # bm1 = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/Algorithm benchmark/Intra chain/PDXH_ECOLI_1-218_b0.2_new.txt', min_seq_length=5)
     # print(bm.SpearmanCorrelation(bm1))
-    bm = ComplexBenchmarker(chain1_length=209, ECfile_baseline='/Users/simon/research/EVcouplings/E.coli-50S/couplings/plmc/RL3_ECOLI_RL13_ECOLI_b0.2.txt')
-    print(max(bm.interprotein_couplings.values()))
-    bm1 = ComplexBenchmarker(chain1_length=209, ECfile_baseline='/Users/simon/research/EVcouplings/E.coli-50S/couplings/aplm/RL1_ECOLI_RL2_ECOLI_b0.2.csv')
-    print(max(bm1.interprotein_couplings.values()))
+    bm = ComplexBenchmarker(chain1_length=110, ECfile_baseline='/Users/simon/research/EVcouplings/E.coli-50S/couplings/plmc/RL22_ECOLI_RL31_ECOLI_b0.2.txt')
+    print(bm.interprotein_couplings.values.max())
+    with open("/Users/simon/Downloads/merged/metadata.pkl", 'rb') as f:
+        metadata = pickle.load(f)
+    bm1 = ComplexBenchmarker(chain1_length=metadata['saved_columns'], ECfile_baseline='/Users/simon/Downloads/newtest_zarr.txt')
+    print(bm1.interprotein_couplings.values.max())
     print(bm.SpearmanCorrelation(bm1))
+    print(bm1.TopKInterproteinPairOverlap(bm, 10))
+    edf = bm1.EmpiricalDistribution()
+    print(edf.cdf)
+    print(edf.cdf.quantiles)
+    print(edf.cdf.quantiles[np.where(edf.cdf.probabilities >= 0.9999)[0]])
+    print(len(edf.cdf.quantiles[np.where(edf.cdf.probabilities >= 0.9999)[0]]))
+    print(edf.cdf.confidence_interval(0.99).high.quantiles)

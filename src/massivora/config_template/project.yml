@@ -1,0 +1,74 @@
+# Massivora project configuration (YAML)
+# This file supports comments.
+# This is a template file, tailor it to your needs.
+
+project:
+  # Name of the project
+  name: my_project
+
+  # Root folder for this project (data, outputs, jobs, db, ...)
+  project_path: /ptmp/USER/my_project
+
+  # Text file of protein list. One protein ID per line.
+  proteins_list: /ptmp/USER/my_project/data/proteins.txt
+
+# These are subdirectories under project_path
+paths:
+  # Where protein homologue MSAs are stored
+  monomers: msa
+
+  # Where concatenated alignments / EC outputs go
+  couplings: ecs
+
+  # SQLite database path
+  job_db: job_db.sqlite3
+
+logging:
+  enable: true
+  level: WARNING
+  dir: /ptmp/USER/my_project/logs
+  file: massivora.log
+
+pipeline:
+  download: false
+  align: false
+  concatenate: true
+  coupling: true
+
+align:
+  # jackhmmer and database
+  jackhmmer_binary: /u/USER/apps/hmmer/bin/jackhmmer
+  database: /u/USER/uniprot.fasta
+  per_job_cpu: 4
+  iterations: 5
+  analogue_threshold: 0.2
+  paralogue_threshold: 0.9
+  row_gap_threshold: 0.5
+  col_gap_threshold: 0.5
+
+  # Applies when one wants to split the calculation to multiple clusters
+  # portion: 1.0
+  # portion_start: 0.0
+
+concatenate:
+  reweighting_threshold: 0.8
+  # downsample settings (optional)
+  downsample:
+    enabled: true
+    to: 10000
+
+coupling:
+  method: plm
+
+  # CPU settings
+  per_job_cpu: 8
+  claim_batch_size: 4
+
+  # plmc
+  plmc_binary: /u/USER/apps/plmc
+  lambda_h: 0.01
+  lambda_J: 0.01
+
+  # Applies when one wants to split the calculation to multiple clusters
+  # portion: 1.0
+  # portion_start: 0.0

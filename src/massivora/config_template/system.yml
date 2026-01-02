@@ -1,0 +1,23 @@
+# Massivora system configuration (YAML)
+# Put machine/cluster specific settings here.
+# This file supports comments.
+
+system:
+  # Default process count for download on login node
+  download_processes: 4
+
+manager:
+  # type: local
+  type: slurm
+  conda_env: myenv
+
+batch:
+  # Modules and environment setup injected into sbatch scripts
+  script_dir: jobs
+  modules:
+    - anaconda/3/2023.03
+    - julia/1.11
+  maximum_nodes: 16
+  maximum_jobs: 300
+  time_limit: "24:00:00"
+  cpu_count: 128

@@ -2,10 +2,11 @@ pandas
 numpy
 biopython
 rich
-pymongo
 zarr
 pybind11
 psutil
 numba
 scipy
 cupy-cuda12x
+statsmodels
+PyYAML
