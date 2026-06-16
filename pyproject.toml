@@ -14,18 +14,25 @@ dependencies = [
     "biopython",
     "rich",
     "zarr",
-    "pybind11",
     "psutil",
-    "numba",
     "scipy",
-    "statsmodels",
-    "PyYAML"
+    "matplotlib",
+    "PyYAML",
+    "dask[distributed]",
 ]
 
+# NOTE: `ost` (OpenStructure) is required at runtime but is NOT pip-installable.
+# It is provided via conda (bioconda channel) — see environment.yml. This is the
+# main reason conda is the recommended installation path.
+
 [project.optional-dependencies]
-gpu = [
-    "cupy-cuda12x"
-]
+# GPU support is optional. The recommended way to enable it is via conda
+# (`conda install -c conda-forge cupy`), which auto-selects the CuPy build
+# matching the host CUDA driver. These pip extras are only a fallback for
+# pip-only installs that need an explicit CUDA pin.
+cuda12 = ["cupy-cuda12x"]
+cuda13 = ["cupy-cuda13x"]
+dev = ["pytest", "scikit-build-core", "pybind11"]
 
 [project.scripts]
 massivora = "massivora:massivora"
@@ -33,11 +40,33 @@ massiworker = "massivora:massiworker"
 massiveilance = "massivora:massiveilance"
 
 [build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
 
-[tool.setuptools]
-package-dir = {"" = "src"}
+[tool.scikit-build]
+# Build the native extension via CMake.
+cmake.version = ">=3.18"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["src/massivora"]
+# CMake is the sole provider of the compiled artifacts.
+wheel.exclude = [
+    "**/__pycache__",
+    # Build sources only — not needed at runtime, and avoids shipping the large
+    # tracked prebuilt libcuLBFGSB.so. The runtime cuda_kernels.cuh is installed
+    # by CMake into massivora/cpp_bindings instead.
+    "massivora/bindings_src",
+]
+sdist.exclude = [
+    "build",
+    "tests",
+    "benchmark_dataset",
+    "**/__pycache__",
+    "**/*.so",
+]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.scikit-build.cmake.define]
+# GPU is optional and auto-detected: the CUDA backend is built when a CUDA
+# compiler is present, CPU-only otherwise. So `pip install .[cuda12]` enables
+# GPU automatically on a CUDA host. Force it with:
+#   pip install . -C cmake.define.ENABLE_CUDA=ON   (or =OFF to force CPU-only)
+ENABLE_CUDA = "AUTO"

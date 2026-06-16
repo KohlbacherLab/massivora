@@ -1,21 +1,20 @@
+import logging
+import math
 import os
 import re
-import time
-import logging
-import sys
-from massivora import compute
-import zarr
-import pickle
-import subprocess
 import shutil
+import subprocess
 
 import numpy as np
 import pandas as pd
-from Bio import AlignIO, SeqIO
+import zarr
+from Bio import AlignIO, ExPASy, SeqIO
 from Bio.Align import MultipleSeqAlignment
 from Bio.Seq import Seq
-from Bio import ExPASy
 from Bio.SeqRecord import SeqRecord
+
+from massivora import cpp_bindings
+from massivora.utils import get_cuda_module, gpu_is_available
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +65,6 @@ class TextAlignment(MultipleSeqAlignment):
 
     def _analyze_descriptions(self):
         self._desc_list = []
-        # TODO: try the difference between dict[list] and list[list]
         for record in self._records:
             os_, ox, gn, pe, sv = self._parse_description(record.description)
             self._desc_list.append({
@@ -86,6 +84,27 @@ class TextAlignment(MultipleSeqAlignment):
 
     @classmethod
     def From_SwissProt(cls, protein_id):
+        """
+        Create an instance from SwissProt record. This function will download 
+        protein record from the SwissProt server and then load it. 
+        
+        If the user wish to load an already downloaded file, they should load this file 
+        with BioPython, and then use the constructor of this class to create an instance.
+
+        >>> with open("protein.txt") as f:
+        >>>     record = SeqIO.read(f, 'swiss')
+        >>> alignment = TextAlignment(record)
+
+        Parameters
+        ----------
+        `protein_id` — str
+            Uniprot ID of the protein
+
+        Returns
+        -------
+        `TextAlignment`
+            The alignment instance of that only contains this protein
+        """
         try:
             handle = ExPASy.get_sprot_raw(protein_id)
             record = SeqIO.read(handle, 'swiss')
@@ -94,27 +113,28 @@ class TextAlignment(MultipleSeqAlignment):
             logger.error(f"Failed to fetch protein {protein_id}: {e}")
             return None
 
-    def AnalogueSearch(self, query=None, threshold=0.2, **search_args):
+    def AnalogueSearch(self, query=None, threshold=0.2, output_prefix=None, jackhmmer_path=None, iterations=5, threads=4, database=None):
         if not query:
-            _id = self._records[0].id
-            query = os.path.join(search_args['working_dir'], f'{_id}.fasta')
+            query = output_prefix + '.fasta'
             SeqIO.write(self._records[0], query, "fasta")
-        search_threshold = str(threshold * self.sequenceLength)
+            search_threshold = str(threshold * self.sequenceLength)
+        else:
+            search_threshold = str(threshold * len(query))
         cmd = [
-            search_args['binary'],
-            "-N", str(search_args['iterations']),
+            jackhmmer_path,
+            "-N", str(iterations),
             "-o", '/dev/null',
-            "-A", os.path.join(search_args['working_dir'], f'{_id}_b{threshold}.sto'),
-            "--tblout", os.path.join(search_args['working_dir'], f'{_id}_b{threshold}.tblout'),
-            "--domtblout", os.path.join(search_args['working_dir'], f'{_id}_b{threshold}.domtblout'),
+            "-A", output_prefix + '.sto',
+            "--tblout", output_prefix + '.tblout',
+            "--domtblout", output_prefix + '.domtblout',
             "--noali",
             "--notextw",
             "-T", search_threshold,
             "--domT", search_threshold,
             "--incT", search_threshold,
             "--incdomT", search_threshold,
-            "--cpu", str(search_args['cpu']),
-            query, search_args['database']
+            "--cpu", str(threads),
+            query, database
         ]
         logger.debug("Running Jackhmmer with the following command line: "+ ' '.join(cmd))
         r = subprocess.run(cmd)
@@ -122,11 +142,27 @@ class TextAlignment(MultipleSeqAlignment):
             logger.error(f"Jackhmmer failed with return code {r.returncode}")
             raise RuntimeError(f"Jackhmmer failed with return code {r.returncode}")
         else:
-            self.__init__(os.path.join(search_args['working_dir'], f'{_id}_b{threshold}.sto'))
+            self.__init__(output_prefix + '.sto')
 
     def Get_Numpy_Array(self, mapped=False, string=None):
+        """
+        Transform the MSA into a numpy array.
+
+        Parameters
+        ----------
+        `mapped` — bool (optional)
+            Whether to map the characters into numbers (default: `False`)
+        `string` — str (optional)
+            The string that contains all sequences in the MSA, 
+            concatenated one after another (default: `None`)
+
+        Returns
+        -------
+        `numpy.ndarray`
+            The transformed MSA as a numpy array
+        """
         if not string: string = ''.join([str(record.seq) for record in self])
-        matrix = compute.getAlignmentInNumpy(string, self.sequenceLength, self.sequenceCount)
+        matrix = cpp_bindings.getAlignmentInNumpy(string, self.sequenceLength, self.sequenceCount)
         # First change all the '.' to '-'
         matrix[matrix == b'.'] = b'-'
         if mapped:
@@ -142,6 +178,10 @@ class TextAlignment(MultipleSeqAlignment):
         return matrix
 
     def Filtering_MSA_Invalid(self):
+        """
+        Filtering out the sequences who has invalid characters in the MSA. 
+        Valid characters include 20 natural amino acids and the gap character '-'.
+        """
         # Remove sequences with invalid characters from the alignment
         valid_rows = np.where(np.max(self.encoded_matrix, axis=1) <= 20)[0]
         indices_to_delete = np.setdiff1d(np.arange(len(self._records)), valid_rows)
@@ -156,30 +196,43 @@ class TextAlignment(MultipleSeqAlignment):
         self._update_info()
         logger.info(f'Alignment filtered: {len(self)} sequences, {len(self[0])} positions')
 
-    def Filtering_MSA_Gap(self, row_keep_percentage, col_keep_percentage):
+    def Filtering_MSA_Gap(self, row_keep_ratio=0.5, col_keep_ratio=0.5):
+        """
+        Filtering out the gaps in the MSA according to the set ratios. 
+        This function does: 1. Remove the all-gap columns. 2. Remove sequences 
+        whose gap ratio are higher than `row_keep_ratio`. 3. Create masks for 
+        columns whose gap ratio are higher than `col_keep_ratio`.
+
+        Parameters
+        ----------
+        `row_keep_ratio` — float (optional)
+            Ratio threshold for keep rows (default: `0.5`)
+        `col_keep_ratio` — float (optional)
+            Ratio threshold for keep columns (default: `0.5`)
+        """
         # Compute sequence identity of every sequence to the query
         if not hasattr(self, "_desc_list"):
             self._analyze_descriptions()
         
         # Remove gaps if the input is a stockholm file
-        columns_to_keep = np.array([char != '-' for char in self._records[0].seq])
+        nongap_columns_to_keep = np.array([char != '-' for char in self._records[0].seq])
         matrix = self.matrix.copy()
         encoded_matrix = self.encoded_matrix.copy()
-        encoded_matrix = encoded_matrix[:, columns_to_keep]
+        encoded_matrix = encoded_matrix[:, nongap_columns_to_keep]
 
-        # Calculate the ratio of '-' in each row and filter out rows with a ratio higher than row_keep_percentage
+        # Calculate the ratio of '-' in each row and filter out rows with a ratio higher than row_keep_ratio
         logger.debug("Calculate rows to keep")
         row_gap_ratios = np.sum(encoded_matrix == 0, axis=1) / encoded_matrix.shape[1]
-        indices_to_keep = np.where(row_gap_ratios <= row_keep_percentage)[0]
+        indices_to_keep = np.where(row_gap_ratios <= row_keep_ratio)[0]
         indices_to_delete = np.setdiff1d(np.arange(len(self._records)), indices_to_keep)
         encoded_matrix = encoded_matrix[indices_to_keep]
         logger.debug(f"Matrix shape after row filtering: {encoded_matrix.shape}")
 
-        # Calculate the ratio of '-' in each column and filter out columns with a ratio higher than col_keep_percentage
+        # Calculate the ratio of '-' in each column and filter out columns with a ratio higher than col_keep_ratio
         logger.debug("Calculate columns to keep")
         L = encoded_matrix.shape[0]
         col_gap_ratios = np.sum(encoded_matrix == 0, axis=0) / L
-        cols_to_keep = np.where(col_gap_ratios < col_keep_percentage)[0]
+        cols_to_keep = np.where(col_gap_ratios < col_keep_ratio)[0]
         self.saved_columns = cols_to_keep.tolist() # Just keep it as a mask
 
         # Calculate identity to query for remaining sequences
@@ -196,10 +249,9 @@ class TextAlignment(MultipleSeqAlignment):
             self._desc_list[i]["query_identity"] = float(identity)
 
         logger.debug("Reconstructing alignment")
-        matrix = matrix[:, columns_to_keep]
+        matrix = matrix[:, nongap_columns_to_keep]
         matrix = matrix[indices_to_keep]
-        # matrix = matrix[:, cols_to_keep]
-        # matrix = np.char.upper(matrix)
+
         for i in sorted(indices_to_delete, reverse=True):
             del self._records[i]
             del self._desc_list[i]
@@ -215,12 +267,25 @@ class TextAlignment(MultipleSeqAlignment):
         logger.info(f'Alignment filtered: {len(self)} sequences, {len(self[0])} positions')
 
     def Best_Reciprocal_Hit(self, paralog_threshold=0.9, allowed_error=0.02):
+        """
+        Perform the best reciprocal hit scheme for paralog filtering on this 
+        alignment instance. 
+
+        Parameters
+        ----------
+        `paralog_threshold` — float (optional)
+            Threshold for similarity check (default: `0.9`)
+        `allowed_error` — float (optional)
+            Allowed similarity error (default: `0.02`)
+        """
         # Compute sequence identity of every sequence to the query
         if not hasattr(self, "_desc_list"):
             self._analyze_descriptions()
         encoded_matrix = self.encoded_matrix.copy()
         if self._desc_list[0].get("query_identity") is None:
+            # If the identity to query has not been calculated, calculate it now
             if self.saved_columns:
+                # Columns that are masked out are treated as matches
                 reduced_matrix = encoded_matrix[:, self.saved_columns]
                 query_seq = reduced_matrix[0]
                 ident_to_query = np.round(np.sum(reduced_matrix == query_seq.reshape(1, -1), axis=1)
@@ -243,13 +308,12 @@ class TextAlignment(MultipleSeqAlignment):
         logger.debug("This alignment has {} unique species.".format(len(indices_to_keep1)))
 
         # Get query taxid
-        query_name = self[0].name
-        paralog_taxid = None
+        query_name = self[0].name.split('/')[0]
         for i, rec in enumerate(self[1:]):
             if query_name in rec.name:
                 paralog_taxid = self._desc_list[i+1]["OX"]
                 break
-        if paralog_taxid is None:
+        else:
             logger.warning("No paralog taxid could be identified; skipping paralog filtering.")
             return
 
@@ -290,119 +354,27 @@ class TextAlignment(MultipleSeqAlignment):
 
         self._update_info()
 
-    def Filtering_MSA_Paralog(self):
-        if not hasattr(self, "_desc_list"):
-            self._analyze_descriptions()
-        if self._desc_list[0].get("query_identity") is None:
-            matrix = self.matrix.copy()
-            query_seq = matrix[0]
-            ident_to_query = np.sum(matrix == query_seq.reshape(1, -1), axis=1) / self.sequenceLength
-            for i, identity in enumerate(ident_to_query):
-                self._desc_list[i]["query_identity"] = float(identity)
-        
-        desc_df = pd.DataFrame(self._desc_list)
-        indices_to_keep = (
-            desc_df
-            .sort_values(by="query_identity")   # lowest -> highest
-            .groupby("OX", sort=False)
-            .tail(1)                            # keep last (highest identity) per OX
-            .index.to_numpy()                   # these are the row indices in self._records
-        )
-        all_indices = np.arange(1, len(self._records))
-        indices_to_delete = np.setdiff1d(all_indices, indices_to_keep)
-        logger.debug("Paralogs of query removed. The alignment now has {} sequences.".format(len(indices_to_keep)))
-
-        if not hasattr(self, "_desc_list"):
-            for i in sorted(indices_to_delete, reverse=True):
-                del self._records[i]
-        else:
-            for i in sorted(indices_to_delete, reverse=True):
-                del self._records[i]
-                del self._desc_list[i]
-
-    def Filtering_By_Query_Paralog_Similarity(self, paralog_threshold=0.9):
-        """Remove sequences that are more similar to the paralog group than to the query.
-
-        The first record (index 0) is assumed to be the query. Paralogs are
-        identified in three steps:
-          1) Use the query record's name to find other records with the same
-             name in the alignment.
-          2) For the first such hit (non-query), parse its description to
-             extract the taxid (OX field).
-          3) Use this taxid to collect all records in the alignment that share
-             this taxid; these form the paralog group.
-
-        Any non-paralog sequence whose sequence identity to the *representative*
-        paralog (the paralog with highest sequence identity to the query) is
-        greater than its identity to the query by more than the given threshold
-        is removed. Query and all paralogs are always kept.
+    def __add__(self, other):
+        """
+        Contatenate two MSAs according to the sequence taxids. For paralogous 
+        sequences, only the one with the highest similarity to the query will 
+        be kept.
 
         Parameters
         ----------
-        paralog_threshold : float, optional
-            Minimal difference (paralog_id - query_id) above which a sequence
-            is considered closer to the paralog and therefore removed.
-            Default is 0.0 (strictly closer to paralog).
+        `other` — TextAlignment
+            The other alignment instance
+
+        Returns
+        -------
+        `TextAlignment`
+            The concatenated alignment instance
+
+        Raises
+        ------
+        `NotImplementedError`
+            If the other operand is not an alignment instance
         """
-        query_name = self[0].name
-        paralog_taxid = None
-
-        if not hasattr(self, "_desc_list"):
-            self._analyze_descriptions()
-
-        for i, rec in enumerate(self[1:]):
-            if query_name in rec.name:
-                paralog_taxid = self._desc_list[i+1]["OX"]
-                break
-        if paralog_taxid is None:
-            logger.warning("No paralog taxid could be identified; skipping paralog filtering.")
-            return
-
-        # Compute sequence identity of every sequence to the query
-        matrix = self.matrix.copy()
-        if self._desc_list[0].get("query_identity") is None:
-            query_seq = matrix[0]
-            ident_to_query = np.sum(matrix == query_seq.reshape(1, -1), axis=1) / self.sequenceLength
-            for i, identity in enumerate(ident_to_query):
-                self._desc_list[i]["query_identity"] = float(identity)
-
-        # Collect all paralog records sharing this taxid
-        paralog_indices = []
-        for i, desc in enumerate(self._desc_list):
-            if desc["OX"] == paralog_taxid and self._desc_list[i]["query_identity"] < paralog_threshold:
-                paralog_indices.append(i)
-        if len(paralog_indices) == 0:
-            logger.warning("No paralog sequences found for identified taxid; skipping paralog filtering.")
-            return
-
-        # Calculate identity of each sequence to the paralog group
-        paralog_seqs = matrix[paralog_indices]
-        ident_to_paralog = np.sum(matrix == paralog_seqs.reshape(paralog_seqs.shape[0], 1, -1), axis=2) / self.sequenceLength
-
-        # Compare similarities, if sequence is more similar to any paralog than the query, remove it
-        indices_to_keep = [0]  # always keep query
-        for i in range(1, len(self)):
-            max_paralog_id = np.max(ident_to_paralog[:, i])
-            if max_paralog_id < self._desc_list[i]["query_identity"]+0.02:
-                indices_to_keep.append(i)
-
-        # Delete all other sequences
-        indices_to_delete = np.setdiff1d(np.arange(len(self)), indices_to_keep)
-        if not hasattr(self, "_desc_list"):
-            for i in sorted(indices_to_delete, reverse=True):
-                del self._records[i]
-        else:
-            for i in sorted(indices_to_delete, reverse=True):
-                del self._records[i]
-                del self._desc_list[i]
-
-        self._update_info()
-        logger.info(
-            f'Filtered alignment contains: {len(self)} sequences after paralog filtering; '
-            f'paralog taxid={paralog_taxid}, total paralogs={len(paralog_indices)}'
-        )
-
-    def __add__(self, other):
         if not isinstance(other, MultipleSeqAlignment):
             raise NotImplementedError("Only MultipleSeqAlignment can be concatenated")
         
@@ -465,6 +437,14 @@ class TextAlignment(MultipleSeqAlignment):
         return TextAlignment(merged)
 
     def Downsample_Randomly(self, to):
+        """
+        Downsample the alignment randomly to a lower size
+
+        Parameters
+        ----------
+        `to` — int
+            The number of sequences to downsample to
+        """
         if to >= self.sequenceCount:
             logger.error(f"Downsampling to {to} is not possible, as the alignment has only {self.sequenceCount} sequences")
             return
@@ -475,13 +455,26 @@ class TextAlignment(MultipleSeqAlignment):
         self._update_info()
 
     def To_Zarr(self, filename=None, overwrite=False):
+        """
+        Save the alignment as a Zarr format. The sequences will be grouped by 
+        species, and the one with the highest identity to the query will be 
+        put at the first position for each species. The species list and saved
+        columns will be saved as Zarr attributes. This function will also create
+        a species_index_map indicating the starting index of a species.
+
+        Parameters
+        ----------
+        `filename` — str (optional)
+            Filename of the Zarr archive. If not set, 
+            will use alignmentName as default (default: `None`)
+        `overwrite` — bool (optional)
+            Whether to overwrite the existing file (default: `False`)
+        """
         if not filename: filename = f'{self.alignmentName}'
-        if os.path.exists(filename) & os.path.exists(os.path.join(filename, 'c')):
+        if os.path.exists(os.path.join(filename, 'align', 'zarr.json')):
             if overwrite:
                 logger.warning(f"File {filename} already exists. Overwriting it.")
-                shutil.rmtree(os.path.join(filename, 'c'), ignore_errors=True)
-                os.remove(os.path.join(filename, 'zarr.json'))
-                os.remove(os.path.join(filename, 'metadata.pkl'))
+                shutil.rmtree(os.path.join(filename, 'align'), ignore_errors=True)
             else:
                 logger.error(f"File {filename} already exists. Use overwrite=True to overwrite it.")
                 return
@@ -521,41 +514,38 @@ class TextAlignment(MultipleSeqAlignment):
             species_list.append(species)
             p_seq += sequence_count
         matrix = self.Get_Numpy_Array(mapped=True, string=tempstr)
-        z = zarr.create_array(store=filename,shape=(self.sequenceCount, self.sequenceLength), dtype='int8')
-        metadata = {
+        grp = zarr.open_group(store=filename)
+        z = grp.create_array(name='align', shape=(self.sequenceCount, self.sequenceLength), dtype='int8')
+        z.attrs.update({
             'species_list': species_list, 
             'species_index_map': species_index_map,
-            'saved_columns': list(self.saved_columns)
-        }
-        with open(os.path.join(filename, 'metadata.pkl'), 'wb') as f:
-            pickle.dump(metadata, f)
+            'saved_columns': [list(self.saved_columns)],
+            'lengthes': [len(self[0].seq)]
+        })
         z[:] = matrix
 
 
-class ZarrAlignment(object):
+class BinaryAlignment(object):
     def __init__(self, filename=None):
         self.matrix = np.zeros((0, 0), dtype=np.int8)
-        self.metadata = {}
         self.species_list_map = {}
         self.saved_columns = []
+        self.lengthes = []
 
         if isinstance(filename, str):
             try:
-                with open(os.path.join(filename, 'metadata.pkl'), 'rb') as f:
-                    self.metadata = pickle.load(f)
+                arr = zarr.open_group(filename, mode='r')
+                align = arr['align']
+                self.matrix = align[:]
+                self.weights = align.attrs.get('weights', None)
+                self.Beff = align.attrs.get('Beff', None)
+                self.saved_columns = align.attrs.get('saved_columns', [])
+                self.lengthes = align.attrs.get('lengthes', [self.matrix.shape[1]])
+                self.species_list = align.attrs.get('species_list', [])
+                self.species_index_map = align.attrs.get('species_index_map', {})
+                self.species_list_map = {species: i for i, species in enumerate(self.species_list)}
             except Exception as e:
-                logger.error(f"Metadata file not found in {filename}, {e}")
-                raise FileNotFoundError(f"Metadata file not found in {filename}")
-            try:
-                arr = zarr.open(filename, mode='r')
-                self.matrix = arr[:]
-                self.weights = arr.attrs.get('weights', None)
-                self.Beff = arr.attrs.get('Beff', None)
-            except Exception as e:
-                logger.error(f"Error loading Zarr file {filename}, {e}")
                 raise FileNotFoundError(f"Error loading Zarr file {filename}")
-            self.species_list_map = {species: i for i, species in enumerate(self.metadata['species_list'])}
-            self.saved_columns = self.metadata.get('saved_columns', [])
 
     def __repr__(self):
         return "<%s instance (%i records of length %i) at %x>" % (
@@ -566,40 +556,93 @@ class ZarrAlignment(object):
         )
 
     def __str__(self):
-        return f"Alignment from Zarr with {len(self.metadata['species_list'])} species"
+        return f"Alignment from Zarr with {len(self.species_list)} species"
 
     def __add__(self, other):
-        # Ensure that Query is the first species in both alignments
-        common_species = sorted(list(set(self.metadata['species_list'][1:]) & set(other.metadata['species_list'][1:])))
-        common_species.insert(0, self.metadata['species_list'][0])
+        """
+        Concatenate the two MSAs according to the sequence taxids
 
-        new_instance = ZarrAlignment()
-        self_saved = list(range(self.matrix.shape[1]))
-        other_saved = list(range(other.matrix.shape[1]))
-        saved_columns = self_saved + other_saved
-        new_instance.metadata = {
-            'species_list': common_species,
-            'species_index_map': list(range(len(common_species))),
-            'saved_columns': saved_columns
-        }
-        new_instance.saved_columns = new_instance.metadata['saved_columns']
-        new_instance.species_list_map = {species: i for i, species in enumerate(new_instance.metadata['species_list'])}
+        Parameters
+        ----------
+        `other` — BinaryAlignment
+            The incoming alignment instance
+
+        Returns
+        -------
+        `BinaryAlignment`
+            The concatenated alignment instance
+        """
+        # Ensure that Query is the first species in both alignments
+        common_species = sorted(list(set(self.species_list[1:]) & set(other.species_list[1:])))
+        common_species.insert(0, self.species_list[0])
+
+        new_instance = BinaryAlignment()
+        new_instance.species_list = common_species
+        new_instance.species_index_map = list(range(len(common_species)))
+        new_instance.saved_columns = self.saved_columns + other.saved_columns
+        new_instance.lengthes = self.lengthes + other.lengthes
+        new_instance.species_list_map = {species: i for i, species in enumerate(new_instance.species_list)}
 
         # species_list_map[species] is the index of the species in the species_list
-        # metadata['species_index_map'][species_list_map[species]] is the index of the species in the matrix
-        indices1 = np.array([self.metadata['species_index_map'][self.species_list_map[species]] for species in common_species])
-        indices2 = np.array([other.metadata['species_index_map'][other.species_list_map[species]] for species in common_species])
+        # species_index_map[species_list_map[species]] is the index of the species in the matrix
+        indices1 = np.array([self.species_index_map[self.species_list_map[species]] for species in common_species])
+        indices2 = np.array([other.species_index_map[other.species_list_map[species]] for species in common_species])
         new_instance.matrix = np.concatenate((self.matrix[indices1], other.matrix[indices2]), axis=1)
 
         return new_instance
 
-    def Column_Gap_Control(self, gap_percentage=50):
-        gap_percentage /= 100
-        L = self.matrix.shape[0]
+    def Gap_Columns_Control(self, gap_ratio=0.5):
+        """
+        Before this call, saved_columns is a list of per-monomer masks.
+        After this call, it becomes a list of per-monomer per-column index maps
+        that reflect the gap ratio control. The alignment matrix is not modified.
+        Any existing mask is ignored and recomputed from scratch.
+        If available, monomer boundaries are derived from lengthes.
+
+        The gap ratio is calculated as the number of gaps in a column divided
+        by the total number of sequences. Columns with a gap ratio higher than
+        the specified threshold will be excluded from the saved_columns mask.
+
+        Parameters
+        ----------
+        `gap_ratio` — float (optional)
+            Gap ratio in columns (default: `0.5`)
+        """
+        L, n_cols = self.matrix.shape
+
+        # Ignore any prior mask: all columns are eligible
+        if self.lengthes:
+            total_len = int(np.sum(self.lengthes))
+            if total_len == n_cols:
+                block_offsets = [0]
+                cursor = 0
+                for block_len in self.lengthes[:-1]:
+                    cursor += int(block_len)
+                    block_offsets.append(cursor)
+            else:
+                logger.warning(
+                    "lengthes sum (%d) does not match alignment width (%d); treating as single monomer",
+                    total_len,
+                    n_cols,
+                )
+                block_offsets = [0]
+        else:
+            # No per-monomer lengths available: treat as single monomer
+            block_offsets = [0]
+
         col_gap_ratios = np.sum(self.matrix == 0, axis=0) / L
-        cols_to_keep = np.where(col_gap_ratios < gap_percentage)[0]
-        self.matrix = self.matrix[:, cols_to_keep]
-        self.saved_columns = [self.saved_columns[i] for i in cols_to_keep]
+        cols_to_keep = np.where(col_gap_ratios < gap_ratio)[0]
+
+        # Rebuild saved_columns as per-monomer per-column maps
+        block_ends = block_offsets[1:] + [n_cols]
+        new_saved_columns = [[] for _ in range(len(block_offsets))]
+        for col in cols_to_keep:
+            for block_idx, (start, end) in enumerate(zip(block_offsets, block_ends)):
+                if start <= col < end:
+                    new_saved_columns[block_idx].append(int(col - start))
+                    break
+
+        self.saved_columns = new_saved_columns
 
     def Downsample_Randomly(self, to):
         if to >= self.matrix.shape[0]:
@@ -615,27 +658,48 @@ class ZarrAlignment(object):
         new_species_index_map = list(range(kept_count))
 
         for i in range(kept_count-1):
-            new_species_list.append(self.metadata['species_list'][chosen_indices[i + 1]])
+            new_species_list.append(self.species_list[chosen_indices[i + 1]])
 
-        self.metadata['species_list'] = new_species_list
-        self.metadata['species_index_map'] = new_species_index_map
+        self.species_list = new_species_list
+        self.species_index_map = new_species_index_map
         self.species_list_map = {species: i for i, species in enumerate(new_species_list)}
 
-    def Reweight_Sequence(self, x=0.8):
-        B = self.matrix.shape[0]
-        N = self.matrix.shape[1]
+    def Reweight_Sequence(self, x=0.8, use_GPU=False):
+        B, N = self.matrix.shape
         identical_threshold = x * N
-        simM = np.full((B,B), N, dtype=np.int16)
 
-        # TODO: parallelize this (or not?)
-        for b in range(B-1):
-            identical_positions = np.equal(self.matrix[b+1:], self.matrix[b])
-            identity_scores = np.sum(identical_positions, axis=1)
-            simM[b, b+1:] = identity_scores
-            simM[b+1:, b] = identity_scores
-        m = np.sum(simM >= identical_threshold, axis=0)
-        w = 1/m
-        Beff = w.sum()
+        if use_GPU:
+            if not gpu_is_available():
+                logger.error("CuPy is not available. Please install CuPy to use GPU acceleration.")
+                raise ImportError("CuPy is not available. Please install CuPy to use GPU acceleration.")
+            import cupy as cp
+
+            tx = 16
+            ty = 16
+            bx = math.ceil(B / tx)
+            by = math.ceil(B / ty)
+            MSA = cp.asarray(self.matrix, dtype=cp.int8)
+            simM = cp.ones(B, dtype=cp.int32)
+
+            cuda_module = get_cuda_module()
+            pairwise_similarity = cuda_module.get_function('pairwise_similarity')
+            pairwise_similarity((bx, by), (tx, ty), (MSA, simM, np.int32(B), np.int32(N), np.float32(identical_threshold)))
+            cp.cuda.runtime.deviceSynchronize()
+
+            w_d = 1.0 / simM.astype(cp.float32)
+            Beff = cp.sum(w_d)
+            w = cp.asnumpy(w_d)
+            del MSA, simM, w_d
+        else:
+            simM = np.full((B,B), N, dtype=np.int16)
+            for b in range(B-1):
+                identical_positions = np.equal(self.matrix[b+1:], self.matrix[b])
+                identity_scores = np.sum(identical_positions, axis=1)
+                simM[b, b+1:] = identity_scores
+                simM[b+1:, b] = identity_scores
+            m = np.sum(simM >= identical_threshold, axis=0)
+            w = 1/m
+            Beff = w.sum()
 
         self.weights = w.tolist()
         self.Beff = float(Beff)
@@ -652,21 +716,25 @@ class ZarrAlignment(object):
         ascii_codes = reverse_mapping[self.matrix + 20]
         char_matrix = np.frombuffer(ascii_codes.tobytes(), dtype='S1').reshape(self.matrix.shape)
         if restore_gaps:
-            diff = np.diff(self.saved_columns)
-            decrease_indices = np.where(diff < 0)[0]
-            monomer_starts = [0]
-            for ending in decrease_indices:
-                monomer_starts.append(ending + 1)
             monomer_matrices = []
-            for i in range(len(monomer_starts)):
-                start_idx = monomer_starts[i]
-                end_idx = monomer_starts[i + 1] if i + 1 < len(monomer_starts) else len(self.saved_columns)
-                monomer_saved_cols = self.saved_columns[start_idx:end_idx]
-                monomer_char_matrix = char_matrix[:, start_idx:end_idx]
-                monomer_original_length = max(monomer_saved_cols) + 1
+            cursor = 0
+            for monomer_idx, monomer_saved_cols in enumerate(self.saved_columns):
+                n = len(monomer_saved_cols)
+                monomer_char_matrix = char_matrix[:, cursor:cursor + n]
+                cursor += n
+
+                if self.lengthes and monomer_idx < len(self.lengthes):
+                    monomer_original_length = int(self.lengthes[monomer_idx])
+                elif monomer_saved_cols:
+                    monomer_original_length = max(monomer_saved_cols) + 1
+                else:
+                    monomer_original_length = 0
+
                 monomer_original_matrix = np.full((self.matrix.shape[0], monomer_original_length), b'-', dtype='S1')
-                monomer_original_matrix[:, monomer_saved_cols] = monomer_char_matrix
+                if monomer_saved_cols:
+                    monomer_original_matrix[:, monomer_saved_cols] = monomer_char_matrix
                 monomer_matrices.append(monomer_original_matrix)
+
             original_matrix = np.concatenate(monomer_matrices, axis=1)
         else:
             original_matrix = char_matrix.copy()
@@ -675,7 +743,7 @@ class ZarrAlignment(object):
         # Convert matrix back to SeqRecord objects
         seq_records = []
         i = 0
-        for species, starting_idx in zip(self.metadata['species_list'][:-1], self.metadata['species_index_map'][1:]):
+        for species, starting_idx in zip(self.species_list[:-1], self.species_index_map[1:]):
             for _ in range(i, starting_idx):
                 row = original_matrix[i]
                 sequence_str = ''.join(row.tolist())
@@ -687,7 +755,7 @@ class ZarrAlignment(object):
                 )
                 seq_records.append(seq_record)
                 i += 1
-        species = self.metadata['species_list'][-1]
+        species = self.species_list[-1]
         for _ in range(i, original_matrix.shape[0]):
             row = original_matrix[i]
             sequence_str = ''.join(row.tolist())
@@ -707,25 +775,24 @@ class ZarrAlignment(object):
 
     def To_Zarr(self, filename=None, overwrite=False):
         if not filename: filename = 'merged_alignment'
-        if os.path.exists(filename):
+        if os.path.exists(os.path.join(filename, 'align', 'zarr.json')):
             if overwrite:
                 logger.warning(f"File {filename} already exists. Overwriting it.")
-                if os.path.exists(os.path.join(filename, 'c')):
-                    shutil.rmtree(os.path.join(filename, 'c'), ignore_errors=True)
-                os.remove(os.path.join(filename, 'zarr.json'))
-                os.remove(os.path.join(filename, 'metadata.pkl'))
+                shutil.rmtree(os.path.join(filename, 'align'), ignore_errors=True)
             else:
                 logger.error(f"File {filename} already exists. Use overwrite=True to overwrite it.")
                 return
-        z = zarr.create_array(store=filename,shape=self.matrix.shape, dtype='int8')
+        grp = zarr.open_group(store=filename)
+        z = grp.create_array(name='align', shape=self.matrix.shape, dtype='int8')
         z.attrs.update({
+            'saved_columns': getattr(self, 'saved_columns', None),
+            'species_list': getattr(self, 'species_list', None),
+            'species_index_map': getattr(self, 'species_index_map', None),
+            'lengthes': getattr(self, 'lengthes', [self.matrix.shape[1]]),
             'weights': getattr(self, 'weights', None),
             'Beff': getattr(self, 'Beff', None)
         })
-        # TODO: move python pkl metadata to zarr metadata
-        self.metadata['saved_columns'] = self.saved_columns
-        with open(os.path.join(filename, 'metadata.pkl'), 'wb') as f:
-            pickle.dump(self.metadata, f)
+
         z[:] = self.matrix
 
     def To_Npy(self, filename=None):
@@ -733,42 +800,6 @@ class ZarrAlignment(object):
             np.save(filename, self.matrix)
         return self.matrix
 
-if __name__ == '__main__':
-    FORMAT = '%(asctime)s %(levelname)s - From %(name)s: %(message)s'
-    logging.basicConfig(format=FORMAT, stream=sys.stderr, level=logging.DEBUG)
 
-    start_time = time.time()
-    alignment1 = TextAlignment("/Users/simon/research/EVcouplings/residue_distance/ATPA_HUMAN_b0.2.sto")
-    # alignment1 = TextAlignment("/Users/simon/Downloads/RL22_ECOLI_1-110_b0.2/align/RL22_ECOLI_1-110_b0.2.sto")
-    alignment1.Filtering_MSA_Gap(50, 50)
-    # alignment1.Filtering_MSA_Paralog()
-    # df = pd.DataFrame(alignment1._desc_list)
-    # df.to_pickle("/Users/simon/Downloads/RL18New.pkl")
-    # alignment1.Filtering_By_Query_Paralog_Similarity()
-    alignment1.Filtering_MSA_Invalid()
-    alignment1.Best_Reciprocal_Hit()
-    # alignment1.Filtering_MSA_Gap(100, 50)
-    alignment1.To_Zarr("/Users/simon/Downloads/ATPA_HUMAN", overwrite=True)
-    alignment2 = TextAlignment("/Users/simon/research/EVcouplings/residue_distance/ATPB_HUMAN_b0.2.sto")
-    # alignment2 = TextAlignment("/Users/simon/Downloads/RL31_ECOLI_1-70_b0.2/align/RL31_ECOLI_1-70_b0.2.sto")
-    alignment2.Filtering_MSA_Gap(50, 50)
-    # alignment2.Filtering_MSA_Paralog()
-    # df = pd.DataFrame(alignment2._desc_list)
-    # df.to_pickle("/Users/simon/Downloads/RL31New.pkl")
-    # alignment2.Filtering_By_Query_Paralog_Similarity()
-    alignment2.Filtering_MSA_Invalid()
-    alignment2.Best_Reciprocal_Hit()
-    # alignment2.Filtering_MSA_Gap(100, 50)
-    alignment2.To_Zarr("/Users/simon/Downloads/ATPB_HUMAN", overwrite=True)
-    logger.info(f"Time taken for reducing: {time.time() - start_time:.2f}s")
-    start_time = time.time()
-    zarr1 = ZarrAlignment("/Users/simon/Downloads/ATPA_HUMAN")
-    zarr2 = ZarrAlignment("/Users/simon/Downloads/ATPB_HUMAN")
-    merged_alignment = zarr1 + zarr2
-    merged_alignment.Reweight_Sequence(x=0.8)
-    # merged_alignment.Filtering_MSA_Gap(100, 50)
-    # merged_alignment.Filtering_MSA_Invalid()
-    merged_alignment.To_Zarr("/Users/simon/Downloads/ATPA_ATPB_HUMAN", overwrite=True)
-    logger.info(f"Time taken for concatenating: {time.time() - start_time:.2f}s")
 
 

@@ -1,0 +1,44 @@
+# Massivora conda environment — the recommended (primary) installation path.
+#
+#   conda env create -f environment.yml      # creates the env + native toolchain
+#   conda activate massivora
+#   pip install . --no-build-isolation        # build & install Massivora (runs CMake)
+#   conda install -c conda-forge cupy         # optional: GPU acceleration
+#
+# This env provides the build toolchain (compilers, CMake, Ninja, NLopt, Eigen,
+# pybind11, scikit-build-core) and `openstructure` (the `ost` runtime dep, only
+# available via bioconda).
+name: massivora
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  - pip
+
+  # --- Native build toolchain (used by `pip install . --no-build-isolation`) ---
+  - c-compiler
+  - cxx-compiler
+  - cmake>=3.18
+  - ninja
+  - pkg-config
+  - scikit-build-core
+  - pybind11>=2.12
+  - eigen
+  - nlopt
+
+  # --- Runtime dependency only available via conda (bioconda) ---
+  - openstructure
+
+  # --- Python runtime dependencies (resolved by conda for better binaries) ---
+  - pandas
+  - numpy
+  - scipy
+  - biopython
+  - matplotlib
+  - rich
+  - zarr
+  - psutil
+  - pyyaml
+  - dask
+  - distributed

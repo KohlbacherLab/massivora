@@ -11,19 +11,22 @@ from rich.progress import (BarColumn, MofNCompleteColumn, Progress, TextColumn,
 
 from massivora.config import (_normalize_config_path,
                               load_project_and_system_config)
-from massivora.db import STATUS, connect_db
-from massivora.logging_utils import setup_logging
+from massivora.db import (STATUS, connect_db, get_table_names, get_db_path,
+                          quote_identifier)
+from massivora.utils import setup_logging
 
 
 class BaseJobLoader(object):
     def __init__(self, project_cfg):
         self.config_path = _normalize_config_path(project_cfg)
         self.config = load_project_and_system_config(self.config_path)
-        paths = self.config.get('paths')
         self.project_path = self.config.get('project').get('project_path')
-        db_rel = paths.get('job_db')
-        self.db_path = os.path.join(self.project_path, db_rel) if self.project_path and db_rel else None
-        self.conda_env = self.config.get('manager').get('conda_env')
+        self.db_path = get_db_path(self.config)
+        self.conda_prefix = os.environ.get('CONDA_PREFIX')
+
+        # Extract table names
+        self.table_names = get_table_names(self.config)
+
         setup_logging(self.config)
 
     def download_protein(self, protein):
@@ -40,20 +43,28 @@ class BaseJobLoader(object):
             os.makedirs(output_folder, 0o755)
         except OSError:
             logging.warning(f"Directory for protein \"{protein}\" already exists")
-        conn = connect_db(self.db_path)
+
+        align_table = quote_identifier(self.table_names['alignments'])
+
+        conn = connect_db(self.config)
         cursor = conn.cursor()
         try:
             handle = ExPASy.get_sprot_raw(protein)
             with open(os.path.join(output_folder, f"{protein}.txt"), 'w') as f:
                 f.write(handle.read())
             cursor.execute(
-                "INSERT OR IGNORE INTO alignments (pid, status) VALUES (?, ?)",
-                (protein, -1),
+                f"UPDATE {align_table} SET status = ? WHERE pid = ?",
+                (STATUS['NOOPT'], protein),
             )
             conn.commit()
             conn.close()
         except Exception as e:
             logging.error(f"Failed to fetch protein {protein}: {e}")
+            cursor.execute(
+                f"UPDATE {align_table} SET status = ? WHERE pid = ?",
+                (STATUS['FAILED'], protein),
+            )
+            conn.commit()
             conn.close()
 
 
@@ -80,17 +91,62 @@ class LocalJobLoader(BaseJobLoader):
     def __init__(self, project_cfg):
         super().__init__(project_cfg)
 
-    def run_align(self, protein_list):
-        cmd = ['massiworker', 'align', '--config', self.config_path, self.config.get('project').get('proteins_list')]
-        return subprocess.run(cmd).returncode
+    def _run_detached(self, cmd, log_prefix):
+        logging_cfg = self.config.get('logging') or {}
+        log_dir = logging_cfg.get('dir')
+        if not log_dir:
+            log_dir = os.path.join(self.project_path, 'logs')
+        elif not os.path.isabs(log_dir):
+            log_dir = os.path.join(self.project_path, log_dir)
+        os.makedirs(log_dir, mode=0o755, exist_ok=True)
+
+        stdout_path = os.path.join(log_dir, f"{log_prefix}.out")
+        stderr_path = os.path.join(log_dir, f"{log_prefix}.err")
+
+        # Run in a new session and detach from the controlling terminal.
+        with open(stdout_path, 'ab') as stdout, open(stderr_path, 'ab') as stderr:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=True,
+                close_fds=True,
+            )
+
+        logging.info(
+            "Started background job %s (pid=%s). Logs: %s",
+            log_prefix,
+            proc.pid,
+            log_dir,
+        )
+        return proc.pid
+
+    def run_align(self):
+        cmd = ['massiworker', 'align', '--config', self.config_path]
+        return self._run_detached(cmd, 'align')
 
     def run_concatenate(self):
-        cmd = ['massiworker', 'concat', '--config', self.config_path]
-        return subprocess.run(cmd).returncode
+        align_table = quote_identifier(self.table_names['alignments'])
+
+        conn = connect_db(self.config)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT pid from {align_table} where status = ?", (STATUS['DONE'],))
+        done_alignments = [pid for (pid,) in cursor]
+        jobs = list(combinations(done_alignments, 2))
+        conn.close()
+
+        jobs_file = os.path.join(self.project_path, "concat_jobs.txt")
+        with open(jobs_file, 'w') as f:
+            for job in jobs:
+                f.write(f"{','.join(job)}\n")
+
+        cmd = ['massiworker', 'concat', '--config', self.config_path, jobs_file]
+        return self._run_detached(cmd, 'concat')
 
     def run_couple(self):
         cmd = ['massiworker', 'couple', '--config', self.config_path]
-        return subprocess.run(cmd).returncode
+        return self._run_detached(cmd, 'couple')
 
 
 class SlurmJobLoader(BaseJobLoader):
@@ -145,6 +201,7 @@ class SlurmJobLoader(BaseJobLoader):
         )
         if time_limit:
             header += f"#SBATCH --time={time_limit}\n"
+        header += "source /etc/profile\n"
         if modules:
             header += "module purge\n"
             for module in modules:
@@ -152,69 +209,56 @@ class SlurmJobLoader(BaseJobLoader):
         header += "export OMP_NUM_THREADS=1\n"
         return header
 
-    def run_align(self, protein_list):
+    def run_align(self):
         batch = self.config.get('batch')
-        align = self.config.get('align')
-        maximum_nodes = int(batch.get('maximum_nodes', 1))
-        portion = float(align.get('portion', 1.0))
-        portion_start = float(align.get('portion_start', 0.0))
+        align_cfg = self.config.get('align') or {}
+        align_table = quote_identifier(self.table_names['alignments'])
 
-        total_proteins = len(protein_list)
-        total_proteins_this_slurm = int(total_proteins * portion)
-        starting_protein_index = int(total_proteins * portion_start)
-        proteins_per_node = total_proteins_this_slurm // maximum_nodes + 1
+        maximum_nodes = max(1, int(batch.get('maximum_nodes', 1)))
+        total_cpu = max(1, int(batch.get('cpu_count', 1)))
+        per_job_cpu = max(1, int(align_cfg.get('per_job_cpu', 4)))
+
+        # Each submitted node can claim this many alignment jobs concurrently.
+        jobs_per_node = max(1, total_cpu // per_job_cpu)
+
+        conn = connect_db(self.config)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT COUNT(*) FROM {align_table}")
+        total_jobs = int(cursor.fetchone()[0])
+        conn.close()
+
+        if total_jobs <= 0:
+            logging.error("No alignment jobs found in alignments table; skipping SLURM submission.")
+            return
+
+        # Minimal nodes needed to cover all jobs in the first batch, capped by configured maximum.
+        nodes_needed = (total_jobs + jobs_per_node - 1) // jobs_per_node
+        maximum_nodes = min(maximum_nodes, nodes_needed)
 
         for node in range(maximum_nodes):
-            if starting_protein_index >= total_proteins_this_slurm + starting_protein_index:
-                break
-
-            this_node_start = starting_protein_index + node * proteins_per_node
-            this_node_end = min(
-                this_node_start + proteins_per_node,
-                total_proteins_this_slurm + starting_protein_index,
-            )
-            proteins = protein_list[this_node_start:this_node_end]
-            if not proteins:
-                continue
-            
-            this_node_proteins_file = os.path.join(self.script_dir, f"align_node_{node}.txt")
-            with open(this_node_proteins_file, 'w') as f:
-                for pid in proteins:
-                    f.write(f"{pid}\n")
-
             job_name = f"{self.job_name_prefix}_ali{node}"
-            header = self.default_sbatch_header(job_name, cpus_per_task=self.cpu_count, time_limit=self.time_limit, log_dir=self.log_dir, modules=self.modules)
-            cmd = f"conda run -n {self.conda_env} massiworker align --config {self.config_path} {this_node_proteins_file}\n"
+            header = self.default_sbatch_header(job_name, cpus_per_task=total_cpu, time_limit=self.time_limit, log_dir=self.log_dir, modules=self.modules)
+            cmd = f"conda run -p {self.conda_prefix} massiworker align --config {self.config_path}\n"
 
             script_path = os.path.join(self.script_dir, f"align_node_{node}.sh")
             self.write_script(script_path, header + cmd)
-
             job_id = self.sbatch(script_path)
 
-            conn = connect_db(self.db_path)
+            conn = connect_db(self.config)
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO jobs (job_id) VALUES (?)",
-                (str(job_id),)
+                "INSERT INTO jobs (job_id, status) VALUES (?, ?)",
+                (str(job_id), 'PENDING')
             )
-
-            # Record job_id for each protein
-            for pid in proteins:
-                cursor.execute(
-                    "UPDATE alignments SET job_id = ?, status = ? WHERE pid = ?",
-                    (str(job_id), STATUS['PENDING'], pid),
-                )
             conn.commit()
             conn.close()
 
     def run_concatenate(self):
-        project_path = (self.config.get('project') or {}).get('project_path')
-        if not project_path:
-            raise SystemExit('Missing config: project.project_path')
+        align_table = quote_identifier(self.table_names['alignments'])
 
-        conn = connect_db(self.db_path)
+        conn = connect_db(self.config)
         cursor = conn.cursor()
-        cursor.execute("SELECT pid from alignments where status = ?", (STATUS['DONE'],))
+        cursor.execute(f"SELECT pid from {align_table} where status = ?", (STATUS['DONE'],))
         done_alignments = [pid for (pid,) in cursor]
         jobs = list(combinations(done_alignments, 2))
         conn.close()
@@ -250,18 +294,18 @@ class SlurmJobLoader(BaseJobLoader):
 
             job_name = f"{self.job_name_prefix}_cc{node}"
             header = self.default_sbatch_header(job_name, cpus_per_task=self.cpu_count, time_limit=self.time_limit, log_dir=self.log_dir, modules=self.modules)
-            cmd = f"conda run -n {self.conda_env} massiworker concat --config {self.config_path} {this_node_jobs_file}\n"
+            cmd = f"conda run -p {self.conda_prefix} massiworker concat --config {self.config_path} {this_node_jobs_file}\n"
 
             script_path = os.path.join(self.script_dir, f"concat_node_{node}.sh")
             self.write_script(script_path, header + cmd)
 
             job_id = self.sbatch(script_path)
 
-            conn = connect_db(self.db_path)
+            conn = connect_db(self.config)
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO jobs (job_id) VALUES (?)",
-                (str(job_id),)
+                "INSERT INTO jobs (job_id, status) VALUES (?, ?)",
+                (str(job_id), 'PENDING')
             )
             conn.commit()
             conn.close()
@@ -269,44 +313,22 @@ class SlurmJobLoader(BaseJobLoader):
     def run_couple(self):
         batch = self.config.get('batch')
         maximum_nodes = int(batch.get('maximum_nodes', 1))
-        coupling_cfg = self.config.get('coupling')
-        portion = float(coupling_cfg.get('portion', 1.0))
-        portion_start = float(coupling_cfg.get('portion_start', 0.0))
-
-        # Record job_id for coupling task id range
-        conn = connect_db(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT COUNT(*) FROM couplings WHERE status != ?",
-            (STATUS['DONE'],),
-        )
-        total_proteins = cursor.fetchone()[0]
-        conn.close()
-
-        total_couplings = int(total_proteins * (total_proteins - 1) / 2)
-        total_couplings_this_slurm = int(total_couplings * portion) + 1
-        starting_coupling_index = int(total_couplings * portion_start) + 1
-        per_node = total_couplings_this_slurm // maximum_nodes + 1
 
         for node in range(maximum_nodes):
-            if starting_coupling_index >= total_couplings_this_slurm + starting_coupling_index:
-                break
-
             job_name = f"{self.job_name_prefix}_cp{node}"
             header = self.default_sbatch_header(job_name, cpus_per_task=self.cpu_count, time_limit=self.time_limit, log_dir=self.log_dir, modules=self.modules)
-            cmd = f"conda run -n {self.conda_env} massiworker couple --config {self.config_path}"
-
+            cmd = f"conda run -p {self.conda_prefix} massiworker couple --config {self.config_path}"
 
             script_path = os.path.join(self.script_dir, f"coupling_node_{node}.sh")
             self.write_script(script_path, header + cmd)
 
             job_id = self.sbatch(script_path)
 
-            conn = connect_db(self.db_path)
+            conn = connect_db(self.config)
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO jobs (job_id) VALUES (?)",
-                (str(job_id),)
+                "INSERT INTO jobs (job_id, status) VALUES (?, ?)",
+                (str(job_id), 'PENDING')
             )
             conn.commit()
             conn.close()

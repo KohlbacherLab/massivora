@@ -12,14 +12,41 @@ from ost.geom import MinDistance, Vec3List
 
 logger = logging.getLogger(__name__)
 
-class BaseBenchmarker(object):
+class BaseAnalyzer(object):
     def __init__(self, EC_threshold=0.7, distance_cutoff=8, min_seq_length=1):
         self.distance_cutoff = distance_cutoff
         self.EC_threshold = EC_threshold
         self.min_seq_length = min_seq_length
 
+    @staticmethod
+    def _to_one_based_labels(labels):
+        idx = pd.Index(labels)
+        if idx.empty:
+            return idx
+        numeric = pd.to_numeric(idx, errors="coerce")
+        if numeric.isna().any():
+            return idx
+        vals = numeric.to_numpy(dtype=int)
+        if vals.min() == 0:
+            vals = vals + 1
+        return pd.Index(vals)
+
+    @classmethod
+    def _ensure_one_based_df(cls, df):
+        out = df.copy()
+        out.index = cls._to_one_based_labels(out.index)
+        out.columns = cls._to_one_based_labels(out.columns)
+        return out
+
+    @staticmethod
+    def _mirror_upper_to_lower(df):
+        arr = df.to_numpy(copy=True)
+        lower = np.tril_indices_from(arr, k=-1)
+        arr[lower] = arr.T[lower]
+        return pd.DataFrame(arr, index=df.index, columns=df.columns)
+
     def AnalyzeProteinInterface(self, chainAhandle, chainBhandle, cutoff=8):
-        if not (chainAhandle.valid and chainBhandle.valid): return None
+        if not (chainAhandle.valid and chainBhandle.valid): return pd.DataFrame()
         positions = {}
         for residue in chainAhandle.residues:
             positions[residue] = Vec3List([atom.pos for atom in residue.atoms])
@@ -33,7 +60,7 @@ class BaseBenchmarker(object):
                 if minDistance < cutoff: 
                     if Aresidue not in surfaceAlist: surfaceAlist.append(Aresidue)
                     if Bresidue not in surfaceBlist: surfaceBlist.append(Bresidue)
-        if not (surfaceAlist and surfaceBlist): return None
+        if not (surfaceAlist and surfaceBlist): return pd.DataFrame()
         df = pd.DataFrame(index=[f"{residue.number}" for residue in surfaceAlist], 
                         columns=[f"{residue.number}" for residue in surfaceBlist])
         for i, row in enumerate(surfaceAlist):
@@ -54,10 +81,7 @@ class BaseBenchmarker(object):
             df.iloc[i+1, i+2:] = long_df.iloc[decrease_indices[i] + 1:decrease_indices[i + 1] + 1]["score"].to_numpy()
         df.iloc[i+2, i+3:] = long_df.iloc[decrease_indices[i+1]+1:decrease_indices[i+1]+3]["score"].to_numpy()
         df.iloc[i+3, i+4] = long_df.iloc[-1]["score"]
-        for i in range(len(positions)):
-            for j in range(i + 1, len(positions)):
-                df.iloc[j, i] = df.iloc[i, j]
-        return df
+        return self._ensure_one_based_df(self._mirror_upper_to_lower(df))
 
     def ParseCSVOutput(self, ECfile):
         # CSV format: res1,res2,score
@@ -77,31 +101,28 @@ class BaseBenchmarker(object):
             pd.unique(pd.concat([long_df["res1"], long_df["res2"]], ignore_index=True))
         )
         df = pd.DataFrame(0, index=positions, columns=positions, dtype=float)
-        for _, row in long_df.iterrows():
-            df.at[row["res1"], row["res2"]] = row["score"]
-        for i in range(len(positions)):
-            for j in range(i + 1, len(positions)):
-                df.iloc[j, i] = df.iloc[i, j]
-        return df
+        row_idx = np.searchsorted(positions, long_df["res1"].to_numpy())
+        col_idx = np.searchsorted(positions, long_df["res2"].to_numpy())
+        df_values = df.to_numpy(copy=False)
+        df_values[row_idx, col_idx] = long_df["score"].to_numpy()
+        return self._ensure_one_based_df(self._mirror_upper_to_lower(df))
 
     def ParseNumpyOutput(self, ECfile):
         arr = np.load(ECfile, allow_pickle=True)
-        data = {}
-        for i in range(arr.shape[0]):
-            for j in range(i+1, arr.shape[1]):
-                data[(i+1, j+1)] = arr[i, j]
-        return data
+        data = pd.DataFrame(arr)
+        return self._ensure_one_based_df(data)
 
     def ParseZarrOutput(self, ECfile):
-        arr = zarr.load(ECfile)
-        with open(os.path.join(ECfile, 'metadata.pkl'), 'rb') as f:
-            metadata = pickle.load(f)
-        saved_columns = metadata.get('saved_columns', [])
-        data = {}
-        for i in range(arr.shape[0]):
-            for j in range(i+1, arr.shape[1]):
-                data[(saved_columns[i], saved_columns[j])] = arr[i, j]
-        return data
+        try:
+            grp = zarr.open_group(ECfile, mode='r')
+        except Exception as e:
+            logger.error(f"Error opening Zarr file {ECfile}: {e}")
+            return pd.DataFrame(), None
+        saved_columns = grp["align"].attrs.get('saved_columns', None)
+        arr = grp["couplings"][:]
+        data = pd.DataFrame(arr)
+        data = self._ensure_one_based_df(data)
+        return data, saved_columns
 
     def TruePositiveCount(self, interface, couplings):
         if not couplings:
@@ -141,7 +162,7 @@ class BaseBenchmarker(object):
         res = ecdf(couplings)
         return res
 
-class MonomerBenchmarker(BaseBenchmarker):
+class MonomerAnalyzer(BaseAnalyzer):
     def __init__(self, structure_file=None, chain_name=None, ECfile_baseline=None, EC_threshold=0.7, distance_cutoff=8, min_seq_length=1):
         super().__init__(EC_threshold, distance_cutoff, min_seq_length)
         self.nTP = None
@@ -163,8 +184,12 @@ class MonomerBenchmarker(BaseBenchmarker):
             self.raw_couplings = self.ParsePLMCOutput(ECfile_baseline)
         elif ECfile_baseline.endswith('.npy'):
             self.raw_couplings = self.ParseNumpyOutput(ECfile_baseline)
+        elif isinstance(ECfile_baseline, pd.DataFrame):
+            self.raw_couplings = ECfile_baseline
+        elif isinstance(ECfile_baseline, np.ndarray):
+            self.raw_couplings = pd.DataFrame(ECfile_baseline)
         else:
-            self.raw_couplings = {}
+            self.raw_couplings, _ = self.ParseZarrOutput(ECfile_baseline)
         self.positive_couplings = self.AnalyzeCouplings()
         if not self.positive_couplings: 
             self.positive_couplings = {}
@@ -192,24 +217,24 @@ class MonomerBenchmarker(BaseBenchmarker):
         if nCouplings == 0: return 0
         return super().TruePositiveRate(self.nTP, nCouplings)
     
-    def SpearmanCorrelation(self, query_benchmarker):
+    def SpearmanCorrelation(self, query_analyzer):
         """
         Return the Spearman correlation between the baseline and query couplings.
 
         Parameters
         ----------
-        `query_benchmarker` — MonomerBenchmarker
-            The query benchmarker instance to compare against.
+        `query_analyzer` — MonomerAnalyzer
+            The query analyzer instance to compare against.
 
         Returns
         -------
         Tuple[float, float]
             The Spearman correlation coefficient and p-value.
         """
-        if not query_benchmarker:
+        if not query_analyzer:
             return 0, 0
         ranked_baseline = dict(sorted(self.raw_couplings.items(), key=lambda item: (item[0][0], item[0][1])))
-        ranked_query = dict(sorted(query_benchmarker.raw_couplings.items(), key=lambda item: (item[0][0], item[0][1])))
+        ranked_query = dict(sorted(query_analyzer.raw_couplings.items(), key=lambda item: (item[0][0], item[0][1])))
         corr, pval = super().SpearmanCorrelation(ranked_baseline, ranked_query)
         return float(corr), float(pval)
 
@@ -218,18 +243,18 @@ class MonomerBenchmarker(BaseBenchmarker):
         res = super().EmpiricalDistribution(scores)
         return res
 
-    def GetBenchmarkIndex(self, query_benchmarker):
+    def GetBenchmarkIndex(self, query_analyzer):
         if type(self.interface) == None or not self.positive_couplings: raise RuntimeError('No interface or couplings found')
-        if not isinstance(query_benchmarker, MonomerBenchmarker):
-            raise TypeError('The input must be an instance of MonomerBenchmarker')
+        if not isinstance(query_analyzer, MonomerAnalyzer):
+            raise TypeError('The input must be an instance of MonomerAnalyzer')
 
-        couplings_query = query_benchmarker.positive_couplings
+        couplings_query = query_analyzer.positive_couplings
 
         nTP_Query = super().TruePositiveCount(self.interface, couplings_query)
         TPRfull = self.TruePositiveRatio(self.nTP, nTP_Query)
         TPR = super().TruePositiveRate(nTP_Query, len(couplings_query))
         BI = self.BenchmarkIndex(TPRfull, TPR)
-        Spearman = self.SpearmanCorrelation(query_benchmarker)
+        Spearman = self.SpearmanCorrelation(query_analyzer)
         print(f'TP Baseline: {self.nTP};\tTP Query: {nTP_Query};\tTPRfull (%): {TPRfull:.2%};\tTPR (%): {TPR:.2%};\tBI: {BI:.3f};\tSpearman: {Spearman[0]:.3f}')
         return {'TP Baseline': self.nTP, 'TP Query': nTP_Query, 'TPRfull': TPRfull, 'TPR': TPR, 'BI': BI, 'Spearman': Spearman[0]}
 
@@ -275,38 +300,99 @@ class MonomerBenchmarker(BaseBenchmarker):
 
         return plt.gcf()
 
-class ComplexBenchmarker(BaseBenchmarker):
-    def __init__(self, structure_file=None, chain1_name="A", chain1_length=None, chain2_name=None, ECfile_baseline=None, EC_threshold=0.7, distance_cutoff=8):
+class ComplexAnalyzer(BaseAnalyzer):
+    def __init__(self, ECfile_baseline=None, saved_columns=None, EC_threshold=0.7, structure_file=None, chainA_name="A", chainA_length=None, chainB_name=None, distance_cutoff=8, switch_order=False):
         super().__init__(EC_threshold, distance_cutoff)
         self.nTP = None
         self.positive_couplings = pd.DataFrame()
+        self.saved_columns = saved_columns
+        self.chainA_length = chainA_length
         if structure_file is not None:
-            self.ReadStructure(structure_file, chain1_name, chain2_name)
+            self.ReadStructure(structure_file, chainA_name, chainB_name)
         if ECfile_baseline is not None:
-            self.ReadCouplings(ECfile_baseline, chain1_length)
+            self.ReadCouplings(ECfile_baseline, switch_order=switch_order)
 
-    def ReadStructure(self, structure_file, chain1_name, chain2_name):
+    def ReadStructure(self, structure_file, chainA_name, chainB_name):
         self.mol = io.LoadEntity(structure_file).Select('peptide=true')
-        chain1_handle = self.mol.FindChain(chain1_name)
-        chain2_handle = self.mol.FindChain(chain2_name)
-        self.interface = self.AnalyzeProteinInterface(chain1_handle, chain2_handle, self.distance_cutoff)
+        chainA_handle = self.mol.FindChain(chainA_name)
+        chainB_handle = self.mol.FindChain(chainB_name)
+        self.interface = self.AnalyzeProteinInterface(chainA_handle, chainB_handle, self.distance_cutoff)
 
-    def ReadCouplings(self, ECfile_baseline, chain1_length):
-        if ECfile_baseline.endswith('.csv'):
-            self.raw_couplings = self.ParseCSVOutput(ECfile_baseline)
-        elif ECfile_baseline.endswith('.txt'):
-            self.raw_couplings = self.ParsePLMCOutput(ECfile_baseline)
-        elif ECfile_baseline.endswith('.npy'):
-            self.raw_couplings = self.ParseNumpyOutput(ECfile_baseline)
+    def ReadCouplings(self, ECfile_baseline, switch_order=False):
+        if isinstance(ECfile_baseline, pd.DataFrame):
+            self.raw_couplings = self._ensure_one_based_df(ECfile_baseline)
+            self.interprotein_couplings = self._ensure_one_based_df(ECfile_baseline)
+        elif isinstance(ECfile_baseline, np.ndarray):
+            self.raw_couplings = self._ensure_one_based_df(pd.DataFrame(ECfile_baseline))
+            self.AnalyzeInterProteinCouplings(chainA_length=self.chainA_length, saved_columns=self.saved_columns)
         else:
-            self.raw_couplings = pd.DataFrame()
-        # Analyze the interface and the couplings
-        self.interprotein_couplings = self.AnalyzeCouplings(chain1_length)
+            if ECfile_baseline.endswith('.csv'):
+                self.raw_couplings = self.ParseCSVOutput(ECfile_baseline)
+            elif ECfile_baseline.endswith('.txt'):
+                self.raw_couplings = self.ParsePLMCOutput(ECfile_baseline)
+            elif ECfile_baseline.endswith('.npy'):
+                self.raw_couplings = self.ParseNumpyOutput(ECfile_baseline)
+            else:
+                self.raw_couplings, self.saved_columns = self.ParseZarrOutput(ECfile_baseline)
+            self.raw_couplings = self._ensure_one_based_df(self.raw_couplings)
+            self.AnalyzeInterProteinCouplings(chainA_length=self.chainA_length, saved_columns=self.saved_columns)
+        self.interprotein_couplings = self._ensure_one_based_df(self.interprotein_couplings)
+        if switch_order:
+            self.interprotein_couplings = self.interprotein_couplings.T
+        self.AnalyzePositiveCouplings()
+
+    def AnalyzeInterProteinCouplings(self, chainA_length=None, saved_columns=None, switch_order=False):
+        # Determine inter-protein extraction method:
+        # chainA_length takes precedence; then an explicit saved_columns; then columns
+        # embedded in the zarr file; raise only if none of these are available.
+        if chainA_length is None:
+            raise ValueError("Chain A length must be provided")
+        inter = self.GetInterProtCouplingsByChainALength(chainA_length)
+        if saved_columns is not None:
+            inter = self.FilterMaskedBySavedColumns(saved_columns, source_df=inter)
+        self.interprotein_couplings = self._ensure_one_based_df(inter)
+
+    def AnalyzePositiveCouplings(self):
         inter = self.interprotein_couplings.apply(pd.to_numeric, errors="coerce")
         self.positive_couplings = inter.where(inter >= self.EC_threshold)
         if self.positive_couplings.notna().sum().sum() == 0:
             self.positive_couplings = pd.DataFrame()
             print(f'No couplings found under the threshold {self.EC_threshold}')
+
+    def GetInterProtCouplingsByChainALength(self, chainA_length):
+        if chainA_length is None:
+            raise ValueError('chainA_length must be provided')
+        idx_vals = pd.to_numeric(self.raw_couplings.index, errors='coerce')
+        col_vals = pd.to_numeric(self.raw_couplings.columns, errors='coerce')
+        if idx_vals.isna().any() or col_vals.isna().any():
+            raise RuntimeError('Raw couplings index/columns must be numeric for chainA_length slicing')
+
+        # Use literal label values to split chain A and chain B.
+        row_mask = idx_vals <= chainA_length
+        col_mask = col_vals > chainA_length
+        inter = self.raw_couplings.loc[row_mask, col_mask].copy()
+        inter.columns = (col_vals[col_mask].to_numpy(dtype=int) - int(chainA_length))
+        return inter
+
+    def FilterMaskedBySavedColumns(self, saved_columns, source_df):
+        if len(saved_columns) < 2:
+            raise RuntimeError('Saved columns must contain at least two per-protein lists')
+
+        saved_a = pd.to_numeric(pd.Index(saved_columns[0]), errors='coerce')
+        saved_b = pd.to_numeric(pd.Index(saved_columns[1]), errors='coerce')
+        if saved_a.isna().any() or saved_b.isna().any():
+            raise RuntimeError('Saved columns must be numeric to restore residue numbering')
+
+        row_labels = (saved_a.to_numpy(dtype=int) + 1).tolist()
+        col_labels = (saved_b.to_numpy(dtype=int) + 1).tolist()
+
+        row_labels = [label for label in row_labels if label in source_df.index]
+        col_labels = [label for label in col_labels if label in source_df.columns]
+
+        inter = source_df.loc[row_labels, col_labels].copy()
+        inter.index = row_labels
+        inter.columns = col_labels
+        return inter
 
     def SumUpRawCouplings(self):
         if self.raw_couplings.empty:
@@ -355,26 +441,10 @@ class ComplexBenchmarker(BaseBenchmarker):
             raise RuntimeError('Cannot normalize: minimum absolute score is 0')
         return float(np.nanmax((vals / abs_min) / constant))
 
-    def AnalyzeCouplings(self, saved_columns):
-        if type(saved_columns) == int:
-            inter = self.raw_couplings.loc[:saved_columns, saved_columns:]
-            inter.columns -= saved_columns
-        else:
-            if len(saved_columns) != len(self.raw_couplings.index):
-                raise RuntimeError('Saved columns length does not match raw couplings length')
-            diff = np.diff(saved_columns)
-            prot2_start = np.where(diff < 0)[0][0]+1
-            inter = self.raw_couplings.iloc[:prot2_start, prot2_start:]
-            inter.index = saved_columns[:prot2_start]
-            inter.columns = saved_columns[prot2_start:]
-            inter.index += 1
-            inter.columns += 1
-        return inter
-
     def GetBenchmarkIndex(self, ECfile_query):
         if type(self.interface) == None or not self.couplings_baseline: raise RuntimeError('No interface or couplings found')
 
-        couplings_query = self.AnalyzeCouplings(ECfile_query, self.chain1_length, self.EC_threshold)
+        couplings_query = self.GetInterProtCouplingsByChainALength(ECfile_query, self.chain1_length, self.EC_threshold)
 
         TP_Query = self.TruePositiveCount(self.interface, couplings_query)
         if TP_Query == 0: raise RuntimeError(f'No true positive found for {ECfile_query}')
@@ -384,14 +454,14 @@ class ComplexBenchmarker(BaseBenchmarker):
         print(f'TP Baseline: {self.TP_Baseline};\tTP Query: {TP_Query};\tTPRfull (%): {TPRfull:.2%};\tTPR (%): {TPR:.2%};\tBI: {BI:.3f}')
         return {'TP Baseline': self.TP_Baseline, 'TP Query': TP_Query, 'TPRfull': TPRfull, 'TPR': TPR, 'BI': BI}
 
-    def SpearmanCorrelation(self, query_benchmarker):
+    def SpearmanCorrelation(self, query_analyzer):
         """
         Return the Spearman correlation between the baseline and query couplings.
 
         Parameters
         ----------
-        `query_benchmarker` — ComplexBenchmarker
-            The query benchmarker instance to compare against.
+        `query_analyzer` — ComplexAnalyzer
+            The query analyzer instance to compare against.
 
         Returns
         -------
@@ -411,7 +481,7 @@ class ComplexBenchmarker(BaseBenchmarker):
         )
         ranked_query = dict(
             sorted(
-                _df_to_pair_dict(query_benchmarker.interprotein_couplings).items(),
+                _df_to_pair_dict(query_analyzer.interprotein_couplings).items(),
                 key=lambda item: (item[0][0], item[0][1]),
             )
         )
@@ -438,21 +508,26 @@ class ComplexBenchmarker(BaseBenchmarker):
         scores_other = []  # Others (black)
         distances_other = []
 
-        for pair, score in self.interprotein_couplings.items():
-            pos1, pos2 = pair
-            distance = 50
+        dfn = self.interprotein_couplings.apply(pd.to_numeric, errors="coerce")
+        stacked = dfn.stack(future_stack=True).astype(float).dropna()
+
+        for (pos1, pos2), score in stacked.items():
+            distance = 50.0
             if self.interface is not None:
-                if f'{pos1}' in self.interface.index and f'{pos2}' in self.interface.columns:
-                    distance = self.interface.loc[f'{pos1}', f'{pos2}']
-                    if score > self.EC_threshold and distance > self.distance_cutoff:
-                        scores_fp.append(score)
-                        distances_fp.append(distance)
-                    elif score > self.EC_threshold and distance < self.distance_cutoff:
-                        scores_tp.append(score)
-                        distances_tp.append(distance)
-                else:
-                    scores_other.append(score)
-                    distances_other.append(distance)
+                has_numeric_labels = pos1 in self.interface.index and pos2 in self.interface.columns
+                has_string_labels = f'{pos1}' in self.interface.index and f'{pos2}' in self.interface.columns
+
+                if has_numeric_labels:
+                    distance = float(self.interface.loc[pos1, pos2])
+                elif has_string_labels:
+                    distance = float(self.interface.loc[f'{pos1}', f'{pos2}'])
+
+            if score > self.EC_threshold and distance > self.distance_cutoff:
+                scores_fp.append(score)
+                distances_fp.append(distance)
+            elif score > self.EC_threshold and distance < self.distance_cutoff:
+                scores_tp.append(score)
+                distances_tp.append(distance)
             else:
                 scores_other.append(score)
                 distances_other.append(distance)
@@ -470,18 +545,51 @@ class ComplexBenchmarker(BaseBenchmarker):
         plt.grid(True, alpha=0.3)
         
         # Set fixed x-axis range from -0.1 to 1.8
-        plt.xlim(-0.1, 1.8)
+        plt.xlim(-0.1, 5)
 
         return plt.gcf()
 
-    def TopKInterproteinPairOverlap(self, query_benchmarker, k):
+    def TopKPairs(self, k):
         """
-        Count how many top-k interprotein coupling pairs are shared with query_benchmarker.
+        Get the top-k interprotein coupling pairs based on their scores.
 
         Parameters
         ----------
-        `query_benchmarker` — ComplexBenchmarker
-            The query benchmarker instance to compare against.
+        `k` — int
+            The number of top interprotein coupling pairs to retrieve.
+
+        Returns
+        -------
+        `pd.DataFrame`
+            A DataFrame containing the top-k interprotein coupling pairs, where each row is a pair (pos1, pos2) and the column represents the coupling score.
+
+        Raises
+        ------
+        `ValueError`
+            If `k` is not a positive integer.
+        """
+        if not isinstance(k, int) or k <= 0:
+            raise ValueError('k must be a positive integer')
+        if self.interprotein_couplings.empty:
+            return pd.DataFrame()
+
+        dfn = self.interprotein_couplings.apply(pd.to_numeric, errors="coerce")
+        stacked = dfn.stack(future_stack=True).astype(float).dropna()
+        if stacked.empty:
+            return pd.DataFrame()
+        
+        # Select top-k by score (descending)
+        top = stacked.nlargest(k)
+        return top
+
+    def TopKInterproteinPairOverlap(self, query_analyzer, k):
+        """
+        Count how many top-k interprotein coupling pairs are shared with query_analyzer.
+
+        Parameters
+        ----------
+        `query_analyzer` — ComplexAnalyzer
+            The query analyzer instance to compare against.
         `k` — int
             The number of top interprotein coupling pairs to consider.
 
@@ -493,86 +601,77 @@ class ComplexBenchmarker(BaseBenchmarker):
         Raises
         ------
         `TypeError`
-            If `query_benchmarker` is not a ComplexBenchmarker instance.
+            If `query_analyzer` is not a ComplexAnalyzer instance.
         `ValueError`
             If `k` is not a positive integer.
         """
-        if query_benchmarker is None:
-            raise TypeError('query_benchmarker must be a ComplexBenchmarker instance')
+        if query_analyzer is None:
+            raise TypeError('query_analyzer must be a ComplexAnalyzer instance')
         if not isinstance(k, int) or k <= 0:
             raise ValueError('k must be a positive integer')
-        if self.interprotein_couplings.empty or query_benchmarker.interprotein_couplings.empty:
+        if self.interprotein_couplings.empty or query_analyzer.interprotein_couplings.empty:
             return 0
 
-        def _topk_pairs(df, k_):
-            dfn = df.apply(pd.to_numeric, errors="coerce")
-            stacked = dfn.stack(future_stack=True)
-            if stacked.empty:
-                return set()
-            # Select top-k by score (descending)
-            top = stacked.nlargest(k_)
-            return set(top.index.tolist())  # (row_index, col_index)
-
-        top_self = _topk_pairs(self.interprotein_couplings, k)
-        top_query = _topk_pairs(query_benchmarker.interprotein_couplings, k)
+        top_self = set(self.TopKPairs(k).index.tolist())             # (row_index, col_index)
+        top_query = set(query_analyzer.TopKPairs(k).index.tolist())  # (row_index, col_index)
         return int(len(top_self.intersection(top_query)))
 
-if __name__ == '__main__':
-    # bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/MSA_subset_evaluation/coupling/PDXH_ECOLI_1-218_b0.5_Full_ECs.txt', min_seq_length=5)
-    # fig = bm.PlotCouplings()
-    # fig.savefig('/Users/simon/Dev/CoevoFlash/1g79_couplings_plmc.png', dpi=300, bbox_inches='tight')
-    # print("PLMC:", bm.TruePositiveCount(), f"{bm.TruePositiveRate():.2%}")
-    # bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/Dev/CoevoFlash/new.csv', min_seq_length=5)
-    # fig = bm.PlotCouplings()
-    # fig.savefig('/Users/simon/Dev/CoevoFlash/1g79_couplings_aplm.png', dpi=300, bbox_inches='tight')
-    # print("AsymJulia:", bm.TruePositiveCount(), f"{bm.TruePositiveRate():.2%}")
-    # bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/Algorithm benchmark/Intra chain/GaussDCA_PDXH_ECOLI.csv', min_seq_length=5)
-    # fig = bm.PlotCouplings()
-    # fig.savefig('/Users/simon/Dev/CoevoFlash/1g79_couplings_gauss.png', dpi=300, bbox_inches='tight')
-    # print("GaussDCA:", bm.TruePositiveCount(), f"{bm.TruePositiveRate():.2%}")
-    # bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/Dev/CoevoFlash/Jmat_PDXH_ECOLI.npy', min_seq_length=5)
-    # fig = bm.PlotCouplings()
-    # print("AsymC++:", bm.TruePositiveCount(), f"{bm.TruePositiveRate():.2%}")
-    # fig.savefig('/Users/simon/Dev/CoevoFlash/1g79_couplings_new.png', dpi=300, bbox_inches='tight')
-    # results = []
-    # for i in range(1, 5):
-    #     result = bm.GetBenchmarkIndex(f'/Users/simon/research/EVcouplings/MSA_subset_evaluation/multi-iteration/it{i}/couplings/PDXH_ECOLI_1-218_b0.5_it{i}_ECs.txt')
-    #     results.append(result)
-    #     result = bm.GetBenchmarkIndex(f'/Users/simon/research/EVcouplings/MSA_subset_evaluation/multi-iteration/it{i}/couplings/PDXH_ECOLI_1-218_b0.5_it{i}_10000_ECs.txt')
-    #     results.append(result)
-    #     result = bm.GetBenchmarkIndex(f'/Users/simon/research/EVcouplings/MSA_subset_evaluation/multi-iteration/it{i}/couplings/PDXH_ECOLI_1-218_b0.5_it{i}_5000_ECs.txt')
-    #     results.append(result)
-    # df = pd.DataFrame(results)
-    # df.to_csv('/Users/simon/research/EVcouplings/MSA_subset_evaluation/benchmark_results2.csv', index=False)
+    def TopKTruePositiveCount(self, k):
+        """
+        Count the number of true positives among the top-k interprotein coupling pairs.
 
-    # bm = ComplexBenchmarker(structure_file='/Users/simon/research/EVcouplings/E.coli-50S/6pj6-50S.cif', chain1_name='K', chain1_length=123, chain2_name='U', ECfile_baseline='/Users/simon/research/EVcouplings/E.coli-50S/couplings/plmc/RL14_ECOLI_RL24_ECOLI_b0.2.txt', EC_threshold=0.1)
-    # print(sum(bm.interprotein_couplings.values()))
-    # fig = bm.PlotCouplings()
-    # fig.savefig('/Users/simon/Dev/CoevoFlash/6pj6-50S_couplings_plmc.png', dpi=300, bbox_inches='tight')
+        Parameters
+        ----------
+        `k` — int
+            The number of top interprotein coupling pairs to consider.
+        
+        Returns
+        -------
+        `int`
+            The number of true positives among the top-k interprotein coupling pairs.
 
-    # bm = ComplexBenchmarker('/Users/simon/Downloads/6wlz.cif', 'A', 617, 'E', '/Users/simon/Dev/CoevoFlash/Jmat_PDXH_ECOLI.npy', 0.1)
-    # bm.GetBenchmarkIndex('/Users/simon/Dev/EVsnap/GaussDCA_ATPA_HUMAN-ATPB_HUMAN_b0.2.csv')
+        Raises
+        ------
+        `ValueError`
+            If `k` is not a positive integer.
+        """
+        if not isinstance(k, int) or k <= 0:
+            raise ValueError('k must be a positive integer')
+        if self.interprotein_couplings.empty:
+            return 0
 
-    # bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/Algorithm benchmark/Intra chain/GSH1_ECOLI_1-518_b0.2_old.txt', min_seq_length=5)
-    # bm1 = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/Algorithm benchmark/Intra chain/GSH1_ECOLI_1-518_b0.2_new.txt', min_seq_length=5)
-    # print(bm.SpearmanCorrelation(bm1))
-    # bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/Algorithm benchmark/Intra chain/NUOG_ECOLI_1-908_b0.2_old.txt', min_seq_length=5)
-    # bm1 = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/Algorithm benchmark/Intra chain/NUOG_ECOLI_1-908_b0.2_new.txt', min_seq_length=5)
-    # print(bm.SpearmanCorrelation(bm1))
-    # bm = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/Algorithm benchmark/Intra chain/PDXH_ECOLI_1-218_b0.2_old.txt', min_seq_length=5)
-    # bm1 = MonomerBenchmarker('/Users/simon/research/EVcouplings/MSA_subset_evaluation/1g79.cif', 'A', '/Users/simon/research/EVcouplings/Algorithm benchmark/Intra chain/PDXH_ECOLI_1-218_b0.2_new.txt', min_seq_length=5)
-    # print(bm.SpearmanCorrelation(bm1))
-    bm = ComplexBenchmarker(chain1_length=110, ECfile_baseline='/Users/simon/research/EVcouplings/E.coli-50S/couplings/plmc/RL22_ECOLI_RL31_ECOLI_b0.2.txt')
-    print(bm.interprotein_couplings.values.max())
-    with open("/Users/simon/Downloads/merged/metadata.pkl", 'rb') as f:
-        metadata = pickle.load(f)
-    bm1 = ComplexBenchmarker(chain1_length=metadata['saved_columns'], ECfile_baseline='/Users/simon/Downloads/newtest_zarr.txt')
-    print(bm1.interprotein_couplings.values.max())
-    print(bm.SpearmanCorrelation(bm1))
-    print(bm1.TopKInterproteinPairOverlap(bm, 10))
-    edf = bm1.EmpiricalDistribution()
-    print(edf.cdf)
-    print(edf.cdf.quantiles)
-    print(edf.cdf.quantiles[np.where(edf.cdf.probabilities >= 0.9999)[0]])
-    print(len(edf.cdf.quantiles[np.where(edf.cdf.probabilities >= 0.9999)[0]]))
-    print(edf.cdf.confidence_interval(0.99).high.quantiles)
+        top_k = self.TopKPairs(k)
+        if top_k.empty:
+            return 0
+        return self.TruePositiveCount(self.interface, top_k.to_dict())
+
+    def TopKTruePositiveRate(self, k):
+        """
+        Calculate the true positive rate among the top-k interprotein coupling pairs.
+
+        Parameters
+        ----------
+        `k` — int
+            The number of top interprotein coupling pairs to consider.
+        
+        Returns
+        -------
+        `float`
+            The true positive rate among the top-k interprotein coupling pairs.
+
+        Raises
+        ------
+        `ValueError`
+            If `k` is not a positive integer.
+        """
+        if not isinstance(k, int) or k <= 0:
+            raise ValueError('k must be a positive integer')
+        if self.interprotein_couplings.empty:
+            return 0.0
+
+        top_k = self.TopKPairs(k)
+        if top_k.empty:
+            return 0.0
+        tp_count = self.TruePositiveCount(self.interface, top_k.to_dict())
+
+        return tp_count / k

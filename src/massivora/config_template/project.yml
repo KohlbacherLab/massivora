@@ -4,13 +4,13 @@
 
 project:
   # Name of the project
-  name: my_project
+  name: PROJECTNAME
 
   # Root folder for this project (data, outputs, jobs, db, ...)
-  project_path: /ptmp/USER/my_project
+  project_path: /PROJECTPATH/PROJECTNAME
 
   # Text file of protein list. One protein ID per line.
-  proteins_list: /ptmp/USER/my_project/data/proteins.txt
+  proteins_list: /PROJECTPATH/PROJECTNAME/data/proteins.txt
 
 # These are subdirectories under project_path
 paths:
@@ -20,22 +20,39 @@ paths:
   # Where concatenated alignments / EC outputs go
   couplings: ecs
 
-  # SQLite database path
-  job_db: job_db.sqlite3
+# Database configuration
+database:
+  # Backend type: sqlite, mysql, mariadb, postgresql
+  backend: sqlite
+
+  # SQLite-specific (when backend=sqlite)
+  filename: job_db.sqlite3
+
+  # IMPORTANT for SLURM/HPC clusters: Set to true if database is on shared/network filesystem
+  # (NFS, Lustre, GPFS, BeeGFS, etc.). This enables safe multi-node access.
+  # If not specified, will auto-detect filesystem type.
+  # shared_filesystem: true
+
+  # MySQL/MariaDB/PostgreSQL-specific (when backend=mysql/mariadb/postgresql)
+  # host: localhost
+  # port: 3306  # 3306 for MySQL/MariaDB, 5432 for PostgreSQL
+  # user: username
+  # password: password
+  # database: massivora
+  #
+  # Optional connection parameters
+  # connect_timeout: 60
+  # charset: utf8mb4  # MySQL/MariaDB only
 
 logging:
-  enable: true
-  level: WARNING
-  dir: /ptmp/USER/my_project/logs
+  enabled: true
+  level: INFO
+  dir: /PROJECTPATH/PROJECTNAME/logs
   file: massivora.log
 
-pipeline:
-  download: false
-  align: false
-  concatenate: true
-  coupling: true
 
-align:
+align: 
+  db_table: alignments
   # jackhmmer and database
   jackhmmer_binary: /u/USER/apps/hmmer/bin/jackhmmer
   database: /u/USER/uniprot.fasta
@@ -45,29 +62,36 @@ align:
   paralogue_threshold: 0.9
   row_gap_threshold: 0.5
   col_gap_threshold: 0.5
+  keep_original_msa: false
+  claim_batch_size: 'auto'  # 'auto' or integer
 
   # Applies when one wants to split the calculation to multiple clusters
   # portion: 1.0
   # portion_start: 0.0
 
 concatenate:
-  reweighting_threshold: 0.8
+  db_table: couplings
+  # method for pairing sequences in concatenated alignment
+  method: best_hit
+  reweighting: 
+    enabled: true
+    threshold: 0.8
   # downsample settings (optional)
   downsample:
     enabled: true
-    to: 10000
+    to: 30000
 
-coupling:
+couple: 
+  db_table: couplings
+  claim_batch_size: 'auto'  # 'auto' or integer
+
   method: plm
 
-  # CPU settings
-  per_job_cpu: 8
-  claim_batch_size: 4
-
-  # plmc
-  plmc_binary: /u/USER/apps/plmc
+  # plmDCA parameters
   lambda_h: 0.01
   lambda_J: 0.01
+  eps_conv: 3e-4
+  maxit: 200
 
   # Applies when one wants to split the calculation to multiple clusters
   # portion: 1.0

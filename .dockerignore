@@ -1,0 +1,20 @@
+.git
+.gitignore
+.DS_Store
+**/.DS_Store
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+build/
+dist/
+wheelhouse/
+*.egg-info/
+src/*egg*
+temp_code/
+docs/
+benchmark_dataset/
+tests/
+# Stale local native build outputs — rebuilt inside the image.
+src/massivora/bin/
+src/massivora/cpp_bindings/*.so
+src/massivora/bindings_src/build/

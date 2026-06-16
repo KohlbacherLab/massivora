@@ -6,11 +6,6 @@ system:
   # Default process count for download on login node
   download_processes: 4
 
-manager:
-  # type: local
-  type: slurm
-  conda_env: myenv
-
 batch:
   # Modules and environment setup injected into sbatch scripts
   script_dir: jobs

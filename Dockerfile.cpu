@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+#
+# Production CPU-only image for Massivora (no CUDA toolkit / CuPy).
+#
+#   docker build -f Dockerfile.cpu -t massivora:cpu .
+#   docker run --rm massivora:cpu massivora --help
+#
+# Multi-stage on the micromamba base: build the env (incl. compilers, nlopt,
+# eigen, openstructure) then copy it into a clean runtime layer.
+
+############################
+# Stage 1: build
+############################
+FROM mambaorg/micromamba:1.5.8 AS build
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
+USER $MAMBA_USER
+
+COPY --chown=$MAMBA_USER:$MAMBA_USER . /opt/massivora-src
+WORKDIR /opt/massivora-src
+
+# Create the env (toolchain + deps), then build & install massivora (CPU).
+# The build is a separate step run inside the activated env so CMake finds the
+# conda compilers, Eigen and NLopt.
+RUN micromamba create -y -n massivora -f environment.yml && \
+    micromamba clean --all --yes
+RUN micromamba run -n massivora pip install . --no-build-isolation --no-deps
+
+############################
+# Stage 2: runtime
+############################
+FROM mambaorg/micromamba:1.5.8 AS runtime
+
+COPY --from=build /opt/conda/envs/massivora /opt/conda/envs/massivora
+ENV PATH=/opt/conda/envs/massivora/bin:$PATH
+ENV CONDA_DEFAULT_ENV=massivora
+
+WORKDIR /work
+ENTRYPOINT ["massivora"]
+CMD ["--help"]

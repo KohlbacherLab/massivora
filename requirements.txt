@@ -1,12 +1,17 @@
+# Convenience list of pip-installable runtime dependencies.
+# The authoritative source is pyproject.toml ([project.dependencies]).
+#
+# NOTE: `ost` (OpenStructure) is NOT listed here because it is not on PyPI.
+# Install it via conda/bioconda (see environment.yml). GPU support (cupy) is
+# optional — install it with `conda install -c conda-forge cupy`, which matches
+# the build to your CUDA driver automatically.
 pandas
 numpy
 biopython
 rich
 zarr
-pybind11
 psutil
-numba
 scipy
-cupy-cuda12x
-statsmodels
+matplotlib
 PyYAML
+dask[distributed]

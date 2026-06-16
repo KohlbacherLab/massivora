@@ -1,4 +1,13 @@
 __pycache__/
 temp_code/
 src/*egg*
-src/massivora/compute/
+src/massivora/bin/
+src/massivora/cpp_bindings/
+src/massivora/bindings_src/build
+.DS_Store
+
+# Build backends (scikit-build-core / CMake)
+/build/
+/dist/
+/wheelhouse/
+*.egg-info/

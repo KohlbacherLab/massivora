@@ -8,9 +8,9 @@ from itertools import combinations
 import psutil
 
 from massivora.config import load_project_and_system_config
-from massivora.alignment import ZarrAlignment
-from massivora.db import connect_db, STATUS
-from massivora.logging_utils import setup_logging
+from massivora.alignment import BinaryAlignment
+from massivora.db import connect_db, STATUS, quote_identifier
+from massivora.utils import setup_logging
 
 
 def analyze_input_file(proteins_file):
@@ -21,8 +21,8 @@ def analyze_input_file(proteins_file):
 
 def concatenate(pair):
     pid1, pid2 = pair
-    align1 = ZarrAlignment(os.path.join(alignment_dir, pid1))
-    align2 = ZarrAlignment(os.path.join(alignment_dir, pid2))
+    align1 = BinaryAlignment(os.path.join(alignment_dir, pid1))
+    align2 = BinaryAlignment(os.path.join(alignment_dir, pid2))
     concatenated_align = align1 + align2
     if downsample:
         concatenated_align.Downsample_Randomly(to=downsample_to)
@@ -46,24 +46,32 @@ if __name__ == '__main__':
 
     cfg = load_project_and_system_config(args.config)
     project_path = cfg.get('project').get('project_path')
-    job_db = os.path.join(project_path, cfg.get('paths').get('job_db'))
-    if not job_db:
-        raise SystemExit('Missing config: paths.job_db')
     alignment_dir = os.path.join(project_path, cfg.get('paths').get('monomers'))
     output_dir = os.path.join(project_path, cfg.get('paths').get('couplings'))
-    down_cfg = cfg.get('concatenate').get('downsample')
+
+    concat_cfg = cfg.get('concatenate', {})
+    concat_table = concat_cfg.get('db_table', 'couplings')
+
+    # Get align table for reading
+    align_cfg = cfg.get('align', {})
+    align_table = align_cfg.get('db_table', 'alignments')
+
+    down_cfg = concat_cfg.get('downsample', {})
     downsample = bool(down_cfg.get('enabled', False))
     downsample_to = int(down_cfg.get('to', 10000))
-    reweighting_threshold = float(cfg.get('concatenate').get('reweighting_threshold', 0.8))
+    reweighting_threshold = float(concat_cfg.get('reweighting', {}).get('threshold', 0.8))
 
     setup_logging(cfg)
 
     logical_cpus = psutil.cpu_count(logical=True)
 
     if not args.proteins:
-        conn = connect_db(job_db)
+        conn = connect_db(cfg)
         cursor = conn.cursor()
-        cursor.execute("SELECT pid from alignments where status = ?", (STATUS['DONE'],))
+        cursor.execute(
+            f"SELECT pid from {quote_identifier(align_table)} where status = ?",
+            (STATUS['DONE'],)
+        )
         done_alignments = [pid for (pid,) in cursor]
         pairs = list(combinations(done_alignments, 2))
         conn.close()
@@ -72,12 +80,10 @@ if __name__ == '__main__':
 
     with mp.Pool(logical_cpus) as pool:
         rv = pool.map(concatenate, pairs)
-    pool.join()
-    pool.close()
 
-    conn = connect_db(job_db)
+    conn = connect_db(cfg)
     conn.executemany(
-        '''INSERT OR IGNORE INTO couplings (pid1, pid2, length, number, effnumber, status) VALUES (?, ?, ?, ?, ?, ?)''',
+        f'''INSERT OR IGNORE INTO {quote_identifier(concat_table)} (pid1, pid2, length, number, effnumber, status) VALUES (?, ?, ?, ?, ?, ?)''',
         [(pid1, pid2, length, number, effnumber, status) for (pid1, pid2, length, number, effnumber, status) in rv],
     )
     conn.commit()
