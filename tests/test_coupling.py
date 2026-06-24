@@ -179,12 +179,7 @@ def test_coupling_GPU():
     MSA_pad = cp.zeros((B, N, q_pad), dtype=cp.float16)
     MSA_pad[b_idx, i_idx, MSA] = 1.0
 
-    # Create CUDA streams for parallel execution. Each worker thread owns
-    # exactly one stream and optimizes a disjoint slice of sites
-    # (r = tid, tid+n_streams, ...). This guarantees one stream is touched by
-    # one thread only, so concurrent sites never interleave their L-BFGS
-    # history buffers on a shared stream. (The old `streams[r % n_streams]`
-    # mapping could hand the same stream to two simultaneously-running tasks.)
+    # Create CUDA streams for parallel execution.
     n_streams = 4
     streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
 

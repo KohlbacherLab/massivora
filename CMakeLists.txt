@@ -224,9 +224,7 @@ set(MASSIVORA_BIN_INSTALL_DIR "massivora/bin")
 
 # --- pybind11 extension module ---
 if(ENABLE_CUDA)
-    pybind11_add_module(cpp_bindings
-        ${BINDINGS_SRC}/bindings.cpp
-        ${BINDINGS_SRC}/bindings.cu)
+    pybind11_add_module(cpp_bindings ${BINDINGS_SRC}/bindings.cpp)
     target_compile_definitions(cpp_bindings PRIVATE ENABLE_CUDA)
     target_include_directories(cpp_bindings PRIVATE
         ${BINDINGS_SRC}
@@ -235,7 +233,7 @@ if(ENABLE_CUDA)
     if(MASSIVORA_CUDA_LIB_DIRS)
       target_link_directories(cpp_bindings PRIVATE ${MASSIVORA_CUDA_LIB_DIRS})
     endif()
-    target_link_libraries(cpp_bindings PRIVATE ${MASSIVORA_CUBLAS_TARGET})
+    target_link_libraries(cpp_bindings PRIVATE cuda_bindings ${MASSIVORA_CUBLAS_TARGET})
 else()
     pybind11_add_module(cpp_bindings ${BINDINGS_SRC}/bindings.cpp)
 endif()
@@ -255,7 +253,9 @@ if(ENABLE_CUDA)
       target_link_directories(cuda_bindings PRIVATE ${MASSIVORA_CUDA_LIB_DIRS})
     endif()
     target_link_libraries(cuda_bindings PRIVATE ${MASSIVORA_CUBLAS_TARGET})
+    # RDC (for cooperative-groups grid.sync in the L-BFGS two-loop)
     set_property(TARGET cuda_bindings PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+    set_property(TARGET cuda_bindings PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
     # Build the standalone plm_opt_site executable against the CUDA backend.
     target_compile_definitions(plm_opt_site PRIVATE ENABLE_CUDA)

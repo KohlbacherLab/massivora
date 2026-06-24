@@ -822,7 +822,7 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
         lambdaH, lambdaJ = params["lambdaH"], params["lambdaJ"]
         eps_conv = params["eps_conv"]
         maxit = params["maxit"]
-        n_streams = int(params.get("n_streams", 1))
+        n_streams = int(params.get("n_streams", 4))
         plm_opt_exe = params["plm_opt_exe"]
 
         try:
