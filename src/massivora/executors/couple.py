@@ -864,7 +864,9 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
         J_shm = shared_memory.SharedMemory(name=params["name"]+'_J', size=N*N*q*q*4)
         J = np.ndarray((N, N*q*q), dtype=np.float32, buffer=J_shm.buf)
 
+        cpp_bindings.applyIsingGauge(J, q)
         score = self.compute_score(J.T, q=q).astype(np.float16)
+
         logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
         grp = zarr.open_group(store=filename)
         # TODO: Compression need implementing

@@ -153,12 +153,13 @@ std::pair<int, float> cudaOptimizeSite(
     cudaStream_t stream = 0           /* CUDA stream; non-zero enables multi-stream concurrency */
 )
 {
-    auto get = [&](const char* k, float def) -> float {
+    auto hyper = [&](const char* k, float def) -> float {
         auto it = hyperparams.find(k);
         return (it != hyperparams.end()) ? it->second : def;
     };
 
-    const int optimizer_type  = static_cast<int>(get("optimizer", 0.0f));
+    /* optimizer: 0 = RMSprop, 1 = NAdam, 2 (default) = unconstrained L-BFGS */
+    const int optimizer_type  = static_cast<int>(hyper("optimizer", 2.0f));
     const int n_params        = q_pad + N * q_pad * q_pad;
     const size_t msa_flat_bytes = (size_t)B * N * q_pad * sizeof(__half);
 
@@ -167,14 +168,12 @@ std::pair<int, float> cudaOptimizeSite(
     float*  pll_out;
     float*  grad_pad;
     __half* vgrad_pad;
-    __half* energies_fp16;
     float*  energies_fp32;
 
     cudaMallocAsync(&MSA_pad_flat,  msa_flat_bytes,                           stream);
     cudaMallocAsync(&pll_out,       4 * sizeof(float),                        stream);
     cudaMallocAsync(&grad_pad,      (size_t)n_params * sizeof(float),         stream);
     cudaMallocAsync(&vgrad_pad,     (size_t)B * q_pad * sizeof(__half),       stream);
-    cudaMallocAsync(&energies_fp16, (size_t)B * q_pad * sizeof(__half),       stream);
     cudaMallocAsync(&energies_fp32, (size_t)B * q_pad * sizeof(float),        stream);
     /* Copy full MSA_pad into MSA_pad_flat, then zero column r.
      * fp16(0.0) == 0x0000, so cudaMemset2DAsync works correctly. */
@@ -205,67 +204,79 @@ std::pair<int, float> cudaOptimizeSite(
     float pll_current = 0.0f;
     int   iter        = 0;
 
-    /* ============================================================
-    * First-order optimizer path (RMSprop / NAdam)
-    * ============================================================*/
-    // std::unique_ptr<Optimizer> opt;
-    // if (optimizer_type == 1) {
-    //     opt = std::make_unique<NAdam>(
-    //         x_pad, n_params,
-    //         get("lr",            0.005f),
-    //         get("beta1",         0.9f),
-    //         get("beta2",         0.999f),
-    //         get("eps",           1e-8f),
-    //         get("weight_decay",  0.0f),
-    //         get("momentum_decay",4e-3f),
-    //         stream
-    //     );
-    // } else {
-    //     opt = std::make_unique<RMSprop>(
-    //         x_pad, n_params,
-    //         get("lr",           0.002f),
-    //         get("alpha",        0.92f),
-    //         get("eps",          1e-8f),
-    //         get("weight_decay", 0.0f),
-    //         get("momentum",     0.9f),
-    //         static_cast<int>(get("centered", 0.0f)),
-    //         stream
-    //     );
-    // }
+    if (optimizer_type == 0 || optimizer_type == 1) {
+        /* ============================================================
+         * First-order optimizer path (RMSprop / NAdam), kept alongside
+         * the L-BFGS path for easy comparison. Each step does one
+         * GEMM1+kernel+GEMM2 evaluation then a single fused update.
+         * ============================================================*/
+        std::unique_ptr<Optimizer> opt;
+        if (optimizer_type == 1) {
+            opt = std::make_unique<NAdam>(
+                x_pad, n_params,
+                hyper("lr",            0.005f),
+                hyper("beta1",         0.9f),
+                hyper("beta2",         0.999f),
+                hyper("eps",           1e-8f),
+                hyper("weight_decay",  0.0f),
+                hyper("momentum_decay",4e-3f),
+                stream
+            );
+        } else {
+            opt = std::make_unique<RMSprop>(
+                x_pad, n_params,
+                hyper("lr",           0.002f),
+                hyper("alpha",        0.92f),
+                hyper("eps",          1e-8f),
+                hyper("weight_decay", 0.0f),
+                hyper("momentum",     0.9f),
+                static_cast<int>(hyper("centered", 0.0f)),
+                stream
+            );
+        }
 
-    // for (iter = 0; iter < maxeval; ++iter) {
-    //     broadcast_hr_to_energies<<<(B*q_pad+255)/256, 256, 0, stream>>>(x_pad, energies_fp32, q_pad, B*q_pad);
-    //     cudaFillPllGradients(
-    //         MSA_pad_flat, x_pad, MSA, W,
-    //         r, B, N, q, q_pad, lambdaH, lambdaJ,
-    //         pll_out, grad_pad, vgrad_pad,
-    //         energies_fp32, handle, stream);
-    //     opt->step(x_pad, grad_pad);
-    //     cudaMemcpyAsync(pll_host, pll_out + 1, sizeof(float),
-    //                     cudaMemcpyDeviceToHost, stream);
-    //     cudaStreamSynchronize(stream);
-    //     pll_current = *pll_host;
-    //     if (fabsf(pll_current - pll_prev) < eps_conv) { ++iter; break; }
-    //     pll_prev = pll_current;
-    // }
-    // /* unique_ptr destructor frees optimizer GPU buffers (stream-ordered) */
-    // opt.reset();
+        for (iter = 0; iter < maxeval; ++iter) {
+            broadcast_hr_to_energies<<<(B*q_pad+255)/256, 256, 0, stream>>>(x_pad, energies_fp32, q_pad, B*q_pad);
+            cudaFillPllGradients(
+                MSA_pad_flat, x_pad, MSA, W,
+                r, B, N, q, q_pad, lambdaH, lambdaJ,
+                pll_out, grad_pad, vgrad_pad,
+                energies_fp32, handle, stream);
+            opt->step(x_pad, grad_pad);
+            cudaMemcpyAsync(pll_host, pll_out + 1, sizeof(float),
+                            cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            pll_current = *pll_host;
+            if (fabsf(pll_current - pll_prev) < eps_conv) { ++iter; break; }
+            pll_prev = pll_current;
+        }
+        /* unique_ptr destructor frees optimizer GPU buffers (stream-ordered) */
+        opt.reset();
+    } else {
+        /* ============================================================
+         * Unconstrained L-BFGS (default). Owns its own iteration loop;
+         * runs entirely on the caller's stream.
+         * ============================================================*/
+        LBFGS_Unconstrained lbfgs(
+            x_pad, MSA_pad_flat, MSA, W,
+            pll_out, grad_pad, vgrad_pad, energies_fp32,
+            handle,
+            n_params, B, N, q, q_pad, r,
+            lambdaH, lambdaJ,
+            static_cast<int>(hyper("m_corr",   8.0f)),
+            /* eps_g = gtol on ‖∇f‖∞. Default 1e-3 is calibrated on the
+             * RL4/RL31 benchmark. Override per call via hyperparams["eps_g"].
+             * eps_f/eps_x are fixed tight safety nets 
+             * (relative f-stall / line-search step floor). */
+            hyper("eps_f", 1e-9f),
+            hyper("eps_g", 1e-3f),
+            hyper("eps_x", 1e-9f),
+            maxeval, stream);
 
-    LBFGS lbfgs(
-        x_pad, MSA_pad_flat, MSA, W,
-        pll_out, vgrad_pad, energies_fp16, energies_fp32,
-        handle,
-        n_params, B, N, q, q_pad, r,
-        lambdaH, lambdaJ,
-        static_cast<int>(get("m_corr",   8.0f)),
-        get("eps_f", 3e-4f),
-        get("eps_g", 3e-4f),
-        get("eps_x", 3e-4f),
-        maxeval);
-
-    auto result = lbfgs.optimize();
-    iter        += result.first;
-    pll_current = result.second;
+        auto result = lbfgs.optimize();
+        iter        += result.first;
+        pll_current  = result.second;
+    }
 
     if (own_handle) cublasDestroy(handle);
     cudaFreeHost(pll_host);
@@ -275,7 +286,6 @@ std::pair<int, float> cudaOptimizeSite(
     cudaFreeAsync(pll_out,       stream);
     cudaFreeAsync(grad_pad,      stream);
     cudaFreeAsync(vgrad_pad,     stream);
-    cudaFreeAsync(energies_fp16, stream);
     cudaFreeAsync(energies_fp32, stream);
 
     return {iter, pll_current};

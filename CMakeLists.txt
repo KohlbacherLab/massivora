@@ -202,43 +202,9 @@ if(NOT TARGET NLopt::nlopt)
     "brew: `nlopt`), or allow building from source with -DMASSIVORA_FETCH_NLOPT=ON.")
 endif()
 
-# --- CUDA L-BFGS-B (cuLBFGSB) GPU library ---
-# When CUDA is enabled, build libcuLBFGSB.so from source 
-if(ENABLE_CUDA)
-  include(FetchContent)
-  include(ExternalProject)
-
-  set(CULBFGSB_GIT_REPOSITORY "https://github.com/everburstSun/lbfgsb-gpu.git"
-      CACHE STRING "Git URL for the cuLBFGSB GPU library")
-  set(CULBFGSB_GIT_TAG "master"
-      CACHE STRING "Git tag/branch/commit of cuLBFGSB to build")
-
-  FetchContent_Declare(culbfgsb
-    GIT_REPOSITORY "${CULBFGSB_GIT_REPOSITORY}"
-    GIT_TAG "${CULBFGSB_GIT_TAG}"
-    GIT_SHALLOW TRUE
-    SOURCE_SUBDIR "massivora-no-add-subdirectory"
-  )
-  FetchContent_MakeAvailable(culbfgsb)
-
-  set(MASSIVORA_CULBFGSB_LIB "${culbfgsb_BINARY_DIR}/culbfgsb/libcuLBFGSB.so")
-
-  ExternalProject_Add(culbfgsb_ext
-    SOURCE_DIR "${culbfgsb_SOURCE_DIR}"
-    BINARY_DIR "${culbfgsb_BINARY_DIR}"
-    DOWNLOAD_COMMAND ""
-    UPDATE_COMMAND ""
-    CMAKE_ARGS
-      -DBUILD_CULBFGSB_SHARED=ON
-      -DCMAKE_BUILD_TYPE=Release
-      # Allow CMake >= 3.31 / 4.x to configure this older project.
-      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-    # Declared so Ninja knows about the generated artifact for build ordering.
-    BUILD_BYPRODUCTS "${MASSIVORA_CULBFGSB_LIB}"
-    # We only need the .so in-tree; skip the upstream install step.
-    INSTALL_COMMAND ""
-  )
-endif()
+# The GPU optimizer is now the in-tree unconstrained L-BFGS
+# (src/massivora/bindings_src/optimizers.cuh); the old cuLBFGSB GPU library is
+# no longer built or linked.
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -270,8 +236,6 @@ if(ENABLE_CUDA)
       target_link_directories(cpp_bindings PRIVATE ${MASSIVORA_CUDA_LIB_DIRS})
     endif()
     target_link_libraries(cpp_bindings PRIVATE ${MASSIVORA_CUBLAS_TARGET})
-    target_link_libraries(cpp_bindings PRIVATE ${MASSIVORA_CULBFGSB_LIB})
-    add_dependencies(cpp_bindings culbfgsb_ext)
 else()
     pybind11_add_module(cpp_bindings ${BINDINGS_SRC}/bindings.cpp)
 endif()
@@ -291,8 +255,6 @@ if(ENABLE_CUDA)
       target_link_directories(cuda_bindings PRIVATE ${MASSIVORA_CUDA_LIB_DIRS})
     endif()
     target_link_libraries(cuda_bindings PRIVATE ${MASSIVORA_CUBLAS_TARGET})
-    target_link_libraries(cuda_bindings PRIVATE ${MASSIVORA_CULBFGSB_LIB})
-    add_dependencies(cuda_bindings culbfgsb_ext)
     set_property(TARGET cuda_bindings PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
     # Build the standalone plm_opt_site executable against the CUDA backend.
@@ -342,7 +304,4 @@ install(FILES
 if(ENABLE_CUDA)
     install(TARGETS cuda_bindings
         LIBRARY DESTINATION ${MASSIVORA_BINDINGS_INSTALL_DIR})
-    # Ship the cuLBFGSB shared lib we built from source next to the module.
-    install(FILES ${MASSIVORA_CULBFGSB_LIB}
-        DESTINATION ${MASSIVORA_BINDINGS_INSTALL_DIR})
 endif()
