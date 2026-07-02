@@ -202,10 +202,6 @@ if(NOT TARGET NLopt::nlopt)
     "brew: `nlopt`), or allow building from source with -DMASSIVORA_FETCH_NLOPT=ON.")
 endif()
 
-# The GPU optimizer is now the in-tree unconstrained L-BFGS
-# (src/massivora/bindings_src/optimizers.cuh); the old cuLBFGSB GPU library is
-# no longer built or linked.
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -214,6 +210,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
 
 set(MASSIVORA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/massivora")
 set(BINDINGS_SRC "${MASSIVORA_SRC}/bindings_src")
