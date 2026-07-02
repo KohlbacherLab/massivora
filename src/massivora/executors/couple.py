@@ -22,7 +22,7 @@ from massivora.config import load_project_and_system_config
 from massivora.db import (STATUS, compute_file_hash, connect_db_rw,
                           ensure_columns, get_db_path, get_hashed_file_path,
                           get_table_names, quote_identifier)
-from massivora.utils import (compute_id_range, get_cuda_module,
+from massivora.utils import (SHM_PREFIX, compute_id_range, get_cuda_module,
                              gpu_is_available, massivora_pkg_dir,
                              setup_logging, worker_id)
 if gpu_is_available():
@@ -42,6 +42,7 @@ class LoggingWorkerPlugin(WorkerPlugin):
 # ---------------------------------------------------------------------------
 
 class BaseCouplingExecutor(object):
+    SHM_PREFIX = SHM_PREFIX
     def __init__(self, config):
         self._config = config
 
@@ -248,6 +249,108 @@ class BaseCouplingExecutor(object):
             self.db_conn.rollback()
             raise
 
+    def _checkpoint_wal(self):
+        """Merge the SQLite WAL into the main database file.
+
+        No-op for non-SQLite backends (MySQL/PostgreSQL) and harmless for
+        SQLite connections not using WAL (e.g. DELETE journal mode on network
+        filesystems), where ``wal_checkpoint`` returns without effect.
+        """
+        if not isinstance(self.db_conn, sqlite3.Connection):
+            return
+        try:
+            row = self.db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            # row = (busy, log_frames, checkpointed_frames); busy != 0 means a
+            # concurrent reader/writer prevented a full checkpoint this time.
+            if row is not None and row[0] != 0:
+                logging.debug(
+                    f"WAL checkpoint for job_id={self.job_id} could not fully "
+                    f"complete (busy); {row[2]}/{row[1]} frames checkpointed"
+                )
+        except sqlite3.Error as e:
+            logging.warning(f"WAL checkpoint failed for job_id={self.job_id}: {e}")
+
+    def _check_shared_memory(self, inflight):
+        """Unlink shared-memory segments this coordinator has leaked.
+
+        Enumeration relies on POSIX shared memory being exposed under
+        ``/dev/shm`` (Linux). On platforms without it (macOS/Windows) this is a
+        no-op.
+        """
+        shm_dir = "/dev/shm"
+        if not os.path.isdir(shm_dir):
+            return
+
+        try:
+            existing = [n for n in os.listdir(shm_dir) if n.startswith(self.SHM_PREFIX)]
+        except OSError as e:
+            logging.warning(f"Could not list {shm_dir} for shared-memory cleanup: {e}")
+            return
+        if not existing:
+            return
+
+        # Map each segment back to a candidate pair name: strip our prefix, and
+        # for the coupling buffer also strip the trailing "_J".
+        prefix_len = len(self.SHM_PREFIX)
+        candidates = set()
+        for seg in existing:
+            core = seg[prefix_len:]
+            candidates.add(core)
+            if core.endswith("_J"):
+                candidates.add(core[:-2])
+
+        # Resolve ownership (pair id + owning job_id) for every candidate in one query.
+        table = quote_identifier(self.couple_table)
+        placeholders = ",".join("?" * len(candidates))
+        try:
+            cur = self.db_conn.execute(
+                f"SELECT id, name, job_id FROM {table} WHERE name IN ({placeholders})",
+                tuple(candidates),
+            )
+            owners = {row[1]: (row[0], row[2]) for row in cur.fetchall()}
+        except Exception as e:
+            logging.warning(f"Shared-memory cleanup skipped; DB lookup failed: {e}")
+            return
+
+        inflight_ids = set(inflight.values())
+        me = str(self.job_id)
+
+        removed = 0
+        for seg in existing:
+            core = seg[prefix_len:]
+            # Prefer an exact name match (the MSA buffer, or a pair literally
+            # named like the core); otherwise treat it as the "_J" buffer.
+            if core in owners:
+                pair_name = core
+            elif core.endswith("_J") and core[:-2] in owners:
+                pair_name = core[:-2]
+            else:
+                # No known pair owns this segment name; leave it alone rather
+                # than reason about something we can't attribute.
+                continue
+
+            pair_id, owner = owners[pair_name]
+            if pair_id in inflight_ids:
+                continue  # our own active pair
+            if owner is not None and str(owner) != me:
+                continue  # claimed by another live coordinator on this node
+
+            try:
+                shm = shared_memory.SharedMemory(name=seg)
+                shm.close()
+                shm.unlink()
+                removed += 1
+            except FileNotFoundError:
+                # Already unlinked by the owning task in the meantime.
+                pass
+            except Exception as e:
+                logging.warning(f"Failed to unlink stale shared memory '{seg}': {e}")
+
+        if removed:
+            logging.info(
+                f"Cleaned up {removed} stale shared-memory segment(s) for job_id={self.job_id}"
+            )
+
     @staticmethod
     def compute_score(J, q=21, gap_idx=0):
         """
@@ -314,7 +417,7 @@ class BaseCouplingExecutor(object):
 
         try:
             client.forward_logging()
-            client.register_worker_plugin(
+            client.register_plugin(
                 LoggingWorkerPlugin(self._config),
                 name="massivora-logging",
             )
@@ -338,7 +441,8 @@ class BaseCouplingExecutor(object):
 
         - Claims work from DB and feeds it to workers.
         - Receives results and performs DB updates.
-        - Commits every 64 tasks OR every 5 minutes.
+        - Commits (and checkpoints the WAL into the main DB file) every 64
+          tasks OR every 5 minutes.
 
         Lease-expiry reclaim is intentionally NOT implemented here.
 
@@ -365,6 +469,8 @@ class BaseCouplingExecutor(object):
                     return 0
 
             n = self._db_apply_results(done_updates, fail_ids)
+            self._checkpoint_wal()
+            self._check_shared_memory(inflight)
             done_updates = []
             fail_ids = []
             last_commit = float(time.time())
@@ -455,6 +561,7 @@ class BaseCouplingExecutor(object):
         flush(force=True)
 
         if terminating:
+            self.close_db_connection()
             raise SystemExit(143)
 
 
@@ -565,7 +672,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
         w_size = W.nbytes
         logging.debug(f"MSA size (bytes): {msa_size}, Weights size (bytes): {w_size}")
         logging.debug(f"MSA dimensions: {MSA.shape}, Weights length: {W.shape}")
-        msa_shm = shared_memory.SharedMemory(name=pair_name, create=True, size=msa_size+w_size)
+        msa_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +pair_name, create=True, size=msa_size+w_size)
         msa_arr = np.ndarray(MSA.shape, dtype=np.int32, buffer=msa_shm.buf)
         w_arr = np.ndarray(W.shape, dtype=np.float64, buffer=msa_shm.buf[msa_size:])
         np.copyto(msa_arr, MSA)
@@ -606,7 +713,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
             return r, 1  # Invalid site index; return non-zero code to indicate failure
 
         try:
-            J_shm = shared_memory.SharedMemory(name=msa_name+'_J', create=True, size=N*N*q*q*8)
+            J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +msa_name+'_J', create=True, size=N*N*q*q*8)
         except FileExistsError:
             pass # Ensure the shared memory has been created, do nothing here
         logging.debug(F"Running PLM optimization with cmd {' '.join([plm_opt_exe, msa_name, str(r), str(B), str(N), str(q), str(lambdaH), str(lambdaJ), str(eps_conv), str(maxit)])}")
@@ -633,7 +740,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
         N = params["N"]
         q = params["q"]
 
-        J_shm = shared_memory.SharedMemory(name=params["name"]+'_J', size=N*N*q*q*8)
+        J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +params["name"]+'_J', size=N*N*q*q*8)
         J = np.ndarray((N*q*q, N), dtype=np.float64, buffer=J_shm.buf)
 
         score = self.compute_score(J, q=q).astype(np.float16)
@@ -654,7 +761,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
             del J
             J_shm.close()
             J_shm.unlink()
-            shm = shared_memory.SharedMemory(name=params["name"])
+            shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +params["name"])
             shm.close()
             shm.unlink()
         except FileNotFoundError:
@@ -712,8 +819,7 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
                 logging.warning("Could not detect GPU count; defaulting to device 0")
 
         n_gpus = len(devices)
-        total_cpus = mp.cpu_count()
-        compute_threads = max(1, total_cpus - 4)
+        compute_threads = max(1, n_gpus * 2)
         logging.info(f"Creating GPU cluster with {n_gpus} workers (one per GPU)")
 
         worker_spec = {
@@ -732,7 +838,7 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
             worker_spec[f'gpu-{i}'] = {
                 'cls': Nanny,
                 'options': {
-                    'nthreads': 4,
+                    'nthreads': 1,
                     'resources': {'gpu': 1},
                     'memory_limit': 0,
                     'host': '127.0.0.1',
@@ -792,7 +898,11 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
         w_size = W.nbytes
         logging.debug(f"Pair {pair_id} '{pair_name}': MSA size (bytes): {msa_size}, Weights size (bytes): {w_size}")
         logging.debug(f"Pair {pair_id} '{pair_name}': MSA dimensions: {MSA.shape}, Weights length: {W.shape}")
-        msa_shm = shared_memory.SharedMemory(name=pair_name, create=True, size=msa_size+w_size)
+        try:
+            msa_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +pair_name, create=True, size=msa_size+w_size)
+        except FileExistsError:
+            logging.warning(f"Shared memory for pair {pair_id} '{pair_name}' already exists; reusing it.")
+            msa_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +pair_name)
         msa_arr = np.ndarray(MSA.shape, dtype=np.int32, buffer=msa_shm.buf)
         w_arr = np.ndarray(W.shape, dtype=np.float64, buffer=msa_shm.buf[msa_size:])
         np.copyto(msa_arr, MSA)
@@ -826,7 +936,7 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
         plm_opt_exe = params["plm_opt_exe"]
 
         try:
-            shared_memory.SharedMemory(name=msa_name+'_J', create=True, size=N*N*q*q*4)
+            shared_memory.SharedMemory(name=self.SHM_PREFIX +msa_name+'_J', create=True, size=N*N*q*q*4)
         except FileExistsError:
             pass  # Ensure the shared memory has been created, do nothing here
 
@@ -847,10 +957,10 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
 
         if results != 0:
             try:
-                J_shm = shared_memory.SharedMemory(name=params["name"]+'_J', size=N*N*q*q*4)
+                J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +params["name"]+'_J', size=N*N*q*q*4)
                 J_shm.close()
                 J_shm.unlink()
-                shm = shared_memory.SharedMemory(name=params["name"])
+                shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +params["name"])
                 shm.close()
                 shm.unlink()
             except FileNotFoundError:
@@ -861,7 +971,7 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
 
         # The CUDA executable stores J as float32 with one row per site:
         # row r holds site r's (N, q, q) coupling blocks flattened to (N*q*q,).
-        J_shm = shared_memory.SharedMemory(name=params["name"]+'_J', size=N*N*q*q*4)
+        J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +params["name"]+'_J', size=N*N*q*q*4)
         J = np.ndarray((N, N*q*q), dtype=np.float32, buffer=J_shm.buf)
 
         cpp_bindings.applyIsingGauge(J, q)
@@ -887,7 +997,7 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
             del J
             J_shm.close()
             J_shm.unlink()
-            shm = shared_memory.SharedMemory(name=params["name"])
+            shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +params["name"])
             shm.close()
             shm.unlink()
         except FileNotFoundError:

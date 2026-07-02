@@ -227,10 +227,12 @@ struct ShmMapping {
     }
 };
 
+static const std::string SHM_PREFIX = "Massivora_";
+
 ShmMapping openShm(const std::string& name, size_t expected_size = 0) {
     ShmMapping m;
 
-    std::string shm_path = "/" + name;
+    std::string shm_path = "/" + SHM_PREFIX + name;
     m.fd = shm_open(shm_path.c_str(), O_RDWR, 0666);
     if (m.fd < 0) {
         throw std::runtime_error("Failed to open shared memory: " + name);

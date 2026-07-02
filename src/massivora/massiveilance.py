@@ -10,7 +10,7 @@ from multiprocessing import shared_memory
 
 from massivora.config import load_project_and_system_config
 from massivora.db import STATUS, connect_db, connect_db_ro, get_table_names, quote_identifier
-from massivora.utils import compute_id_range, setup_logging
+from massivora.utils import SHM_PREFIX, compute_id_range, setup_logging
 
 WORKER_NAME = socket.gethostname()
 
@@ -254,8 +254,9 @@ def fix_zombie_tasks(cfg, command):
             )
 
             if is_coupling_task:
-                # fix shared memory record
-                shm_name = f"{r['pid1']}-{r['pid2']}"
+                # fix shared memory record (names carry the SHM_PREFIX applied
+                # at allocation time in the coupling executor)
+                shm_name = f"{SHM_PREFIX}{r['pid1']}-{r['pid2']}"
                 try:
                     shm = shared_memory.SharedMemory(name=shm_name)
                     shm.close()
