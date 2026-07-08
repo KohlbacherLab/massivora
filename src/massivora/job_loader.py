@@ -166,6 +166,10 @@ class SlurmJobLoader(BaseJobLoader):
         self.cpu_count = self.config.get('batch').get('cpu_count', 1)
         self.modules = self.config.get('batch').get('modules', [])
 
+        # Cluster-specific #SBATCH directives for routing the coupling step to
+        # GPU nodes (empty by default -> ordinary CPU submission).
+        self.sbatch_directives = self.config.get('batch').get('sbatch_directives') or []
+
         os.makedirs(self.script_dir, mode=0o755, exist_ok=True)
 
     def sbatch(self, script_path):
@@ -186,7 +190,7 @@ class SlurmJobLoader(BaseJobLoader):
         with open(script_path, 'w', encoding='utf-8') as f:
             f.write(content)
 
-    def default_sbatch_header(self, job_name, cpus_per_task=None, time_limit=None, log_dir="./logs", modules=None):
+    def default_sbatch_header(self, job_name, cpus_per_task=None, time_limit=None, log_dir="./logs", modules=None, extra_directives=[]):
         if cpus_per_task is None:
             cpus_per_task = 1
 
@@ -201,11 +205,19 @@ class SlurmJobLoader(BaseJobLoader):
         )
         if time_limit:
             header += f"#SBATCH --time={time_limit}\n"
+        # Cluster-specific directives (e.g. GPU partition / --gres) injected as-is.
+        for directive in extra_directives:
+            directive = str(directive).strip()
+            if not directive:
+                continue
+            if not directive.startswith("#SBATCH"):
+                directive = f"#SBATCH {directive}"
+            header += f"{directive}\n"
         header += "source /etc/profile\n"
         if modules:
             header += "module purge\n"
             for module in modules:
-                header += f"module load {module}\n"
+                header += f"module load {str(module).strip()}\n"
         header += "export OMP_NUM_THREADS=1\n"
         return header
 
@@ -316,7 +328,7 @@ class SlurmJobLoader(BaseJobLoader):
 
         for node in range(maximum_nodes):
             job_name = f"{self.job_name_prefix}_cp{node}"
-            header = self.default_sbatch_header(job_name, cpus_per_task=self.cpu_count, time_limit=self.time_limit, log_dir=self.log_dir, modules=self.modules)
+            header = self.default_sbatch_header(job_name, cpus_per_task=self.cpu_count, time_limit=self.time_limit, log_dir=self.log_dir, modules=self.modules, extra_directives=self.sbatch_directives)
             cmd = f"conda run -p {self.conda_prefix} massiworker couple --config {self.config_path}"
 
             script_path = os.path.join(self.script_dir, f"coupling_node_{node}.sh")
