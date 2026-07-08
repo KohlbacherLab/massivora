@@ -1029,7 +1029,8 @@ if __name__ == '__main__':
         'distributed.worker.memory.terminate': False,
         'distributed.comm.timeouts.connect': '60s',
         'distributed.comm.timeouts.tcp': '120s',
-        'distributed.scheduler.worker-ttl': '5m',
+        'distributed.scheduler.worker-ttl': None,
+        'distributed.scheduler.allowed-failures': 0,
         'distributed.worker.lifetime.duration': None,
         'distributed.worker.lifetime.restart': False,
     })
