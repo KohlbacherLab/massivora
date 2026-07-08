@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import sys
 import socket
+import time
 from datetime import datetime
 from multiprocessing import shared_memory
 
@@ -13,6 +14,10 @@ from massivora.db import STATUS, connect_db, connect_db_ro, get_table_names, quo
 from massivora.utils import SHM_PREFIX, compute_id_range, setup_logging
 
 WORKER_NAME = socket.gethostname()
+
+# Local runs: give up (and let massiveilance remove itself from crontab) after
+# this many consecutive ticks with no task progress while work still remains.
+MAX_STALL_TICKS = 5
 
 def _get_table_names(cfg):
     """Get table names from config."""
@@ -35,7 +40,14 @@ def _slurm_queuing_job_ids():
     alive = (rv.stdout or '').splitlines()
     return alive
 
-def _too_many_failures(cfg):
+def _too_many_failures(cfg, command, mode):
+    """Decide whether the run is hopeless enough to stop monitoring."""
+    if mode == 'batch':
+        return _too_many_failures_slurm(cfg)
+    return _too_many_failures_local(cfg, command)
+
+
+def _too_many_failures_slurm(cfg):
     """
     Check if the last two batches all have FAILED status.
     This function only applies to the SLURM backend.
@@ -77,6 +89,121 @@ def _too_many_failures(cfg):
         return all(row['status'] == 'FAILED' for row in rows)
     finally:
         conn.close()
+
+
+def _save_monitor_progress(conn, stage, done_count, stall_ticks):
+    """Upsert the local-run progress record for ``stage`` (creates table lazily)."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS monitor_progress (
+            stage TEXT PRIMARY KEY,
+            done_count INTEGER NOT NULL,
+            stall_ticks INTEGER NOT NULL,
+            updated_at REAL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO monitor_progress (stage, done_count, stall_ticks, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(stage) DO UPDATE SET
+            done_count = excluded.done_count,
+            stall_ticks = excluded.stall_ticks,
+            updated_at = excluded.updated_at
+        """,
+        (stage, int(done_count), int(stall_ticks), time.time()),
+    )
+
+
+def _too_many_failures_local(cfg, command):
+    """
+    Local-run analogue of the SLURM too-many-failures guard.
+    """
+    table_names = _get_table_names(cfg)
+    if command == 'align':
+        table = quote_identifier(table_names['alignments'])
+        stage_cfg = cfg.get('align') or {}
+    elif command == 'couple':
+        table = quote_identifier(table_names['couplings'])
+        stage_cfg = cfg.get('couple') or {}
+    else:
+        return False
+
+    try:
+        conn = connect_db(cfg)
+    except Exception as e:
+        logging.warning(f"massiveilance on {WORKER_NAME}: progress check skipped; DB open failed: {e}")
+        return False
+
+    if hasattr(conn, 'row_factory'):
+        conn.row_factory = sqlite3.Row
+
+    try:
+        cursor = conn.cursor()
+
+        # DONE count and whether any workable (non-terminal) task remains, within
+        # the configured slice of this stage's table.
+        portion = float(stage_cfg.get('portion', 1.0))
+        portion_start = float(stage_cfg.get('portion_start', 0.0))
+        cursor.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}")
+        total = int(cursor.fetchone()[0] or 0)
+        idx_start, idx_end = compute_id_range(portion, portion_start, total)
+
+        done_now = int(cursor.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE status = ? AND id >= ? AND id < ?",
+            (STATUS['DONE'], idx_start, idx_end),
+        ).fetchone()[0] or 0)
+
+        workable = cursor.execute(
+            f"SELECT 1 FROM {table} WHERE status NOT IN (?, ?) AND id >= ? AND id < ? LIMIT 1",
+            (STATUS['DONE'], STATUS['FAILED'], idx_start, idx_end),
+        ).fetchone()
+
+        prev = cursor.execute(
+            "SELECT done_count, stall_ticks FROM monitor_progress WHERE stage = ?",
+            (command,),
+        ).fetchone() if _monitor_progress_exists(conn) else None
+
+        # Nothing workable left: completion handles removal. Reset the stall
+        # counter so a fresh re-run isn't immediately judged as stuck.
+        if workable is None:
+            _save_monitor_progress(conn, command, done_now, 0)
+            conn.commit()
+            return False
+
+        # First observation, or progress since last tick: (re)seed and wait.
+        if prev is None or done_now > int(prev['done_count']):
+            _save_monitor_progress(conn, command, done_now, 0)
+            conn.commit()
+            return False
+
+        # No progress this tick: advance the stall counter.
+        stall = int(prev['stall_ticks']) + 1
+        _save_monitor_progress(conn, command, done_now, stall)
+        conn.commit()
+
+        if stall >= MAX_STALL_TICKS:
+            logging.warning(
+                f"massiveilance on {WORKER_NAME} {command}: no progress for {stall} consecutive "
+                f"runs (DONE stuck at {done_now}, workable tasks remain); treating run as failed."
+            )
+            return True
+        return False
+    except Exception as e:
+        logging.warning(f"massiveilance on {WORKER_NAME}: progress check failed: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def _monitor_progress_exists(conn):
+    """True if the local-run progress table has been created in this DB."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='monitor_progress'"
+    ).fetchone()
+    return row is not None
+
 
 def _project_is_complete(cfg, command):
     """
@@ -427,7 +554,7 @@ def main(argv=None):
     logging.info(f"massiveilance on {WORKER_NAME} {args.command} {args.config}: job status in database has been updated")
 
     # 1) completion check
-    if _project_is_complete(cfg, args.command) or _too_many_failures(cfg):
+    if _project_is_complete(cfg, args.command) or _too_many_failures(cfg, args.command, args.mode):
         jobs = _get_crontab()
         if jobs:
             for job in jobs:
