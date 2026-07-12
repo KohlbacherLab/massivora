@@ -46,17 +46,33 @@ py::array_t<char[1]> getAlignmentInNumpy(const std::string& alignment, size_t se
     return result;
 }
 
-void applyIsingGauge(Eigen::Matrix<PLMV, -1, 1>& J, int q) {
-    const int site_size = q * q;
+// In-place zero-sum (Ising) gauge on every q×q block of a C-contiguous,
+// row-major flat buffer. GPU path only.
+template <typename T>
+void applyIsingGauge(py::array_t<T> J, int q) {
+    auto buf = J.request();
+    if (buf.readonly)
+        throw std::runtime_error("applyIsingGauge: array must be writeable");
+    // Require C-contiguous so the flat q×q block walk is valid and in place.
+    py::ssize_t expected = buf.itemsize;
+    for (py::ssize_t d = buf.ndim - 1; d >= 0; --d) {
+        if (buf.strides[d] != expected)
+            throw std::runtime_error("applyIsingGauge: array must be C-contiguous");
+        expected *= buf.shape[d];
+    }
 
-    // Iterate over each site
-    for (int i = 0; i < J.rows(); i+=site_size) {
-        Eigen::Map<Eigen::Matrix<PLMV, -1, -1>> Jij(J.data() + i, q, q);
-        Eigen::Matrix<PLMV, -1, 1> row_mean = Jij.rowwise().mean();
-        Eigen::Matrix<PLMV, -1, 1> col_mean = Jij.colwise().mean();
-        PLMV total_mean = row_mean.mean();
+    T* data = static_cast<T*>(buf.ptr);
+    const size_t n = static_cast<size_t>(buf.size);
+    const size_t site_size = static_cast<size_t>(q * q);
 
-        // Apply Ising gauge transformation
+    if (site_size == 0 || n % static_cast<size_t>(site_size) != 0)
+        throw std::runtime_error("applyIsingGauge: array size must be a multiple of q*q");
+    for (size_t off = 0; off + site_size <= n; off += site_size) {
+        Eigen::Map<Eigen::Matrix<T, -1, -1, Eigen::RowMajor>> Jij(data + off, q, q);
+        Eigen::Matrix<T, -1, 1> row_mean = Jij.rowwise().mean();
+        Eigen::Matrix<T, -1, 1> col_mean = Jij.colwise().mean();
+        T total_mean = row_mean.mean();
+
         for (int k = 0; k < q; ++k) {
             for (int l = 0; l < q; ++l) {
                 Jij(k, l) = Jij(k, l) - row_mean(k) - col_mean(l) + total_mean;
@@ -129,7 +145,10 @@ std::pair<int, float> cudaOptimizeSiteWrapper(
 
 PYBIND11_MODULE(cpp_bindings, m) {
     m.def("getAlignmentInNumpy", &getAlignmentInNumpy);
-    m.def("applyIsingGauge", &applyIsingGauge, py::arg("J"), py::arg("q"));
+    // Overloaded on dtype: float32 (GPU J) and float64 (CPU J). pybind dispatches
+    // by the array's dtype without a copy, so the gauge is applied in place.
+    m.def("applyIsingGauge", &applyIsingGauge<double>, py::arg("J"), py::arg("q"));
+    m.def("applyIsingGauge", &applyIsingGauge<float>,  py::arg("J"), py::arg("q"));
 
 #ifdef ENABLE_CUDA
     m.def("cudaFillPllGradients", &cudaFillPllGradientsWrapper,

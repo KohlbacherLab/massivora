@@ -117,13 +117,15 @@ def test_coupling_GPU_executable():
     massivora_dir = massivora_pkg_dir()
     plm_opt_exe = os.path.join(massivora_dir, 'bin', 'plm_opt_site')
 
-    n_streams = 1
+    n_streams = 4
     rv = subprocess.run([plm_opt_exe, "--use-gpu", "RL4_ECOLI-RL31_ECOLI", str(B), str(N), str(q),
                          str(0.01), str(0.01), str(3e-4), str(500), str(n_streams)])
     assert rv.returncode == 0, f"plm_opt_site (GPU) failed with rc={rv.returncode}"
 
     # Row r holds site r's (N, q, q) coupling blocks flattened to (N*q*q,).
     J = np.ndarray((N, N*q*q), dtype=np.float32, buffer=J_shm.buf)
+    # The GPU executable no longer applies the Ising gauge; do it here (in place).
+    cpp_bindings.applyIsingGauge(J, q)
     score = BaseCouplingExecutor.compute_score(J.T, q=q).astype(np.float16)
 
     grp = zarr.open_group(store=TEST_ZARR)
@@ -177,30 +179,34 @@ def test_coupling_GPU():
     MSA_pad = cp.zeros((B, N, q_pad), dtype=cp.float16)
     MSA_pad[b_idx, i_idx, MSA] = 1.0
 
-    # Create CUDA streams for parallel execution
-    n_streams = 1
+    # Create CUDA streams for parallel execution.
+    n_streams = 4
     streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
-    def run_site(r):
-        stream = streams[r % n_streams]
-        iters, pll_r = cpp_bindings.cudaOptimizeSite(
-            MSA_pad.data.ptr,
-            MSA.data.ptr,
-            W.data.ptr,
-            np.int32(r), np.int32(B), np.int32(N),
-            np.int32(q), np.int32(q_pad),
-            np.float32(0.01), np.float32(0.01),
-            np.float32(3e-4), np.int32(500),
-            x0_pad[r].data.ptr,
-            {}, 0, stream.ptr
-        )
-        return r, iters, pll_r
+
+    def run_stream(tid):
+        stream = streams[tid]
+        results = []
+        for r in range(tid, N, n_streams):
+            iters, pll_r = cpp_bindings.cudaOptimizeSite(
+                MSA_pad.data.ptr,
+                MSA.data.ptr,
+                W.data.ptr,
+                np.int32(r), np.int32(B), np.int32(N),
+                np.int32(q), np.int32(q_pad),
+                np.float32(0.01), np.float32(0.01),
+                np.float32(1e-4), np.int32(500),
+                x0_pad[r].data.ptr,
+                {}, 0, stream.ptr
+            )
+            results.append((r, iters, pll_r))
+        return results
 
     with ThreadPoolExecutor(max_workers=n_streams) as pool:
-        futures = {pool.submit(run_site, r): r for r in range(N)}
+        futures = [pool.submit(run_stream, tid) for tid in range(n_streams)]
         for future in as_completed(futures):
-            r, iters, pll_r = future.result()
-            pll[r] = pll_r
-            print(f"site {r} iter {iters}: PLL = {float(pll_r):.6f}")
+            for r, iters, pll_r in future.result():
+                pll[r] = pll_r
+                print(f"site {r} iter {iters}: PLL = {float(pll_r):.6f}")
 
     J_result = (x0_pad[:, q_pad:]
                 .reshape(N, N, q_pad, q_pad)[:, :, :q, :q]

@@ -81,7 +81,7 @@ concatenate:
     enabled: true
     to: 30000
 
-couple: 
+couple:
   db_table: couplings
   claim_batch_size: 'auto'  # 'auto' or integer
 

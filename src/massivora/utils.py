@@ -2,6 +2,13 @@ import importlib
 import logging
 import os
 
+# Prefix applied to every POSIX shared-memory segment massivora allocates, so
+# cleanup can recognise its own segments and never touch unrelated ones. Kept
+# in this dependency-light module so every Python consumer shares one
+# definition. The C++ optimizer applies the same prefix in
+# bindings_src/plm_opt_site.cpp and must be kept in sync with this value.
+SHM_PREFIX = "Massivora_"
+
 
 def massivora_pkg_dir():
     spec = importlib.util.find_spec('massivora')
@@ -9,7 +16,8 @@ def massivora_pkg_dir():
         return os.fspath(list(spec.submodule_search_locations)[0])
 
 def worker_id():
-    return f"{os.environ.get('SLURM_JOB_ID') or os.environ.get('SLURM_JOBID') or ''}".strip() or "local"
+    slurm_id = f"{os.environ.get('SLURM_JOB_ID') or os.environ.get('SLURM_JOBID') or ''}".strip()
+    return slurm_id or str(os.getpid())
 
 def compute_id_range(portion, portion_start, total):
     if portion < 0:

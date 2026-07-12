@@ -186,6 +186,7 @@ Eigen::Matrix<PLMV, -1, 1> perSiteNLopt(
     return J;
 }
 
+// Only used in CPU calculations, not the GPU path.
 void applyIsingGauge(Eigen::Matrix<PLMV, -1, 1>& J, int q) {
     const int site_size = q * q;
 
@@ -226,10 +227,12 @@ struct ShmMapping {
     }
 };
 
+static const std::string SHM_PREFIX = "Massivora_";
+
 ShmMapping openShm(const std::string& name, size_t expected_size = 0) {
     ShmMapping m;
 
-    std::string shm_path = "/" + name;
+    std::string shm_path = "/" + SHM_PREFIX + name;
     m.fd = shm_open(shm_path.c_str(), O_RDWR, 0666);
     if (m.fd < 0) {
         throw std::runtime_error("Failed to open shared memory: " + name);
@@ -302,25 +305,6 @@ static size_t gpuFreeBytes() {
     size_t freeB = 0, totalB = 0;
     if (cudaMemGetInfo(&freeB, &totalB) != cudaSuccess) return 0;
     return freeB;
-}
-
-// Ising gauge on the host (float32). The result buffer stores each q*q coupling
-// block in row-major order (row index a, col index b), matching the GPU
-// `apply_ising_gauge` kernel convention.
-void applyIsingGaugeF32(float* J, size_t nElems, int q) {
-    const int site_size = q * q;
-    for (size_t off = 0; off + (size_t)site_size <= nElems; off += site_size) {
-        Eigen::Map<Eigen::Matrix<float, -1, -1, Eigen::RowMajor>> Jij(J + off, q, q);
-        Eigen::Matrix<float, -1, 1> row_mean = Jij.rowwise().mean();
-        Eigen::Matrix<float, -1, 1> col_mean = Jij.colwise().mean();
-        float total_mean = row_mean.mean();
-
-        for (int k = 0; k < q; ++k) {
-            for (int l = 0; l < q; ++l) {
-                Jij(k, l) = Jij(k, l) - row_mean(k) - col_mean(l) + total_mean;
-            }
-        }
-    }
 }
 
 int runGpu(const std::string& pairName, int B, int N, int q,
@@ -456,9 +440,9 @@ int runGpu(const std::string& pairName, int B, int N, int q,
         }
     }
 
-    // ---- Ising gauge on the host (float32), then publish to shared memory ----
-    applyIsingGaugeF32(outBuf.data(), outElems, q);
-
+    // ---- Publish the RAW (un-gauged) J to shared memory. The Ising gauge is
+    // applied downstream on the CPU (cpp_bindings.applyIsingGauge in the GPU
+    // executor's collect_results), so it no longer occupies this GPU process. --
     ShmMapping shmJ = openShm(pairName + "_J", outElems * sizeof(float));
     std::memcpy(shmJ.ptr, outBuf.data(), outElems * sizeof(float));
 
