@@ -644,6 +644,36 @@ class BinaryAlignment(object):
 
         self.saved_columns = new_saved_columns
 
+    def Drop_Gap_Columns(self, gap_ratio=0.5):
+        """
+        Remove columns whose gap fraction reaches `gap_ratio` from the matrix.
+
+        ``Gap_Columns_Control`` records the same columns in ``saved_columns`` but
+        deliberately leaves the matrix untouched. This applies the reduction, and
+        is what the ``--fast-approximate`` coupling path uses.
+
+        Any existing weights are discarded: sequence identity must be measured on
+        the reduced matrix, otherwise agreement between two gap characters in a
+        near-empty column dominates it.
+
+        Parameters
+        ----------
+        `gap_ratio` — float (optional)
+            Maximum tolerated gap fraction in a column (default: `0.5`)
+
+        Returns
+        -------
+        `numpy.ndarray`
+            Indices of the kept columns, relative to the original width.
+        """
+        kept = np.flatnonzero(np.mean(self.matrix == 0, axis=0) < gap_ratio)
+        logger.info("Dropping %d of %d columns at gap ratio %.2f",
+                    self.matrix.shape[1] - kept.size, self.matrix.shape[1], gap_ratio)
+        self.matrix = self.matrix[:, kept]
+        self.weights = None
+        self.Beff = None
+        return kept
+
     def Downsample_Randomly(self, to):
         if to >= self.matrix.shape[0]:
             logger.error(f"Downsampling to {to} is not possible, as the alignment has only {self.matrix.shape[0]} sequences")

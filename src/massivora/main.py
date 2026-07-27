@@ -66,6 +66,14 @@ def _add_stage_subparsers(parent_parser):
             default=None,
             help='Optional path to system config YAML (merged before project config)',
         )
+        if stage == 'couple':
+            sp.add_argument(
+                '--fast-approximate',
+                action='store_true',
+                help='Fit couplings only on alignment columns whose gap fraction is '
+                     'below align.col_gap_threshold. Much faster, and changes the '
+                     'couplings: see docs before using for published results.',
+            )
 
 
 def cmd_new(default_project_name, overwrite):
@@ -107,7 +115,7 @@ def cmd_new(default_project_name, overwrite):
     return 0
 
 
-def cmd_run(project_config, system_config, stage, mode):
+def cmd_run(project_config, system_config, stage, mode, fast_approximate=False):
     cfg = load_project_and_system_config(project_config, system_config)
 
     project_path = cfg.get('project').get('project_path')
@@ -175,7 +183,7 @@ def cmd_run(project_config, system_config, stage, mode):
         # Then run alignment
         loader.run_align()
     elif stage == 'couple':
-        loader.run_couple()
+        loader.run_couple(fast_approximate=fast_approximate)
 
     # Put massiveilance into crontab. The massivora command name (run/batch) is
     # passed through so the monitor knows whether to resubmit locally or to SLURM.
@@ -214,10 +222,10 @@ def main(argv=None):
 
     if args.command == 'new':
         return cmd_new(args.project_name, args.overwrite)
-    if args.command == 'run':
-        return cmd_run(args.project_config, args.system_config, args.stage, mode='local')
-    if args.command == 'batch':
-        return cmd_run(args.project_config, args.system_config, args.stage, mode='slurm')
+    if args.command in ('run', 'batch'):
+        return cmd_run(args.project_config, args.system_config, args.stage,
+                       mode='local' if args.command == 'run' else 'slurm',
+                       fast_approximate=getattr(args, 'fast_approximate', False))
     if args.command == 'sysconf':
         return cmd_sysconf()
 

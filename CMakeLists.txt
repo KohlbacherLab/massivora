@@ -239,6 +239,15 @@ endif()
 add_executable(plm_opt_site ${BINDINGS_SRC}/plm_opt_site.cpp)
 target_link_libraries(plm_opt_site PRIVATE Eigen3::Eigen NLopt::nlopt)
 
+# Optional: parallelises the fp16 -> fp32 crop of the coupling blocks on the GPU
+# path. Falls back to a serial loop when OpenMP is unavailable.
+find_package(OpenMP QUIET COMPONENTS CXX)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(plm_opt_site PRIVATE OpenMP::OpenMP_CXX)
+else()
+    message(STATUS "OpenMP not found; plm_opt_site will crop coupling blocks serially")
+endif()
+
 # --- CUDA backend library (only if CUDA is enabled) ---
 if(ENABLE_CUDA)
     add_library(cuda_bindings SHARED ${BINDINGS_SRC}/bindings.cu)

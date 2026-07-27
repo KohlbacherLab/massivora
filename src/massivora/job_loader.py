@@ -144,8 +144,10 @@ class LocalJobLoader(BaseJobLoader):
         cmd = ['massiworker', 'concat', '--config', self.config_path, jobs_file]
         return self._run_detached(cmd, 'concat')
 
-    def run_couple(self):
+    def run_couple(self, fast_approximate=False):
         cmd = ['massiworker', 'couple', '--config', self.config_path]
+        if fast_approximate:
+            cmd.append('--fast-approximate')
         return self._run_detached(cmd, 'couple')
 
 
@@ -322,14 +324,15 @@ class SlurmJobLoader(BaseJobLoader):
             conn.commit()
             conn.close()
 
-    def run_couple(self):
+    def run_couple(self, fast_approximate=False):
         batch = self.config.get('batch')
         maximum_nodes = int(batch.get('maximum_nodes', 1))
+        extra = ' --fast-approximate' if fast_approximate else ''
 
         for node in range(maximum_nodes):
             job_name = f"{self.job_name_prefix}_cp{node}"
             header = self.default_sbatch_header(job_name, cpus_per_task=self.cpu_count, time_limit=self.time_limit, log_dir=self.log_dir, modules=self.modules, extra_directives=self.sbatch_directives)
-            cmd = f"conda run -p {self.conda_prefix} massiworker couple --config {self.config_path}"
+            cmd = f"conda run -p {self.conda_prefix} massiworker couple --config {self.config_path}{extra}"
 
             script_path = os.path.join(self.script_dir, f"coupling_node_{node}.sh")
             self.write_script(script_path, header + cmd)

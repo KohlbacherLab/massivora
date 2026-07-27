@@ -79,6 +79,11 @@ class BaseCouplingExecutor(object):
         self.portion = float(coupling_cfg.get('portion', 1.0))
         self.portion_start = float(coupling_cfg.get('portion_start', 0.0))
 
+        # --fast-approximate: fit the model only on columns that carry data.
+        self.fast_approximate = bool(coupling_cfg.get('fast_approximate', False))
+        self.col_gap_threshold = float(
+            config.get('align', {}).get('col_gap_threshold', 0.5))
+
         self.job_id = worker_id()
         self.plm_opt_exe = None
 
@@ -123,6 +128,33 @@ class BaseCouplingExecutor(object):
             concatenated.Downsample_Randomly(to=downsample_to)
         concatenated.Gap_Columns_Control(self._config.get('align').get('col_gap_threshold', 0.5))
         return concatenated
+
+    @staticmethod
+    def _record_column_provenance(z, params):
+        """Note which alignment columns a score matrix is indexed by.
+
+        Without --fast-approximate the score covers every column and the axes need
+        no explanation. With it the axes are a subset, so the original indices are
+        stored alongside; anything reading the scores back needs them to map a
+        residue pair to its position.
+        """
+        kept = params.get("kept_columns")
+        z.attrs["fast_approximate"] = kept is not None
+        if kept is not None:
+            z.attrs["kept_columns"] = [int(c) for c in kept]
+
+    def _apply_fast_approximate(self, align, reweighting_threshold, use_GPU=False):
+        """Reduce `align` to its informative columns and reweight on the result.
+
+        Returns the kept column indices, or None when the option is off.
+        """
+        if not self.fast_approximate:
+            return None
+        kept = align.Drop_Gap_Columns(self.col_gap_threshold)
+        # Drop_Gap_Columns invalidates the weights on purpose; recompute them on
+        # the reduced matrix so identity is measured over columns with data.
+        align.Reweight_Sequence(reweighting_threshold, use_GPU=use_GPU)
+        return kept
 
     # -- DB helpers --
 
@@ -659,6 +691,8 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
             align.Reweight_Sequence(reweighting_threshold)
             align.To_Zarr(filename, overwrite=True)
 
+        kept_columns = self._apply_fast_approximate(align, reweighting_threshold)
+
         MSA = align.matrix.astype(np.int32)
         B, N = MSA.shape
         W = np.array(align.weights, dtype=np.float64)
@@ -694,7 +728,8 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
             "eps_conv": eps_conv,
             "maxit": maxit,
             "plm_opt_exe": plm_opt_exe,
-            "file_hash": file_hash
+            "file_hash": file_hash,
+            "kept_columns": kept_columns,
         }
         return shared
 
@@ -749,6 +784,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
         # TODO: Compression need implementing
         z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
         z[:] = score
+        self._record_column_provenance(z, params)
 
         result = {
             'id': params["pair_id"],
@@ -886,6 +922,9 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
             align.Reweight_Sequence(reweighting_threshold, use_GPU=True)
             align.To_Zarr(filename, overwrite=True)
 
+        kept_columns = self._apply_fast_approximate(align, reweighting_threshold,
+                                                    use_GPU=True)
+
         MSA = np.asarray(align.matrix, dtype=np.int32)
         B, N = MSA.shape
         W = np.asarray(align.weights, dtype=np.float64)
@@ -908,17 +947,19 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
         np.copyto(msa_arr, MSA)
         np.copyto(w_arr, W)
 
-        # Update kwargs with computed values and ensure all needed fields are present
+        # Update kwargs with computed values and ensure all needed fields are present.
+        # MSA and W are deliberately not included: the native executable reads them
+        # from the shared-memory segment above, so putting them here only made Dask
+        # serialise and ship ~B*N*4 bytes per pair that nothing downstream reads.
         kwargs.update({
             "name": pair_name,
             "pair_id": pair_id,
             "B": B,
             "N": N,
             "q": q,
-            "MSA": MSA,
-            "W": W,
             "Beff": Beff,
-            "file_hash": file_hash
+            "file_hash": file_hash,
+            "kept_columns": kept_columns,
         })
         del align
 
@@ -982,6 +1023,7 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
         # TODO: Compression need implementing
         z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
         z[:] = score
+        self._record_column_provenance(z, params)
 
         # Release GPU buffers and free CuPy pools to return memory to the driver.
         del z, grp, score
@@ -1037,9 +1079,13 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Coupling calculation executor')
     parser.add_argument('--config', required=True, help='Project config YAML')
+    parser.add_argument('--fast-approximate', action='store_true',
+                        help='Fit couplings only on columns below align.col_gap_threshold')
     args = parser.parse_args()
 
     cfg = load_project_and_system_config(args.config)
+    if args.fast_approximate:
+        cfg.setdefault('couple', {})['fast_approximate'] = True
     setup_logging(cfg)
 
     method = cfg.get('coupling', {}).get('method', 'plm')
