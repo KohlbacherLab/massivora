@@ -1,3 +1,4 @@
+import glob
 import logging
 import multiprocessing as mp
 import os
@@ -344,3 +345,31 @@ class SlurmJobLoader(BaseJobLoader):
             )
             conn.commit()
             conn.close()
+
+    # Map a monitored pipeline stage to the sbatch scripts it generates.
+    _STAGE_SCRIPT_PREFIX = {'align': 'align_node_', 'couple': 'coupling_node_'}
+
+    def resubmit(self, stage):
+        """
+        Re-submit the sbatch scripts already generated for ``stage``. Returns the number of scripts resubmitted.
+        """
+        prefix = self._STAGE_SCRIPT_PREFIX.get(stage)
+        if prefix is None:
+            raise ValueError(f"Cannot resubmit unknown stage: {stage!r}")
+
+        scripts = sorted(glob.glob(os.path.join(self.script_dir, f"{prefix}*.sh")))
+
+        submitted = 0
+        for script_path in scripts:
+            job_id = self.sbatch(script_path)
+
+            conn = connect_db(self.config)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO jobs (job_id, status) VALUES (?, ?)",
+                (str(job_id), 'PENDING')
+            )
+            conn.commit()
+            conn.close()
+            submitted += 1
+        return submitted

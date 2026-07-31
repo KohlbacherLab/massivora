@@ -3,7 +3,6 @@ import logging
 import os
 import sqlite3
 import subprocess
-import sys
 import socket
 import time
 from datetime import datetime
@@ -11,6 +10,7 @@ from multiprocessing import shared_memory
 
 from massivora.config import load_project_and_system_config
 from massivora.db import STATUS, connect_db, connect_db_ro, get_table_names, quote_identifier
+from massivora.job_loader import SlurmJobLoader
 from massivora.utils import SHM_PREFIX, compute_id_range, setup_logging
 
 WORKER_NAME = socket.gethostname()
@@ -521,14 +521,9 @@ def maybe_resubmit(cfg, config_path, stage, mode):
         if active_jobs >= maximum_nodes:
             return False
 
-        rv = subprocess.run(
-            [os.path.join(os.path.dirname(sys.executable), 'massivora'), mode, stage, config_path],
-            capture_output=True,
-            text=True
-        )
-        if rv.returncode == 0:
-            return True
-        return False
+        # Re-submit the sbatch scripts that the initial `massivora batch` run already generated
+        loader = SlurmJobLoader(project_cfg=config_path)
+        return loader.resubmit(stage) > 0
     else:
         # Else monitor the coordinator process,
         # and restart it if it's dead.
