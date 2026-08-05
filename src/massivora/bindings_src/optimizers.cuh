@@ -350,6 +350,13 @@ struct LBFGS_Unconstrained {
     /* cooperative single-kernel two-loop (set up in optimize()) */
     bool use_coop  = false;
     int  coop_grid = 0;
+    /* Set false by the caller when many streams share the device. The
+     * cooperative two-loop is sized to cover n_params and so occupies most of
+     * the GPU during its grid.sync barriers; two such grids cannot co-reside,
+     * which serialises concurrent streams. Measured crossover on an H100
+     * (B=1504, N=254): cooperative wins up to ~8 streams, the fused
+     * multi-launch path wins beyond that. */
+    bool allow_coop = true;
 
     /* device-scalar workspace layout: [0,m_corr)=rho, [m_corr,2m_corr)=alpha,
      * then the named temporaries below (only cuBLAS-dot results now — the rest
@@ -535,7 +542,7 @@ struct LBFGS_Unconstrained {
                 const int maxBlocks = blocksPerSM * numSM;
                 const int needed    = (n_params + 255) / 256;
                 coop_grid = (needed < maxBlocks) ? needed : maxBlocks;
-                use_coop  = (blocksPerSM > 0 && coop_grid > 0);
+                use_coop  = (allow_coop && blocksPerSM > 0 && coop_grid > 0);
             }
             if (use_coop)
                 cudaMallocAsync(&d_acc, (size_t)(2 * m_corr + 2) * sizeof(float),

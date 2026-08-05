@@ -973,7 +973,13 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
         lambdaH, lambdaJ = params["lambdaH"], params["lambdaJ"]
         eps_conv = params["eps_conv"]
         maxit = params["maxit"]
-        n_streams = int(params.get("n_streams", 4))
+        # 4 badly under-fills the GPU: per-site work is small and mostly
+        # latency-bound, so the device sits idle between launches. Measured on
+        # an H100 (B=1504, N=254), optimize-phase wall time: 4 streams 5908 ms,
+        # 8 -> 3634, 16 -> 2525, 24 -> 2574, 32 -> 2481, 48 -> 2649. 16 is on
+        # the plateau with margin; plm_opt_site still caps this to what free
+        # device memory allows, and to N.
+        n_streams = int(params.get("n_streams", 16))
         plm_opt_exe = params["plm_opt_exe"]
 
         try:
