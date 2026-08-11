@@ -1,6 +1,6 @@
 [project]
 name = "massivora"
-version = "0.1.0"
+version = "1.0.1"
 description = "A scalable framework for massive sequence co-evolution analysis"
 authors = [
     { name = "Haoran Sun", email = "simonhrsun@gmail.com" }

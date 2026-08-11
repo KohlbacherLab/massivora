@@ -58,6 +58,11 @@ find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 # so its CMake config is on CMAKE_PREFIX_PATH.
 find_package(pybind11 CONFIG REQUIRED)
 
+# --- Threads ---
+# The GaussDCA core (gauss_dca.hpp) uses std::thread, so the standalone
+# gauss_infer executable needs a threading library linked.
+find_package(Threads REQUIRED)
+
 # --- Eigen ---
 # Eigen is header-only. Prefer its CMake config package, then pkg-config, then a
 # plain header search; if it still isn't found, fetch the headers from source
@@ -239,6 +244,10 @@ endif()
 add_executable(plm_opt_site ${BINDINGS_SRC}/plm_opt_site.cpp)
 target_link_libraries(plm_opt_site PRIVATE Eigen3::Eigen NLopt::nlopt)
 
+# --- Standalone executable gauss_infer (GaussDCA couplings over shared memory) ---
+add_executable(gauss_infer ${BINDINGS_SRC}/gauss_infer.cpp)
+target_link_libraries(gauss_infer PRIVATE Eigen3::Eigen Threads::Threads)
+
 # --- CUDA backend library (only if CUDA is enabled) ---
 if(ENABLE_CUDA)
     add_library(cuda_bindings SHARED ${BINDINGS_SRC}/bindings.cu)
@@ -290,6 +299,9 @@ install(TARGETS cpp_bindings
     RUNTIME DESTINATION ${MASSIVORA_BINDINGS_INSTALL_DIR})
 
 install(TARGETS plm_opt_site
+    RUNTIME DESTINATION ${MASSIVORA_BIN_INSTALL_DIR})
+
+install(TARGETS gauss_infer
     RUNTIME DESTINATION ${MASSIVORA_BIN_INSTALL_DIR})
 
 # Python package shim + the runtime CUDA kernel source used by CuPy at runtime.

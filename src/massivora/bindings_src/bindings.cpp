@@ -5,6 +5,7 @@
 #include <Eigen/Dense>
 #include <unsupported/Eigen/CXX11/Tensor>
 
+#include <cstdint>
 #include <iostream>
 #include <map>
 #include <string>
@@ -12,8 +13,65 @@
 #include <utility>
 #include <vector>
 
+#include "gauss_dca.hpp"
+
 namespace py = pybind11;
 using PLMV = double;
+
+
+// GaussDCA couplings J = inv(cholesky(C)) for one alignment.
+//
+//   MSA         : (M, N) integer alignment. Gap = 0, amino acids 1..q-1
+//                 (massivora BinaryAlignment encoding). Values outside
+//                 [1, q-1] are treated as gaps and skipped in the frequencies.
+//   W           : (M,) reweighting vector (NOT normalised; Meff = sum(W)).
+//   q           : alphabet size (21 for proteins => Q = q-1 = 20 amino-acid blocks).
+//   pseudocount : mixing weight with the uniform distribution (GaussDCA default 0.8).
+//
+// Returns J as a C-contiguous (N*Q, N*Q) float64 array (Q = q-1).
+py::array_t<double> gaussCouplings(py::array MSA,
+                                   py::array_t<double, py::array::c_style | py::array::forcecast> W,
+                                   int q = 21,
+                                   double pseudocount = 0.8) {
+    auto MSA_i32 = py::array_t<int32_t, py::array::c_style | py::array::forcecast>(MSA);
+    auto msa_buf = MSA_i32.request();
+    if (msa_buf.ndim != 2)
+        throw std::runtime_error("gaussCouplings: MSA must be 2-D (M, N)");
+    const int M = static_cast<int>(msa_buf.shape[0]);
+    const int N = static_cast<int>(msa_buf.shape[1]);
+
+    auto wbuf = W.request();
+    if (wbuf.ndim != 1 || static_cast<int>(wbuf.shape[0]) != M)
+        throw std::runtime_error("gaussCouplings: W must be 1-D of length M");
+    if (q < 2)
+        throw std::runtime_error("gaussCouplings: q must be >= 2");
+
+    // Transpose into the residue-major int8 buffer Z[i*M + k] the core expects.
+    const int32_t* msa_ptr = static_cast<const int32_t*>(msa_buf.ptr);
+    std::vector<int8_t> Z(static_cast<size_t>(N) * M);
+    for (int k = 0; k < M; ++k) {
+        const int32_t* row = msa_ptr + static_cast<size_t>(k) * N;
+        for (int i = 0; i < N; ++i)
+            Z[static_cast<size_t>(i) * M + k] = static_cast<int8_t>(row[i]);
+    }
+
+    const double* Wp = static_cast<const double*>(wbuf.ptr);
+    double Meff = 0.0;
+    for (int k = 0; k < M; ++k) Meff += Wp[k];
+
+    const long NQ = static_cast<long>(N) * (q - 1);
+    py::array_t<double> out({static_cast<py::ssize_t>(NQ), static_cast<py::ssize_t>(NQ)});
+    double* outp = static_cast<double*>(out.request().ptr);
+
+    {
+        py::gil_scoped_release release;
+        Eigen::MatrixXd J = gaussdca::compute_couplings(Z.data(), N, M, Wp, Meff, q, pseudocount);
+        for (long r = 0; r < NQ; ++r)
+            for (long c = 0; c < NQ; ++c)
+                outp[static_cast<size_t>(r) * NQ + c] = J(r, c);
+    }
+    return out;
+}
 
 
 py::array_t<char[1]> getAlignmentInNumpy(const std::string& alignment, size_t seq_length, size_t align_length) {
@@ -149,6 +207,10 @@ PYBIND11_MODULE(cpp_bindings, m) {
     // by the array's dtype without a copy, so the gauge is applied in place.
     m.def("applyIsingGauge", &applyIsingGauge<double>, py::arg("J"), py::arg("q"));
     m.def("applyIsingGauge", &applyIsingGauge<float>,  py::arg("J"), py::arg("q"));
+
+    m.def("gaussCouplings", &gaussCouplings,
+        py::arg("MSA"), py::arg("W"), py::arg("q") = 21,
+        py::arg("pseudocount") = 0.8);
 
 #ifdef ENABLE_CUDA
     m.def("cudaFillPllGradients", &cudaFillPllGradientsWrapper,

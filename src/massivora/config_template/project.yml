@@ -84,6 +84,7 @@ concatenate:
 couple:
   db_table: couplings
   claim_batch_size: 'auto'  # 'auto' or integer
+  memory_limit: 0.8
 
   method: plm
 

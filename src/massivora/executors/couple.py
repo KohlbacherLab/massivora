@@ -11,6 +11,7 @@ from multiprocessing import shared_memory
 
 import dask
 import numpy as np
+import psutil
 import zarr
 from dask import annotate, delayed
 from dask.distributed import (Client, Nanny, Scheduler, SpecCluster,
@@ -72,7 +73,7 @@ class BaseCouplingExecutor(object):
 
         claim = coupling_cfg.get('claim_batch_size', 'auto')
         if claim == 'auto':
-            self.claim_batch_size = max(4, int(mp.cpu_count() / 16))
+            self.claim_batch_size = max(4, int(mp.cpu_count() / 4))
         else:
             self.claim_batch_size = int(claim)
 
@@ -1015,9 +1016,266 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
         return out_d
 
 
+# ---------------------------------------------------------------------------
+# GaussDCA executor
+# ---------------------------------------------------------------------------
+
+class GaussCouplingExecutor(BaseCouplingExecutor):
+    def __init__(self, config):
+        super().__init__(config)
+        coupling_cfg = config.get('couple')
+        self.pseudocount = float(coupling_cfg.get('pseudocount', 0.8))
+        self.n_threads = max(1, int(coupling_cfg.get('gauss_threads', 1)))
+        massivora_dir = massivora_pkg_dir()
+        self.gauss_infer_exe = os.path.join(massivora_dir, 'bin', 'gauss_infer')
+
+        # Memory-aware admission control
+        self.mem_limit = float(coupling_cfg.get('memory_limit', 0.8))
+        self.mem_per_pair_factor = float(coupling_cfg.get('mem_per_pair_factor', 4.0))
+        self.mem_budget_mb = max(1.0, self.mem_limit * psutil.virtual_memory().total / 1e6)
+
+    def _create_cluster(self):
+        total_cpus = mp.cpu_count()
+        loader_threads = min(total_cpus // 5, 8)
+        compute_threads = max(1, total_cpus - loader_threads - 1)
+        loader_compute_slots = max(1, loader_threads - 1)
+
+        logging.info(
+            f"Creating GaussDCA cluster: loader=1 worker ({loader_threads} threads, "
+            f"{loader_compute_slots} compute slots), "
+            f"compute=1 worker ({compute_threads} threads), "
+            f"memory budget {self.mem_budget_mb:.0f} MB"
+        )
+
+        worker_spec = {
+            'loader': {
+                'cls': Nanny,
+                'options': {
+                    'nthreads': loader_threads,
+                    'resources': {
+                        'loader': loader_threads,
+                        'compute': loader_compute_slots,
+                    },
+                    'memory_limit': 'auto',
+                    'host': '127.0.0.1',
+                    'death_timeout': 120,
+                },
+            },
+            'compute': {
+                'cls': Nanny,
+                'options': {
+                    'nthreads': compute_threads,
+                    'resources': {
+                        'compute': compute_threads,
+                        'memory_mb': self.mem_budget_mb,
+                    },
+                    'memory_limit': 'auto',
+                    'host': '127.0.0.1',
+                    'death_timeout': 120,
+                },
+            },
+        }
+
+        cluster = SpecCluster(
+            workers=worker_spec,
+            scheduler={
+                'cls': Scheduler,
+                'options': {
+                    'host': '127.0.0.1',
+                    'dashboard_address': None,
+                }
+            }
+        )
+        client = Client(cluster)
+        client.wait_for_workers(2, timeout=60)
+        return cluster, client
+
+    @staticmethod
+    def compute_score(J, q=21):
+        Q = q - 1
+        NQ = J.shape[0]
+        if NQ % Q != 0:
+            raise ValueError(f"J size {NQ} is not a multiple of q-1={Q}")
+        N = NQ // Q
+
+        # Block view Jb[i, a, j, b] = J[i*Q + a, j*Q + b]; block (i, j) is e_kl.
+        Jb = J.reshape(N, Q, N, Q)
+
+        # Ising gauge 
+        row_mean = Jb.mean(axis=3, keepdims=True)
+        col_mean = Jb.mean(axis=1, keepdims=True)
+        grand = Jb.mean(axis=(1, 3), keepdims=True)
+        e_zsg = Jb - row_mean - col_mean + grand
+        FN = np.sqrt(np.sum(e_zsg ** 2, axis=(1, 3)))
+        np.fill_diagonal(FN, 0.0)
+
+        # Average Product Correction
+        Si = FN.sum(axis=0, keepdims=True)
+        Sj = FN.sum(axis=1, keepdims=True)
+        Sa = FN.sum() * (1.0 - 1.0 / N)
+        return FN - (Sj @ Si) / Sa
+
+    def load_pair(self, pair, **kwargs):
+        pair_name = pair.get('name')
+        pair_id = pair.get('id')
+        alignment_dir = kwargs.get('alignment_dir')
+        output_dir = kwargs.get('output_dir')
+        downsample = kwargs.get('downsample', False)
+        downsample_to = kwargs.get('downsample_to', None)
+        reweighting_threshold = kwargs.get('reweighting_threshold', 0.8)
+
+        file_hash = pair.get('file_hash') or compute_file_hash(pair_name)
+        filename, _ = get_hashed_file_path(pair_name, file_hash, output_dir)
+
+        logging.debug(f"Loading pair id {pair_id}: {pair.get('pid1')}-{pair.get('pid2')}")
+
+        try:
+            align = BinaryAlignment(filename)
+        except Exception:
+            logging.warning(f"Failed to load pair {pair_id} '{pair_name}', trying to concatenate.")
+            align = self.concatenate(pair, alignment_dir, downsample=downsample,
+                                    downsample_to=downsample_to)
+            align.Reweight_Sequence(reweighting_threshold)
+            align.To_Zarr(filename, overwrite=True)
+
+        if getattr(align, 'weights', None) is None or align.Beff is None:
+            align.Reweight_Sequence(reweighting_threshold)
+
+        MSA = align.matrix.astype(np.int32)
+        B, N = MSA.shape
+        # RAW reweighting vector
+        W = np.asarray(align.weights, dtype=np.float64)
+        Beff = float(align.Beff)
+        q = 21
+
+        msa_size = MSA.nbytes
+        w_size = W.nbytes
+        logging.debug(
+            f"Pair {pair_id} '{pair_name}': MSA {MSA.shape} ({msa_size} B), "
+            f"W {W.shape} ({w_size} B)")
+        try:
+            msa_shm = shared_memory.SharedMemory(
+                name=self.SHM_PREFIX + pair_name, create=True, size=msa_size + w_size)
+        except FileExistsError:
+            logging.warning(f"Shared memory for pair {pair_id} '{pair_name}' already exists; reusing it.")
+            msa_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + pair_name)
+        msa_arr = np.ndarray(MSA.shape, dtype=np.int32, buffer=msa_shm.buf)
+        w_arr = np.ndarray(W.shape, dtype=np.float64, buffer=msa_shm.buf[msa_size:])
+        np.copyto(msa_arr, MSA)
+        np.copyto(w_arr, W)
+
+        params = {
+            "name": pair_name,
+            "pair_id": pair_id,
+            "B": B,
+            "N": N,
+            "q": q,
+            "Beff": Beff,
+            "output_dir": output_dir,
+            "file_hash": file_hash,
+        }
+        return params
+
+    def infer(self, params):
+        q = params["q"]
+        N = params["N"]
+        B = params["B"]
+        msa_name = params["name"]
+        NQ = N * (q - 1)
+
+        # Create the output J segment (float64, (N*Q, N*Q)) for gauss_infer to fill.
+        try:
+            J_shm = shared_memory.SharedMemory(
+                name=self.SHM_PREFIX + msa_name + '_J', create=True, size=NQ * NQ * 8)
+        except FileExistsError:
+            pass  # already created; nothing to do
+
+        n_threads = max(1, int(getattr(self, 'n_threads', 1)))
+        cmd = [self.gauss_infer_exe, msa_name, str(B), str(N), str(q),
+               str(self.pseudocount), str(n_threads)]
+        logging.debug(f"Running GaussDCA inference with cmd {' '.join(cmd)}")
+        rv = subprocess.run(cmd)
+        return rv.returncode
+
+    def collect_results(self, returncode, params):
+        N = params["N"]
+        q = params["q"]
+        NQ = N * (q - 1)
+        output_dir = params["output_dir"]
+        msa_name = params["name"]
+        file_hash = params.get("file_hash")
+        filename, _ = get_hashed_file_path(msa_name, file_hash, output_dir)
+
+        if returncode != 0:
+            try:
+                J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name + '_J', size=NQ * NQ * 8)
+                J_shm.close()
+                J_shm.unlink()
+                shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name)
+                shm.close()
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            raise RuntimeError(
+                f"GaussDCA inference failed for pair {params['pair_id']} '{msa_name}' (rc={returncode})"
+            )
+
+        J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name + '_J', size=NQ * NQ * 8)
+        J = np.ndarray((NQ, NQ), dtype=np.float64, buffer=J_shm.buf)
+
+        score = self.compute_score(J, q=q).astype(np.float16)
+        logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
+        grp = zarr.open_group(store=filename)
+        z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
+        z[:] = score
+
+        result = {
+            'id': params["pair_id"],
+            'effnumber': params["Beff"],
+            'length': int(params["N"]),
+            'number': int(params["B"]),
+            'file_hash': file_hash,
+        }
+        try:
+            del J
+            J_shm.close()
+            J_shm.unlink()
+            shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name)
+            shm.close()
+            shm.unlink()
+        except FileNotFoundError:
+            pass
+        return result
+
+    def calc_graph(self, pair, priority=0, **kwargs):
+        # not to over subscribe
+        n_threads = max(1, int(getattr(self, 'n_threads', 1)))
+        compute_slots = min(n_threads, int(getattr(self, 'compute_threads', n_threads)))
+
+        N = pair.get('length')
+        if not N:
+            length1 = self.db_conn.execute(
+                f"select length from {quote_identifier(self.align_table)} where pid = ?",
+                (pair.get('pid1'),)).fetchone()[0]
+            length2 = self.db_conn.execute(
+                f"select length from {quote_identifier(self.align_table)} where pid = ?",
+                (pair.get('pid2'),)).fetchone()[0]
+            N = length1 + length2
+        NQ = int(N) * 20
+        per_pair_mb = self.mem_per_pair_factor * NQ * NQ * 8 / 1e6
+        per_pair_mb = max(1.0, min(per_pair_mb, self.mem_budget_mb))
+
+        with annotate(resources={'loader': 1}, priority=0):
+            params = delayed(self.load_pair)(pair, **kwargs)
+        with annotate(resources={'compute': compute_slots, 'memory_mb': per_pair_mb}, priority=priority):
+            rc = delayed(self.infer)(params)
+            out_d = delayed(self.collect_results)(rc, params)
+        return out_d
+
 
 EXECUTORS = {
     'plm': (PLMCouplingExecutor, PLMCouplingExecutorGPU),
+    'gauss': (GaussCouplingExecutor, GaussCouplingExecutor),
 }
 
 
@@ -1042,7 +1300,7 @@ if __name__ == '__main__':
     cfg = load_project_and_system_config(args.config)
     setup_logging(cfg)
 
-    method = cfg.get('coupling', {}).get('method', 'plm')
+    method = cfg.get('couple', {}).get('method', 'plm')
     executor_pair = EXECUTORS.get(method)
     if executor_pair is None:
         raise SystemExit(f"Unknown coupling method: {method}")
