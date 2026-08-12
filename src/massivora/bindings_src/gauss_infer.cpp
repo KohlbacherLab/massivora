@@ -2,7 +2,6 @@
 
 #include <Eigen/Dense>
 
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -63,28 +62,6 @@ ShmMapping openShm(const std::string& name, size_t expected_size = 0) {
     return m;
 }
 
-// Transpose the row-major int32 MSA (M, N) held in shared memory into the
-// residue-major int8 buffer Z[i*M + k] the core expects. Cache-blocked so the
-// strided side is touched a tile at a time, and threaded over residues.
-static void transposeMSA(const int32_t* msa, int M, int N, int8_t* Z,
-                         int nthreads) {
-    constexpr int TB = 64;
-    gaussdca::parallel_for(N, nthreads, [&](long lo, long hi) {
-        for (long ib = lo; ib < hi; ib += TB) {
-            const long iend = std::min<long>(ib + TB, hi);
-            for (long kb = 0; kb < M; kb += TB) {
-                const long kend = std::min<long>(kb + TB, M);
-                for (long i = ib; i < iend; ++i) {
-                    int8_t* zi = Z + static_cast<size_t>(i) * M;
-                    for (long k = kb; k < kend; ++k)
-                        zi[k] = static_cast<int8_t>(msa[static_cast<size_t>(k) * N + i]);
-                }
-            }
-        }
-    });
-}
-
-
 // Infer the couplings for one pair and publish them to the `_J` segment.
 int runInfer(const std::string& pairName, int M, int N, int q,
              double pseudocount, int n_threads) {
@@ -92,12 +69,12 @@ int runInfer(const std::string& pairName, int M, int N, int q,
     const int Q = q - 1;
     const size_t NQ = static_cast<size_t>(N) * Q;
 
-    // Input segment: MSA (M, N) int32 row-major, then W (M,) float64.
-    const size_t msa_size = static_cast<size_t>(M) * N * sizeof(int32_t);
+    // Input segment: the alignment as int8 in residue-major (N, M) order
+    const size_t msa_size = static_cast<size_t>(N) * M * sizeof(int8_t);
     const size_t w_size = static_cast<size_t>(M) * sizeof(GV);
     ShmMapping in = openShm(pairName, msa_size + w_size);
 
-    const int32_t* msa = static_cast<const int32_t*>(in.ptr);
+    const int8_t* Z = static_cast<const int8_t*>(in.ptr);
     const char* w_raw = static_cast<const char*>(in.ptr) + msa_size;
 
     // The weights follow the MSA with no padding, so they are only guaranteed
@@ -112,18 +89,17 @@ int runInfer(const std::string& pairName, int M, int N, int q,
         W = w_copy.data();
     }
 
-    std::vector<int8_t> Z(static_cast<size_t>(N) * M);
-    transposeMSA(msa, M, N, Z.data(), nthreads);
-
     GV Meff = 0.0;
     for (int k = 0; k < M; ++k) Meff += W[k];
 
-    // Output segment: J (NQ, NQ) float32
-    ShmMapping shmJ = openShm(pairName + "_J", NQ * NQ * sizeof(float));
-    float* Jout = static_cast<float*>(shmJ.ptr);
+    // Output segment: the (N, N) APC-corrected score, float32, row-major.
+    (void)NQ;
+    ShmMapping shmScore = openShm(pairName + "_J",
+                                  static_cast<size_t>(N) * N * sizeof(float));
+    float* score = static_cast<float*>(shmScore.ptr);
 
-    gaussdca::compute_couplings_into(Z.data(), N, M, W, Meff, q, pseudocount,
-                                     nthreads, Jout);
+    gaussdca::compute_score_into(Z, N, M, W, Meff, q, pseudocount,
+                                 nthreads, score);
     return 0;
 }
 

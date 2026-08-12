@@ -1029,9 +1029,11 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
         massivora_dir = massivora_pkg_dir()
         self.gauss_infer_exe = os.path.join(massivora_dir, 'bin', 'gauss_infer')
 
-        # Memory-aware admission control
+        # Memory-aware admission control.
         self.mem_limit = float(coupling_cfg.get('memory_limit', 0.9))
-        self.mem_per_pair_factor = float(coupling_cfg.get('mem_per_pair_factor', 4.0))
+        self.mem_per_pair_factor = float(coupling_cfg.get('mem_per_pair_factor', 1.15))
+        # TODO: 8 for double precision, 4 for single precision; make this auto-detect
+        self.cov_bytes = int(coupling_cfg.get('cov_bytes', 8))
         self.mem_budget_mb = max(1.0, self.mem_limit * psutil.virtual_memory().total / 1e6)
 
     def _create_cluster(self):
@@ -1141,17 +1143,18 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
         if getattr(align, 'weights', None) is None or align.Beff is None:
             align.Reweight_Sequence(reweighting_threshold)
 
-        MSA = align.matrix.astype(np.int32)
-        B, N = MSA.shape
+        B, N = align.matrix.shape
         # RAW reweighting vector
         W = np.asarray(align.weights, dtype=np.float64)
         Beff = float(align.Beff)
         q = 21
 
-        msa_size = MSA.nbytes
+        # Hand the alignment over as int8 in residue-major (N, M) order
+        Zt = np.ascontiguousarray(align.matrix.T, dtype=np.int8)   # (N, M)
+        msa_size = Zt.nbytes
         w_size = W.nbytes
         logging.debug(
-            f"Pair {pair_id} '{pair_name}': MSA {MSA.shape} ({msa_size} B), "
+            f"Pair {pair_id} '{pair_name}': MSA {Zt.shape} int8 ({msa_size} B), "
             f"W {W.shape} ({w_size} B)")
         try:
             msa_shm = shared_memory.SharedMemory(
@@ -1159,10 +1162,11 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
         except FileExistsError:
             logging.warning(f"Shared memory for pair {pair_id} '{pair_name}' already exists; reusing it.")
             msa_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + pair_name)
-        msa_arr = np.ndarray(MSA.shape, dtype=np.int32, buffer=msa_shm.buf)
+        msa_arr = np.ndarray(Zt.shape, dtype=np.int8, buffer=msa_shm.buf)
         w_arr = np.ndarray(W.shape, dtype=np.float64, buffer=msa_shm.buf[msa_size:])
-        np.copyto(msa_arr, MSA)
+        np.copyto(msa_arr, Zt)
         np.copyto(w_arr, W)
+        del Zt
 
         params = {
             "name": pair_name,
@@ -1183,10 +1187,11 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
         msa_name = params["name"]
         NQ = N * (q - 1)
 
-        # Create the output J segment (float64, (N*Q, N*Q)) for gauss_infer to fill.
+        # (N, N) APC-corrected score as float32
         try:
-            J_shm = shared_memory.SharedMemory(
-                name=self.SHM_PREFIX + msa_name + '_J', create=True, size=NQ * NQ * 4)
+            score_shm = shared_memory.SharedMemory(
+                name=self.SHM_PREFIX + msa_name + '_J', create=True,
+                size=N * N * 4)
         except FileExistsError:
             pass  # already created; nothing to do
 
@@ -1215,7 +1220,7 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
 
         if returncode != 0:
             try:
-                J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name + '_J', size=NQ * NQ * 4)
+                J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name + '_J', size=N * N * 4)
                 J_shm.close()
                 J_shm.unlink()
                 shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name)
@@ -1227,10 +1232,10 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
                 f"GaussDCA inference failed for pair {params['pair_id']} '{msa_name}' (rc={returncode})"
             )
 
-        J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name + '_J', size=NQ * NQ * 4)
-        J = np.ndarray((NQ, NQ), dtype=np.float32, buffer=J_shm.buf)
-
-        score = self.compute_score(J, q=q).astype(np.float16)
+        # gauss_infer already applied the Ising gauge, the gap-excluded
+        # Frobenius norm and the APC, so this is the finished score matrix.
+        J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name + '_J', size=N * N * 4)
+        score = np.ndarray((N, N), dtype=np.float32, buffer=J_shm.buf).astype(np.float16)
         logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
         grp = zarr.open_group(store=filename)
         z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
@@ -1244,7 +1249,6 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
             'file_hash': file_hash,
         }
         try:
-            del J
             J_shm.close()
             J_shm.unlink()
             shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name)
@@ -1269,7 +1273,8 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
                 (pair.get('pid2'),)).fetchone()[0]
             N = length1 + length2
         NQ = int(N) * 20
-        per_pair_mb = self.mem_per_pair_factor * NQ * NQ * 4 / 1e6
+        pair_bytes = NQ * NQ * self.cov_bytes + int(N) * int(N) * 4
+        per_pair_mb = self.mem_per_pair_factor * pair_bytes / 1e6
         per_pair_mb = max(1.0, min(per_pair_mb, self.mem_budget_mb))
 
         with annotate(resources={'loader': 1}, priority=0):
