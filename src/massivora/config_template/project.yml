@@ -84,7 +84,7 @@ concatenate:
 couple:
   db_table: couplings
   claim_batch_size: 'auto'  # 'auto' or integer
-  memory_limit: 0.8
+  memory_limit: 0.9
 
   method: plm
 
@@ -93,6 +93,10 @@ couple:
   lambda_J: 0.01
   eps_conv: 3e-4
   maxit: 200
+
+  # GaussDCA parameters
+  pseudocount: 0.8
+  gauss_threads: 2
 
   # Applies when one wants to split the calculation to multiple clusters
   # portion: 1.0

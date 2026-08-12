@@ -2,6 +2,8 @@
 
 #include <Eigen/Dense>
 
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -61,54 +63,67 @@ ShmMapping openShm(const std::string& name, size_t expected_size = 0) {
     return m;
 }
 
-struct MSAData {
-    Eigen::MatrixXi MSA;              // (M, N)
-    Eigen::Matrix<GV, -1, 1> W;      // (M,)
-};
-
-// Map the input segment: MSA (M, N) int32 row-major, then W (M,) float64.
-const MSAData loadData(const std::string& pairName, int M, int N) {
-    size_t msa_size = (size_t)M * N * sizeof(int);
-    size_t w_size = (size_t)M * sizeof(GV);
-    ShmMapping mapping = openShm(pairName, msa_size + w_size);
-
-    Eigen::Map<Eigen::Matrix<int, -1, -1, Eigen::RowMajor>> MSA(
-            static_cast<int*>(mapping.ptr), M, N);
-
-    Eigen::Matrix<GV, -1, 1> W(M);
-    std::memcpy(W.data(), static_cast<char*>(mapping.ptr) + msa_size, w_size);
-    return MSAData{MSA, W};
+// Transpose the row-major int32 MSA (M, N) held in shared memory into the
+// residue-major int8 buffer Z[i*M + k] the core expects. Cache-blocked so the
+// strided side is touched a tile at a time, and threaded over residues.
+static void transposeMSA(const int32_t* msa, int M, int N, int8_t* Z,
+                         int nthreads) {
+    constexpr int TB = 64;
+    gaussdca::parallel_for(N, nthreads, [&](long lo, long hi) {
+        for (long ib = lo; ib < hi; ib += TB) {
+            const long iend = std::min<long>(ib + TB, hi);
+            for (long kb = 0; kb < M; kb += TB) {
+                const long kend = std::min<long>(kb + TB, M);
+                for (long i = ib; i < iend; ++i) {
+                    int8_t* zi = Z + static_cast<size_t>(i) * M;
+                    for (long k = kb; k < kend; ++k)
+                        zi[k] = static_cast<int8_t>(msa[static_cast<size_t>(k) * N + i]);
+                }
+            }
+        }
+    });
 }
 
 
 // Infer the couplings for one pair and publish them to the `_J` segment.
 int runInfer(const std::string& pairName, int M, int N, int q,
              double pseudocount, int n_threads) {
-    MSAData data = loadData(pairName, M, N);
-    const Eigen::MatrixXi& MSA = data.MSA;
-    const Eigen::Matrix<GV, -1, 1>& W = data.W;
+    const int nthreads = gaussdca::resolve_threads(n_threads);
+    const int Q = q - 1;
+    const size_t NQ = static_cast<size_t>(N) * Q;
 
-    // Transpose into the residue-major int8 buffer Z[i*M + k] the core expects.
-    std::vector<int8_t> Z((size_t)N * M);
-    for (int k = 0; k < M; ++k) {
-        for (int i = 0; i < N; ++i) {
-            Z[(size_t)i * M + k] = static_cast<int8_t>(MSA(k, i));
-        }
+    // Input segment: MSA (M, N) int32 row-major, then W (M,) float64.
+    const size_t msa_size = static_cast<size_t>(M) * N * sizeof(int32_t);
+    const size_t w_size = static_cast<size_t>(M) * sizeof(GV);
+    ShmMapping in = openShm(pairName, msa_size + w_size);
+
+    const int32_t* msa = static_cast<const int32_t*>(in.ptr);
+    const char* w_raw = static_cast<const char*>(in.ptr) + msa_size;
+
+    // The weights follow the MSA with no padding, so they are only guaranteed
+    // 8-byte aligned when M*N is even. Copy in the rare case it is not.
+    std::vector<GV> w_copy;
+    const GV* W;
+    if (reinterpret_cast<uintptr_t>(w_raw) % alignof(GV) == 0) {
+        W = reinterpret_cast<const GV*>(w_raw);
+    } else {
+        w_copy.resize(M);
+        std::memcpy(w_copy.data(), w_raw, w_size);
+        W = w_copy.data();
     }
 
-    const double Meff = W.sum();
+    std::vector<int8_t> Z(static_cast<size_t>(N) * M);
+    transposeMSA(msa, M, N, Z.data(), nthreads);
 
-    Eigen::MatrixXd J = gaussdca::compute_couplings(
-        Z.data(), N, M, W.data(), Meff, q, pseudocount, n_threads);
+    GV Meff = 0.0;
+    for (int k = 0; k < M; ++k) Meff += W[k];
 
-    // Publish J (N*Q, N*Q) float64, row-major. J is symmetric, so the row-major
-    // buffer matches what the Python side reshapes to (N, Q, N, Q).
-    const int Q = q - 1;
-    const size_t NQ = (size_t)N * Q;
-    ShmMapping shmJ = openShm(pairName + "_J", NQ * NQ * sizeof(double));
-    Eigen::Map<Eigen::Matrix<double, -1, -1, Eigen::RowMajor>> Jout(
-        static_cast<double*>(shmJ.ptr), NQ, NQ);
-    Jout = J;
+    // Output segment: J (NQ, NQ) float32
+    ShmMapping shmJ = openShm(pairName + "_J", NQ * NQ * sizeof(float));
+    float* Jout = static_cast<float*>(shmJ.ptr);
+
+    gaussdca::compute_couplings_into(Z.data(), N, M, W, Meff, q, pseudocount,
+                                     nthreads, Jout);
     return 0;
 }
 

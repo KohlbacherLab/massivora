@@ -1030,7 +1030,7 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
         self.gauss_infer_exe = os.path.join(massivora_dir, 'bin', 'gauss_infer')
 
         # Memory-aware admission control
-        self.mem_limit = float(coupling_cfg.get('memory_limit', 0.8))
+        self.mem_limit = float(coupling_cfg.get('memory_limit', 0.9))
         self.mem_per_pair_factor = float(coupling_cfg.get('mem_per_pair_factor', 4.0))
         self.mem_budget_mb = max(1.0, self.mem_limit * psutil.virtual_memory().total / 1e6)
 
@@ -1186,15 +1186,22 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
         # Create the output J segment (float64, (N*Q, N*Q)) for gauss_infer to fill.
         try:
             J_shm = shared_memory.SharedMemory(
-                name=self.SHM_PREFIX + msa_name + '_J', create=True, size=NQ * NQ * 8)
+                name=self.SHM_PREFIX + msa_name + '_J', create=True, size=NQ * NQ * 4)
         except FileExistsError:
             pass  # already created; nothing to do
 
         n_threads = max(1, int(getattr(self, 'n_threads', 1)))
         cmd = [self.gauss_infer_exe, msa_name, str(B), str(N), str(q),
                str(self.pseudocount), str(n_threads)]
+
+        # gauss_infer inverts the covariance through a threaded LAPACK
+        # avoid to oversubscribe the machine
+        env = dict(os.environ)
+        for var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+            env[var] = str(n_threads)
+
         logging.debug(f"Running GaussDCA inference with cmd {' '.join(cmd)}")
-        rv = subprocess.run(cmd)
+        rv = subprocess.run(cmd, env=env)
         return rv.returncode
 
     def collect_results(self, returncode, params):
@@ -1208,7 +1215,7 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
 
         if returncode != 0:
             try:
-                J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name + '_J', size=NQ * NQ * 8)
+                J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name + '_J', size=NQ * NQ * 4)
                 J_shm.close()
                 J_shm.unlink()
                 shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name)
@@ -1220,8 +1227,8 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
                 f"GaussDCA inference failed for pair {params['pair_id']} '{msa_name}' (rc={returncode})"
             )
 
-        J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name + '_J', size=NQ * NQ * 8)
-        J = np.ndarray((NQ, NQ), dtype=np.float64, buffer=J_shm.buf)
+        J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name + '_J', size=NQ * NQ * 4)
+        J = np.ndarray((NQ, NQ), dtype=np.float32, buffer=J_shm.buf)
 
         score = self.compute_score(J, q=q).astype(np.float16)
         logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
@@ -1262,7 +1269,7 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
                 (pair.get('pid2'),)).fetchone()[0]
             N = length1 + length2
         NQ = int(N) * 20
-        per_pair_mb = self.mem_per_pair_factor * NQ * NQ * 8 / 1e6
+        per_pair_mb = self.mem_per_pair_factor * NQ * NQ * 4 / 1e6
         per_pair_mb = max(1.0, min(per_pair_mb, self.mem_budget_mb))
 
         with annotate(resources={'loader': 1}, priority=0):
