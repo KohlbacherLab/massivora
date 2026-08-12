@@ -691,14 +691,20 @@ class BinaryAlignment(object):
             w = cp.asnumpy(w_d)
             del MSA, simM, w_d
         else:
-            simM = np.full((B,B), N, dtype=np.int16)
-            for b in range(B-1):
-                identical_positions = np.equal(self.matrix[b+1:], self.matrix[b])
-                identity_scores = np.sum(identical_positions, axis=1)
-                simM[b, b+1:] = identity_scores
-                simM[b+1:, b] = identity_scores
-            m = np.sum(simM >= identical_threshold, axis=0)
-            w = 1/m
+            m = np.ones(B, dtype=np.int64)      # every sequence matches itself
+            # Bound the comparison temporary at roughly 16 MB regardless of N.
+            block = max(1, int(2 ** 24 // max(1, N)))
+            for b in range(B - 1):
+                row = self.matrix[b]
+                lo = b + 1
+                while lo < B:
+                    hi = min(lo + block, B)
+                    hits = (np.count_nonzero(self.matrix[lo:hi] == row, axis=1)
+                            >= identical_threshold)
+                    m[b] += int(np.count_nonzero(hits))
+                    m[lo:hi] += hits
+                    lo = hi
+            w = 1.0 / m
             Beff = w.sum()
 
         self.weights = w.tolist()
