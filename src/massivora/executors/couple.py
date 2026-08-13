@@ -1069,7 +1069,7 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
 
     def _create_cluster(self):
         total_cpus = mp.cpu_count()
-        loader_threads = min(total_cpus // 5, 8)
+        loader_threads = total_cpus // 2
         compute_threads = max(1, total_cpus - loader_threads - 1)
         loader_compute_slots = max(1, loader_threads - 1)
 
