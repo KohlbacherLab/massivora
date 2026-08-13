@@ -270,18 +270,68 @@ option(MASSIVORA_USE_LAPACK "Use a threaded LAPACK for the GaussDCA inverse" ON)
 set(MASSIVORA_LAPACK_LIBS "")
 set(MASSIVORA_LAPACK_DEFS "")
 if(MASSIVORA_USE_LAPACK)
+  # find_package(LAPACK) resolves through find_library, which searches system
+  # paths only. Every documented install path puts the BLAS somewhere else:
+  #
+  #   conda / micromamba    $CONDA_PREFIX          (set by `conda activate`)
+  #   conda-build           $PREFIX / $BUILD_PREFIX
+  #   pip install .         the target interpreter's prefix -- and pip's build
+  #                         isolation means CONDA_PREFIX may not be exported at
+  #                         all, so derive it from Python_EXECUTABLE too.
+  #
+  # Without these hints the env's openblas is missed, GAUSSDCA_USE_LAPACK is
+  # never defined, and the inverse silently drops to the single-threaded Eigen
+  # fallback.
+  set(_massivora_blas_hints "")
+  foreach(_v CONDA_PREFIX PREFIX BUILD_PREFIX)
+    if(DEFINED ENV{${_v}})
+      list(APPEND _massivora_blas_hints "$ENV{${_v}}")
+    endif()
+  endforeach()
+  if(Python_EXECUTABLE)
+    get_filename_component(_massivora_py_bin "${Python_EXECUTABLE}" DIRECTORY)
+    get_filename_component(_massivora_py_prefix "${_massivora_py_bin}" DIRECTORY)
+    list(APPEND _massivora_blas_hints "${_massivora_py_prefix}")
+  endif()
+  if(_massivora_blas_hints)
+    list(REMOVE_DUPLICATES _massivora_blas_hints)
+    list(PREPEND CMAKE_PREFIX_PATH ${_massivora_blas_hints})
+  endif()
+
   find_package(LAPACK QUIET)
   if(LAPACK_FOUND)
     set(MASSIVORA_LAPACK_LIBS ${LAPACK_LIBRARIES})
     set(MASSIVORA_LAPACK_DEFS GAUSSDCA_USE_LAPACK)
     message(STATUS "massivora: GaussDCA inverse via LAPACK ${LAPACK_LIBRARIES}")
   else()
-    message(WARNING
-      "massivora: MASSIVORA_USE_LAPACK is ON but no LAPACK was found. gauss_infer "
-      "will fall back to a single-threaded Eigen inverse, which is roughly 50x "
-      "slower on wide alignments. Install openblas (conda: openblas, apt: "
-      "libopenblas-dev), or set -DMASSIVORA_USE_LAPACK=OFF to silence this.")
+    # Hard error rather than a warning: `pip install .` hides build warnings, so
+    # a degraded binary would install cleanly and simply be slow, which is a
+    # miserable thing to debug from the far side.
+    string(REPLACE ";" "\n      " _massivora_searched "${_massivora_blas_hints}")
+    message(FATAL_ERROR
+      "massivora: no BLAS/LAPACK found.\n"
+      "\n"
+      "  gauss_infer inverts the GaussDCA covariance with ?potrf/?potri. Without\n"
+      "  a LAPACK it falls back to a single-threaded Eigen path that is roughly\n"
+      "  50x slower on wide alignments and needs ~2.5x the memory.\n"
+      "\n"
+      "  Install one and reinstall:\n"
+      "      conda install -c conda-forge liblapack\n"
+      "      apt install libopenblas-dev          # Debian/Ubuntu\n"
+      "      dnf install openblas-devel           # Fedora/RHEL\n"
+      "\n"
+      "  Prefixes searched, in addition to the system paths:\n"
+      "      ${_massivora_searched}\n"
+      "\n"
+      "  To build the slow fallback deliberately:\n"
+      "      cmake -DMASSIVORA_USE_LAPACK=OFF ...\n"
+      "      pip install . -C cmake.define.MASSIVORA_USE_LAPACK=OFF\n")
   endif()
+else()
+  message(WARNING
+    "massivora: MASSIVORA_USE_LAPACK=OFF -- gauss_infer will use the "
+    "single-threaded Eigen inverse (~50x slower on wide alignments). "
+    "Check `gauss_infer --info` reports lapack=0 as intended.")
 endif()
 
 # Apply the tuning above to a target.

@@ -43,7 +43,16 @@ on `PATH` — no extra flag needed. Force it on/off with
 
 ### 2. pip
 
-Dependencies: `eigen`, `nlopt`. If they are not installed, pip will try to install them. If you wish to use the analysis module of massivora, you also need to install `openstructure` manually.
+Dependencies: `eigen`, `nlopt`, and a **BLAS/LAPACK**. Eigen and NLopt are
+fetched and built automatically if they are missing; a BLAS/LAPACK is **not**,
+so install one first — the build stops with instructions if it cannot find one:
+
+```bash
+sudo apt install libopenblas-dev     # Debian/Ubuntu
+sudo dnf install openblas-devel      # Fedora/RHEL
+```
+
+If you wish to use the analysis module of massivora, you also need to install `openstructure` manually.
 
 - CPU only:
 
@@ -81,6 +90,32 @@ docker run --rm --gpus all massivora:gpu massivora --help
 docker build -f Dockerfile.cpu -t massivora:cpu .
 docker run --rm massivora:cpu massivora --help
 ```
+
+## Verifying the installation
+
+Almost all of the GaussDCA runtime is the covariance inverse, and it is the only
+part that scales with `couple.gauss_threads`. That inverse goes through LAPACK
+(`?potrf`/`?potri`), so it is worth confirming the build found one:
+
+```bash
+python -c "import massivora, os, subprocess; \
+  subprocess.run([os.path.join(os.path.dirname(massivora.__file__), 'bin', 'gauss_infer'), '--info'])"
+```
+
+```
+cov_bytes=4
+lapack=1
+```
+
+* **`lapack=1`** is what you want. `lapack=0` means the build fell back to a
+  single-threaded Eigen inverse — roughly 50x slower on a wide alignment, and
+  about 2.5x the memory. The GaussDCA path will then appear to ignore its thread
+  argument. Installing a BLAS/LAPACK and reinstalling fixes it; the build
+  refuses to produce a `lapack=0` binary unless you pass
+  `-C cmake.define.MASSIVORA_USE_LAPACK=OFF` on purpose.
+* **`cov_bytes=4`** is the default single-precision factorisation. `8` means the
+  build used `-C cmake.define.MASSIVORA_DOUBLE_PRECISION=ON`, which doubles the
+  memory each pair needs for accuracy well below what the stored scores resolve.
 
 ## System configuration
 
