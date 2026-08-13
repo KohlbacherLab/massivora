@@ -109,6 +109,23 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> pos;
     for (int i = 1; i < argc; ++i) pos.push_back(argv[i]);
 
+    // Report the build configuration so the caller can size its memory
+    // reservation without being told separately which precision this binary
+    // was compiled for.
+    if (pos.size() == 1 && pos[0] == "--info") {
+        std::cout << "cov_bytes=" << sizeof(gaussdca::CovScalar) << "\n";
+#ifdef GAUSSDCA_USE_LAPACK
+        std::cout << "lapack=1\n";
+#else
+        // Built without a LAPACK: the inverse runs on the single-threaded Eigen
+        // fallback, which is roughly 50x slower on a wide alignment. Reported
+        // here so a mis-built binary is visible at run time instead of just
+        // being slow.
+        std::cout << "lapack=0\n";
+#endif
+        return 0;
+    }
+
     if (pos.size() < 6) {
         std::cerr << "Usage: " << argv[0]
                   << " <pairName> <M> <N> <q> <pseudocount> <n_threads>"

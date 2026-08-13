@@ -692,7 +692,6 @@ class BinaryAlignment(object):
             del MSA, simM, w_d
         else:
             m = np.ones(B, dtype=np.int64)      # every sequence matches itself
-            # Bound the comparison temporary at roughly 16 MB regardless of N.
             block = max(1, int(2 ** 24 // max(1, N)))
             for b in range(B - 1):
                 row = self.matrix[b]

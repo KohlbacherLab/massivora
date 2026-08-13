@@ -1031,10 +1031,41 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
 
         # Memory-aware admission control.
         self.mem_limit = float(coupling_cfg.get('memory_limit', 0.9))
-        self.mem_per_pair_factor = float(coupling_cfg.get('mem_per_pair_factor', 1.15))
-        # TODO: 8 for double precision, 4 for single precision; make this auto-detect
-        self.cov_bytes = int(coupling_cfg.get('cov_bytes', 8))
+        self.mem_per_pair_factor = float(coupling_cfg.get('mem_per_pair_factor', 1.10))
+        self.cov_bytes = self._probe_cov_bytes(coupling_cfg)
         self.mem_budget_mb = max(1.0, self.mem_limit * psutil.virtual_memory().total / 1e6)
+
+    def _probe_cov_bytes(self, coupling_cfg):
+        """Width of the covariance scalar the installed gauss_infer uses."""
+        configured = coupling_cfg.get('cov_bytes')
+        try:
+            out = subprocess.run([self.gauss_infer_exe, '--info'],
+                                 capture_output=True, text=True, timeout=30)
+            info = dict(l.split('=', 1) for l in out.stdout.splitlines() if '=' in l)
+            if info.get('lapack') == '0':
+                logging.warning(
+                    "%s was built without a LAPACK; the covariance inverse will run "
+                    "single-threaded through the Eigen fallback (roughly 50x slower "
+                    "on wide alignments). Rebuild with openblas available.",
+                    self.gauss_infer_exe)
+            if configured:
+                return int(configured)
+            if 'cov_bytes' in info:
+                return int(info['cov_bytes'])
+        except Exception as e:
+            logging.warning(f"Could not probe {self.gauss_infer_exe} for its precision "
+                            f"({e}); assuming float64. A single-precision build will "
+                            f"then be over-reserved by 2x.")
+        return 8
+
+    def _pair_memory_mb(self, N):
+        """Peak resident memory of one gauss_infer run, in MB."""
+        NQ = int(N) * 20
+        pair_bytes = (self.cov_bytes * NQ * NQ // 2   # covariance, lower triangle only
+                      + 4 * int(N) * int(N)           # score segment
+                      + 10_000 * NQ                   # LAPACK/BLAS workspace, grows with NQ
+                      + 96 * 1024 * 1024)             # runtime, libraries, alignment buffers
+        return self.mem_per_pair_factor * pair_bytes / 1e6
 
     def _create_cluster(self):
         total_cpus = mp.cpu_count()
@@ -1272,10 +1303,7 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
                 f"select length from {quote_identifier(self.align_table)} where pid = ?",
                 (pair.get('pid2'),)).fetchone()[0]
             N = length1 + length2
-        NQ = int(N) * 20
-        pair_bytes = NQ * NQ * self.cov_bytes + int(N) * int(N) * 4
-        per_pair_mb = self.mem_per_pair_factor * pair_bytes / 1e6
-        per_pair_mb = max(1.0, min(per_pair_mb, self.mem_budget_mb))
+        per_pair_mb = max(1.0, min(self._pair_memory_mb(N), self.mem_budget_mb))
 
         with annotate(resources={'loader': 1}, priority=0):
             params = delayed(self.load_pair)(pair, **kwargs)

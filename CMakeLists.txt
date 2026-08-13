@@ -224,6 +224,80 @@ set(BINDINGS_SRC "${MASSIVORA_SRC}/bindings_src")
 set(MASSIVORA_BINDINGS_INSTALL_DIR "massivora/cpp_bindings")
 set(MASSIVORA_BIN_INSTALL_DIR "massivora/bin")
 
+# --- Performance tuning: target ISA, precision, and a threaded LAPACK -------
+# gauss_infer/cpp_bindings spend nearly all of their time in dense linear
+# algebra. Three build-time choices dominate speed and memory:
+#
+#   MASSIVORA_ARCH              the ISA the compiler may emit. A plain -O3 build
+#                               targets baseline x86-64 (SSE2, no FMA), which
+#                               costs ~3.5x on the Cholesky/inverse. "native"
+#                               tunes for the build machine; use e.g.
+#                               x86-64-v3 for a redistributable build, or OFF.
+#   MASSIVORA_USE_LAPACK        ?potrf + ?potri for the inverse, internally
+#                               threaded. Without it a correct but
+#                               single-threaded Eigen fallback is used, which
+#                               is ~50x slower on a wide alignment.
+#   MASSIVORA_DOUBLE_PRECISION  factorise in float64 instead of the float32
+#                               default, doubling the memory a pair costs.
+include(CheckCXXCompilerFlag)
+
+set(MASSIVORA_ARCH "native" CACHE STRING
+    "ISA to target for -march (native, x86-64-v3, ...); OFF for the compiler default")
+
+set(MASSIVORA_ARCH_FLAGS "")
+if(NOT MASSIVORA_ARCH STREQUAL "OFF")
+  check_cxx_compiler_flag("-march=${MASSIVORA_ARCH}" MASSIVORA_HAS_ARCH_FLAG)
+  if(MASSIVORA_HAS_ARCH_FLAG)
+    set(MASSIVORA_ARCH_FLAGS "-march=${MASSIVORA_ARCH}")
+    message(STATUS "massivora: building with -march=${MASSIVORA_ARCH}")
+  else()
+    message(WARNING "massivora: compiler rejected -march=${MASSIVORA_ARCH}; "
+                    "using the default ISA (expect gauss_infer to be ~3.5x slower)")
+  endif()
+endif()
+
+option(MASSIVORA_DOUBLE_PRECISION
+       "Factorise the GaussDCA covariance in float64 instead of float32" OFF)
+set(MASSIVORA_PRECISION_DEFS "")
+if(MASSIVORA_DOUBLE_PRECISION)
+  set(MASSIVORA_PRECISION_DEFS GAUSSDCA_DOUBLE_PRECISION)
+  message(STATUS "massivora: GaussDCA covariance in float64 (2x the memory of the default)")
+else()
+  message(STATUS "massivora: GaussDCA covariance in float32 (default)")
+endif()
+
+option(MASSIVORA_USE_LAPACK "Use a threaded LAPACK for the GaussDCA inverse" ON)
+set(MASSIVORA_LAPACK_LIBS "")
+set(MASSIVORA_LAPACK_DEFS "")
+if(MASSIVORA_USE_LAPACK)
+  find_package(LAPACK QUIET)
+  if(LAPACK_FOUND)
+    set(MASSIVORA_LAPACK_LIBS ${LAPACK_LIBRARIES})
+    set(MASSIVORA_LAPACK_DEFS GAUSSDCA_USE_LAPACK)
+    message(STATUS "massivora: GaussDCA inverse via LAPACK ${LAPACK_LIBRARIES}")
+  else()
+    message(WARNING
+      "massivora: MASSIVORA_USE_LAPACK is ON but no LAPACK was found. gauss_infer "
+      "will fall back to a single-threaded Eigen inverse, which is roughly 50x "
+      "slower on wide alignments. Install openblas (conda: openblas, apt: "
+      "libopenblas-dev), or set -DMASSIVORA_USE_LAPACK=OFF to silence this.")
+  endif()
+endif()
+
+# Apply the tuning above to a target.
+function(massivora_tune tgt)
+  if(MASSIVORA_ARCH_FLAGS)
+    target_compile_options(${tgt} PRIVATE ${MASSIVORA_ARCH_FLAGS})
+  endif()
+  if(MASSIVORA_PRECISION_DEFS)
+    target_compile_definitions(${tgt} PRIVATE ${MASSIVORA_PRECISION_DEFS})
+  endif()
+  if(MASSIVORA_LAPACK_DEFS)
+    target_compile_definitions(${tgt} PRIVATE ${MASSIVORA_LAPACK_DEFS})
+    target_link_libraries(${tgt} PRIVATE ${MASSIVORA_LAPACK_LIBS})
+  endif()
+endfunction()
+
 # --- pybind11 extension module ---
 if(ENABLE_CUDA)
     pybind11_add_module(cpp_bindings ${BINDINGS_SRC}/bindings.cpp)
@@ -243,10 +317,13 @@ endif()
 # --- Standalone executable plm_opt_site ---
 add_executable(plm_opt_site ${BINDINGS_SRC}/plm_opt_site.cpp)
 target_link_libraries(plm_opt_site PRIVATE Eigen3::Eigen NLopt::nlopt)
+massivora_tune(plm_opt_site)
 
 # --- Standalone executable gauss_infer (GaussDCA couplings over shared memory) ---
 add_executable(gauss_infer ${BINDINGS_SRC}/gauss_infer.cpp)
+target_include_directories(gauss_infer PRIVATE ${BINDINGS_SRC})
 target_link_libraries(gauss_infer PRIVATE Eigen3::Eigen Threads::Threads)
+massivora_tune(gauss_infer)
 
 # --- CUDA backend library (only if CUDA is enabled) ---
 if(ENABLE_CUDA)
@@ -280,6 +357,7 @@ endif()
 
 # --- Link Eigen + NLopt into the bindings module ---
 target_link_libraries(cpp_bindings PRIVATE Eigen3::Eigen NLopt::nlopt)
+massivora_tune(cpp_bindings)
 
 # If NLopt is built from source, make its consumers wait for that build.
 if(TARGET nlopt_ext)

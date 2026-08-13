@@ -48,13 +48,12 @@
 
 namespace gaussdca {
 
-// Precision the covariance is stored and factorised in. Single precision halves
-// the workspace -- which is now the whole memory footprint -- and roughly
-// doubles the factorisation rate. The published score is float32 either way.
-#ifdef GAUSSDCA_MIXED_PRECISION
-using CovScalar = float;
-#else
+// Single precision is the default
+// This applies only to compute_score_into()
+#ifdef GAUSSDCA_DOUBLE_PRECISION
 using CovScalar = double;
+#else
+using CovScalar = float;
 #endif
 
 #ifdef GAUSSDCA_USE_LAPACK
@@ -149,7 +148,8 @@ inline constexpr long LAPACK_LP64_MAX_N = 46340L;
 // Invert the SPD matrix held in the lower triangle of `A` (n x n, column-major,
 // leading dimension n), in place. Only the lower triangle is read; on return
 // only the lower triangle is valid.
-inline void invert_spd_lower_inplace(CovScalar* A, long n, int nthreads) {
+template <class S>
+inline void invert_spd_lower_inplace(S* A, long n, int nthreads) {
 #ifdef GAUSSDCA_USE_LAPACK
     if (n <= LAPACK_LP64_MAX_N) {
         set_blas_threads(nthreads);
@@ -175,23 +175,24 @@ inline void invert_spd_lower_inplace(CovScalar* A, long n, int nthreads) {
 #endif
     // Eigen fallback: in-place Cholesky
     (void)nthreads;
-    using CovMatrix = Eigen::Matrix<CovScalar, Eigen::Dynamic, Eigen::Dynamic>;
+    using CovMatrix = Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>;
     Eigen::Map<CovMatrix> C(A, n, n);
     Eigen::LLT<Eigen::Ref<CovMatrix>> llt(C);
     if (llt.info() != Eigen::Success)
         throw std::runtime_error("Cholesky factorization failed (C not SPD)");
     CovMatrix Linv = CovMatrix::Identity(n, n);
-    C.triangularView<Eigen::Lower>().solveInPlace(Linv);
+    C.template triangularView<Eigen::Lower>().solveInPlace(Linv);
     C.setZero();
-    C.selfadjointView<Eigen::Lower>().rankUpdate(Linv.transpose());
+    C.template selfadjointView<Eigen::Lower>().rankUpdate(Linv.transpose());
 }
 
 // Assemble the lower triangle of C = fij - fi*fi^T (with pseudocount) into `C`
 // (NQ x NQ, column-major). The pseudocount mix and the rank-1 term are fused
 // into the pair-block store, so no separate pass over the matrix is needed.
+template <class S>
 inline void build_covariance_lower(const int8_t* Z, int N, int M, const double* W,
                                    double Meff, int q, double pseudocount,
-                                   int nthreads, CovScalar* C) {
+                                   int nthreads, S* C) {
     const int Q = q - 1;
     const int QP = Q + 1;                         // + one sink bin for gaps
     const long NQ = static_cast<long>(N) * Q;
@@ -256,11 +257,11 @@ inline void build_covariance_lower(const int8_t* Z, int N, int M, const double* 
             const long r0 = static_cast<long>(j) * Q;   // row block  (lower)
             const long c0 = static_cast<long>(i) * Q;   // col block
             for (int a = 0; a < Q; ++a) {
-                CovScalar* dst = C + (c0 + a) * NQ + r0;
+                S* dst = C + (c0 + a) * NQ + r0;
                 const double fa = fip[c0 + a];
                 const double* arow = a_ + static_cast<size_t>(a) * QP;
                 for (int b = 0; b < Q; ++b)
-                    dst[b] = static_cast<CovScalar>(
+                    dst[b] = static_cast<S>(
                         (1.0 - lambda) * (arow[b] / Meff) + unif_ij
                         - fip[r0 + b] * fa);
             }
@@ -272,10 +273,10 @@ inline void build_covariance_lower(const int8_t* Z, int N, int M, const double* 
         for (long i = lo; i < hi; ++i) {
             const long x0 = i * Q;
             for (int a = 0; a < Q; ++a) {
-                CovScalar* dst = C + (x0 + a) * NQ + x0;
+                S* dst = C + (x0 + a) * NQ + x0;
                 const double fa = fip[x0 + a];
                 for (int b = a; b < Q; ++b)          // lower triangle of the block
-                    dst[b] = static_cast<CovScalar>(
+                    dst[b] = static_cast<S>(
                         (a == b ? fip[x0 + a] : 0.0) - fip[x0 + b] * fa);
             }
         }
@@ -283,10 +284,11 @@ inline void build_covariance_lower(const int8_t* Z, int N, int M, const double* 
 }
 
 // Mirror the lower triangle of an (n x n) column-major matrix into the upper.
-inline void mirror_lower_to_upper(CovScalar* A, long n, int nthreads) {
+template <class S>
+inline void mirror_lower_to_upper(S* A, long n, int nthreads) {
     parallel_for(n, nthreads, [&](long lo, long hi) {
         for (long c = lo; c < hi; ++c) {
-            const CovScalar* src = A + c * n;        // column c, rows c..n-1
+            const S* src = A + c * n;        // column c, rows c..n-1
             for (long r = c + 1; r < n; ++r) A[r * n + c] = src[r];
         }
     });
@@ -299,7 +301,8 @@ inline void mirror_lower_to_upper(CovScalar* A, long n, int nthreads) {
 // over that block alone, so nothing outside the block is needed. FN comes out
 // symmetric and its diagonal is discarded, so only the strictly lower blocks
 // are read -- every one of which lies wholly inside the stored triangle.
-inline void score_from_inverse_lower(const CovScalar* Jlow, int N, int q,
+template <class S>
+inline void score_from_inverse_lower(const S* Jlow, int N, int q,
                                      int nthreads, float* score_out) {
     const int Q = q - 1;
     const long NQ = static_cast<long>(N) * Q;
@@ -318,7 +321,7 @@ inline void score_from_inverse_lower(const CovScalar* Jlow, int N, int q,
                 double grand = 0.0;
                 std::fill(cb.begin(), cb.end(), 0.0);
                 for (int b = 0; b < Q; ++b) {
-                    const CovScalar* col = Jlow + (j * Q + b) * NQ + i * Q;
+                    const S* col = Jlow + (j * Q + b) * NQ + i * Q;
                     double s = 0.0;
                     double* bcol = blk.data() + static_cast<size_t>(b) * Q;
                     for (int a = 0; a < Q; ++a) {
@@ -402,22 +405,12 @@ inline void compute_couplings_into(const int8_t* Z, int N, int M,
     const long NQ = static_cast<long>(N) * (q - 1);
     const int nthreads = resolve_threads(n_threads);
 
-#ifdef GAUSSDCA_MIXED_PRECISION
-    AlignedBuffer<CovScalar> ws(static_cast<size_t>(NQ) * NQ);
-    CovScalar* C = ws.get();
-#else
-    CovScalar* C = out;                    // already the right type; work in place
-#endif
-
-    build_covariance_lower(Z, N, M, W, Meff, q, pseudocount, nthreads, C);
-    invert_spd_lower_inplace(C, NQ, nthreads);
-    mirror_lower_to_upper(C, NQ, nthreads);
-
-#ifdef GAUSSDCA_MIXED_PRECISION
-    parallel_for(NQ * NQ, nthreads, [&](long lo, long hi) {
-        for (long k = lo; k < hi; ++k) out[k] = static_cast<double>(C[k]);
-    });
-#endif
+    // Always float64 here regardless of CovScalar: this is the path that hands
+    // J back to Python for the reference comparisons, and it works in place in
+    // the caller's buffer, so there is nothing to be saved by narrowing it.
+    build_covariance_lower<double>(Z, N, M, W, Meff, q, pseudocount, nthreads, out);
+    invert_spd_lower_inplace<double>(out, NQ, nthreads);
+    mirror_lower_to_upper<double>(out, NQ, nthreads);
 }
 
 // Convenience wrapper: allocate the result and fill it.
