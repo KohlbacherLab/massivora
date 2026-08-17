@@ -1069,37 +1069,20 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
 
     def _create_cluster(self):
         total_cpus = mp.cpu_count()
-        loader_threads = total_cpus // 2
-        compute_threads = max(1, total_cpus - loader_threads - 1)
-        loader_compute_slots = max(1, loader_threads - 1)
+        self.reweight_threads = 4
 
         logging.info(
-            f"Creating GaussDCA cluster: loader=1 worker ({loader_threads} threads, "
-            f"{loader_compute_slots} compute slots), "
-            f"compute=1 worker ({compute_threads} threads), "
+            f"Creating GaussDCA cluster: 1 worker, {total_cpus} task slots, "
             f"memory budget {self.mem_budget_mb:.0f} MB"
         )
 
         worker_spec = {
-            'loader': {
+            'worker': {
                 'cls': Nanny,
                 'options': {
-                    'nthreads': loader_threads,
+                    'nthreads': total_cpus,
                     'resources': {
-                        'loader': loader_threads,
-                        'compute': loader_compute_slots,
-                    },
-                    'memory_limit': 'auto',
-                    'host': '127.0.0.1',
-                    'death_timeout': 120,
-                },
-            },
-            'compute': {
-                'cls': Nanny,
-                'options': {
-                    'nthreads': compute_threads,
-                    'resources': {
-                        'compute': compute_threads,
+                        'compute': total_cpus,
                         'memory_mb': self.mem_budget_mb,
                     },
                     'memory_limit': 'auto',
@@ -1120,33 +1103,8 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
             }
         )
         client = Client(cluster)
-        client.wait_for_workers(2, timeout=60)
+        client.wait_for_workers(1, timeout=60)
         return cluster, client
-
-    @staticmethod
-    def compute_score(J, q=21):
-        Q = q - 1
-        NQ = J.shape[0]
-        if NQ % Q != 0:
-            raise ValueError(f"J size {NQ} is not a multiple of q-1={Q}")
-        N = NQ // Q
-
-        # Block view Jb[i, a, j, b] = J[i*Q + a, j*Q + b]; block (i, j) is e_kl.
-        Jb = J.reshape(N, Q, N, Q)
-
-        # Ising gauge 
-        row_mean = Jb.mean(axis=3, keepdims=True)
-        col_mean = Jb.mean(axis=1, keepdims=True)
-        grand = Jb.mean(axis=(1, 3), keepdims=True)
-        e_zsg = Jb - row_mean - col_mean + grand
-        FN = np.sqrt(np.sum(e_zsg ** 2, axis=(1, 3)))
-        np.fill_diagonal(FN, 0.0)
-
-        # Average Product Correction
-        Si = FN.sum(axis=0, keepdims=True)
-        Sj = FN.sum(axis=1, keepdims=True)
-        Sa = FN.sum() * (1.0 - 1.0 / N)
-        return FN - (Sj @ Si) / Sa
 
     def load_pair(self, pair, **kwargs):
         pair_name = pair.get('name')
@@ -1168,11 +1126,13 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
             logging.warning(f"Failed to load pair {pair_id} '{pair_name}', trying to concatenate.")
             align = self.concatenate(pair, alignment_dir, downsample=downsample,
                                     downsample_to=downsample_to)
-            align.Reweight_Sequence(reweighting_threshold)
+            align.Reweight_Sequence(reweighting_threshold,
+                                    n_threads=getattr(self, 'reweight_threads', 0))
             align.To_Zarr(filename, overwrite=True)
 
         if getattr(align, 'weights', None) is None or align.Beff is None:
-            align.Reweight_Sequence(reweighting_threshold)
+            align.Reweight_Sequence(reweighting_threshold,
+                                    n_threads=getattr(self, 'reweight_threads', 0))
 
         B, N = align.matrix.shape
         # RAW reweighting vector
@@ -1289,10 +1249,11 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
             pass
         return result
 
+    _COUPLE_PRIORITY = 1 << 20
+
     def calc_graph(self, pair, priority=0, **kwargs):
-        # not to over subscribe
-        n_threads = max(1, int(getattr(self, 'n_threads', 1)))
-        compute_slots = min(n_threads, int(getattr(self, 'compute_threads', n_threads)))
+        budget = mp.cpu_count()
+        n_threads = max(1, min(int(getattr(self, 'n_threads', 1)), budget))
 
         N = pair.get('length')
         if not N:
@@ -1305,10 +1266,19 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
             N = length1 + length2
         per_pair_mb = max(1.0, min(self._pair_memory_mb(N), self.mem_budget_mb))
 
-        with annotate(resources={'loader': 1}, priority=0):
+        # estimate the memory load of pairs
+        b_cap = int(self.downsample_to if self.downsample
+                    else (pair.get('number') or self.downsample_to))
+        load_mb = max(64.0, min(6.0 * b_cap * int(N) / 1e6, self.mem_budget_mb))
+
+        with annotate(resources={'compute': self.reweight_threads, 'memory_mb': load_mb},
+                      priority=priority):
             params = delayed(self.load_pair)(pair, **kwargs)
-        with annotate(resources={'compute': compute_slots, 'memory_mb': per_pair_mb}, priority=priority):
+        with annotate(resources={'compute': n_threads, 'memory_mb': per_pair_mb},
+                      priority=priority + self._COUPLE_PRIORITY):
             rc = delayed(self.infer)(params)
+        with annotate(resources={'compute': 1, 'memory_mb': 1.0},
+                      priority=priority + 2 * self._COUPLE_PRIORITY):
             out_d = delayed(self.collect_results)(rc, params)
         return out_d
 
