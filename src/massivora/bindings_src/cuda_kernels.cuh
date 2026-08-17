@@ -95,34 +95,101 @@ extern "C" __global__ void fused_vgrad(
     }
 }
 
-extern "C" __global__ void pairwise_similarity(
-    const signed char* __restrict__ msa,   // (B, N) int8    
-    int*               __restrict__ simM,  // (B,)   int32   – atomic 
-    int B,                                 // pass as np.int32(B)             
-    int N,                                 // pass as np.int32(N)             
-    float threshold                        // pass as np.float32(threshold)   
-)
+/* =========================================================================
+ * pairwise_similarity - sequence reweighting neighbour counts.
+ *
+ *   - Rows are staged through shared memory in TILE x TILE blocks, so each row
+ *     is read from global memory once per tile rather than once per pair.
+ *   - The alignment is read as uint32, four residues at a time, and matches are
+ *     found with the zero-byte trick plus a popcount instead of four compares.
+ *   - Shared tiles are stored transposed and padded to TILE+1 words so that both
+ *     the staging writes and the inner-loop reads are bank-conflict free.
+ *   - Hits are accumulated in shared memory and flushed with one global atomic
+ *     per row per block, rather than two atomics per matching pair.
+ *
+ * The input is the alignment viewed as uint32, zero-padded on the right to a
+ * whole number of words. Padding bytes are zero in every row, so they match in
+ * every pair and contribute exactly `pad` to each count; the kernel subtracts
+ * that back off.
+ * =========================================================================*/
+#define RW_TILE   32   // rows per tile
+#define RW_CHUNKW 32   // uint32 words staged per pass (128 residues)
+#define RW_TY      8   // threadIdx.y extent; each thread owns RW_PT rows
+#define RW_PT      (RW_TILE / RW_TY)
+
+extern "C" __global__ void pairwise_similarity_tiled(
+    const unsigned int* __restrict__ msa32,  // (B, Nw) uint32, zero-padded
+    int*                __restrict__ simM,   // (B,)    int32, atomic
+    int   B,
+    int   Nw,                                // words per sequence
+    int   pad,                               // padding residues per row
+    float threshold)
 {
-    // Thread layout:
-    //   blockDim.x = tx  (iterates over b dimension)
-    //   blockDim.y = ty  (iterates over i dimension)
-    //   b = blockIdx.x * blockDim.x + threadIdx.x
-    //   i = blockIdx.y * blockDim.y + threadIdx.y
+    const int tI = blockIdx.x, tJ = blockIdx.y;
+    if (tJ < tI) return;                     // upper triangle of tiles only
 
-    const int b = blockIdx.x * blockDim.x + threadIdx.x;
-    const int i = blockIdx.y * blockDim.y + threadIdx.y;
+    const int i0 = tI * RW_TILE, j0 = tJ * RW_TILE;
+    if (i0 >= B || j0 >= B) return;
 
-    if (b >= B || i >= B || i <= b) return;
+    __shared__ unsigned int sA[RW_CHUNKW][RW_TILE + 1];
+    __shared__ unsigned int sB[RW_CHUNKW][RW_TILE + 1];
+    __shared__ int cntA[RW_TILE], cntB[RW_TILE];
 
-    int cnt = 0;
-    for (int j = 0; j < N; ++j) {
-        if (msa[b * N + j] == msa[i * N + j])
-            ++cnt;
+    const int tx = threadIdx.x;              // 0..RW_TILE-1 -> row in the J tile
+    const int ty = threadIdx.y;              // 0..RW_TY-1                       
+    const int tid = tx + ty * RW_TILE;
+    const int nthread = RW_TILE * RW_TY;
+
+    if (tid < RW_TILE) { cntA[tid] = 0; cntB[tid] = 0; }
+
+    int acc[RW_PT];
+#pragma unroll
+    for (int k = 0; k < RW_PT; ++k) acc[k] = 0;
+
+    for (int c0 = 0; c0 < Nw; c0 += RW_CHUNKW) {
+        __syncthreads();
+        // Stage both tiles. idx runs so that consecutive threads read
+        // consecutive words of the same row (coalesced), while the shared
+        // write strides by RW_TILE+1 words (odd, so conflict free).
+        for (int idx = tid; idx < RW_TILE * RW_CHUNKW; idx += nthread) {
+            const int r = idx / RW_CHUNKW, w = idx % RW_CHUNKW;
+            const int c = c0 + w;
+            const int ga = i0 + r, gb = j0 + r;
+            sA[w][r] = (ga < B && c < Nw) ? msa32[(size_t)ga * Nw + c] : 0u;
+            sB[w][r] = (gb < B && c < Nw) ? msa32[(size_t)gb * Nw + c] : 0u;
+        }
+        __syncthreads();
+
+        const int wmax = (Nw - c0) < RW_CHUNKW ? (Nw - c0) : RW_CHUNKW;
+        for (int w = 0; w < wmax; ++w) {
+            const unsigned int bw = sB[w][tx];      // 32 distinct banks
+#pragma unroll
+            for (int k = 0; k < RW_PT; ++k) {
+                const unsigned int aw = sA[w][ty + k * RW_TY];  // broadcast
+                const unsigned int x = aw ^ bw;
+                // Zero bytes of x are the residues that matched.
+                const unsigned int nz =
+                    ((x & 0x7F7F7F7Fu) + 0x7F7F7F7Fu) | x | 0x7F7F7F7Fu;
+                acc[k] += __popc(~nz);
+            }
+        }
     }
+    __syncthreads();
 
-    if ((float)cnt >= threshold) {
-        atomicAdd(&simM[b], 1);
-        atomicAdd(&simM[i], 1);
+    const int j = j0 + tx;
+#pragma unroll
+    for (int k = 0; k < RW_PT; ++k) {
+        const int i = i0 + ty + k * RW_TY;
+        if (i < B && j < B && i < j && (float)(acc[k] - pad) >= threshold) {
+            atomicAdd(&cntA[ty + k * RW_TY], 1);
+            atomicAdd(&cntB[tx], 1);
+        }
+    }
+    __syncthreads();
+
+    if (tid < RW_TILE) {
+        if (i0 + tid < B && cntA[tid]) atomicAdd(&simM[i0 + tid], cntA[tid]);
+        if (j0 + tid < B && cntB[tid]) atomicAdd(&simM[j0 + tid], cntB[tid]);
     }
 }
 

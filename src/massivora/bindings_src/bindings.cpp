@@ -5,6 +5,8 @@
 #include <Eigen/Dense>
 #include <unsupported/Eigen/CXX11/Tensor>
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <iostream>
 #include <map>
@@ -139,6 +141,88 @@ void applyIsingGauge(py::array_t<T> J, int q) {
     }
 }
 
+static inline long matchCount(const int8_t* a, const int8_t* b, long n) {
+    long c = 0;
+    for (long i = 0; i < n; ++i) c += (a[i] == b[i]) ? 1 : 0;
+    return c;
+}
+
+py::array_t<int32_t> reweightNeighbourCounts(
+        py::array_t<int8_t, py::array::c_style | py::array::forcecast> MSA,
+        double identical_threshold,
+        int n_threads = 0) {
+    auto buf = MSA.request();
+    if (buf.ndim != 2)
+        throw std::runtime_error("reweightNeighbourCounts: MSA must be 2-D (B, N)");
+    const long B = static_cast<long>(buf.shape[0]);
+    const long N = static_cast<long>(buf.shape[1]);
+    const int8_t* Z = static_cast<const int8_t*>(buf.ptr);
+
+    py::array_t<int32_t> counts(B);
+    int32_t* m = static_cast<int32_t*>(counts.request().ptr);
+    if (B == 0) return counts;
+
+    unsigned hc = std::thread::hardware_concurrency();
+    int nthreads = n_threads > 0 ? n_threads : (hc == 0 ? 1 : static_cast<int>(hc));
+    if (nthreads < 1) nthreads = 1;
+
+    // Row tile sized so that two tiles stay inside a core's private cache.
+    long tile = N > 0 ? (256L * 1024L) / N : 1024L;
+    tile = std::max(64L, std::min(tile, 1024L));
+    const long ntile = (B + tile - 1) / tile;
+    const long nblocks = ntile * (ntile + 1) / 2;   // upper triangle, tiles included
+
+    {
+        py::gil_scoped_release release;
+
+        std::vector<std::vector<int32_t>> partial(
+            static_cast<size_t>(nthreads), std::vector<int32_t>(static_cast<size_t>(B), 0));
+        std::atomic<long> next_block{0};
+
+        auto worker = [&](int t) {
+            int32_t* acc = partial[static_cast<size_t>(t)].data();
+            for (;;) {
+                const long blk = next_block.fetch_add(1, std::memory_order_relaxed);
+                if (blk >= nblocks) break;
+
+                // Recover the (I, J) tile with I <= J from the flat block index.
+                long I = 0, rem = blk;
+                while (rem >= ntile - I) { rem -= (ntile - I); ++I; }
+                const long J = I + rem;
+
+                const long i0 = I * tile, i1 = std::min(i0 + tile, B);
+                const long j0 = J * tile, j1 = std::min(j0 + tile, B);
+
+                for (long k = i0; k < i1; ++k) {
+                    const int8_t* zk = Z + k * N;
+                    // On the diagonal tile only take l > k, so each unordered
+                    // pair is visited exactly once across all tiles.
+                    const long lstart = (I == J) ? k + 1 : j0;
+                    for (long l = lstart; l < j1; ++l) {
+                        if (static_cast<double>(matchCount(zk, Z + l * N, N))
+                                >= identical_threshold) {
+                            ++acc[k];
+                            ++acc[l];
+                        }
+                    }
+                }
+            }
+        };
+
+        std::vector<std::thread> pool;
+        pool.reserve(static_cast<size_t>(nthreads));
+        for (int t = 0; t < nthreads; ++t) pool.emplace_back(worker, t);
+        for (auto& th : pool) th.join();
+
+        for (long i = 0; i < B; ++i) m[i] = 1;      // every sequence matches itself
+        for (int t = 0; t < nthreads; ++t) {
+            const int32_t* acc = partial[static_cast<size_t>(t)].data();
+            for (long i = 0; i < B; ++i) m[i] += acc[i];
+        }
+    }
+    return counts;
+}
+
 #ifdef ENABLE_CUDA
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -207,6 +291,18 @@ PYBIND11_MODULE(cpp_bindings, m) {
     // by the array's dtype without a copy, so the gauge is applied in place.
     m.def("applyIsingGauge", &applyIsingGauge<double>, py::arg("J"), py::arg("q"));
     m.def("applyIsingGauge", &applyIsingGauge<float>,  py::arg("J"), py::arg("q"));
+
+    m.def("reweightNeighbourCounts", &reweightNeighbourCounts,
+        py::arg("MSA"),
+        py::arg("identical_threshold"),
+        py::arg("n_threads") = 0,
+        R"doc(Neighbour counts for sequence reweighting.
+
+For each of the B sequences, the number of sequences in the alignment
+(itself included) matching it at >= identical_threshold positions. The
+caller forms the weights as 1/counts.
+
+MSA is (B, N) int8; identical_threshold is x * N.)doc");
 
     m.def("gaussCouplings", &gaussCouplings,
         py::arg("MSA"), py::arg("W"), py::arg("q") = 21,

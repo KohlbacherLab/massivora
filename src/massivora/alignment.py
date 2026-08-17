@@ -664,7 +664,7 @@ class BinaryAlignment(object):
         self.species_index_map = new_species_index_map
         self.species_list_map = {species: i for i, species in enumerate(new_species_list)}
 
-    def Reweight_Sequence(self, x=0.8, use_GPU=False):
+    def Reweight_Sequence(self, x=0.8, use_GPU=False, n_threads=0):
         B, N = self.matrix.shape
         identical_threshold = x * N
 
@@ -674,35 +674,31 @@ class BinaryAlignment(object):
                 raise ImportError("CuPy is not available. Please install CuPy to use GPU acceleration.")
             import cupy as cp
 
-            tx = 16
-            ty = 16
-            bx = math.ceil(B / tx)
-            by = math.ceil(B / ty)
-            MSA = cp.asarray(self.matrix, dtype=cp.int8)
-            simM = cp.ones(B, dtype=cp.int32)
+            # The kernel compares four residues at a time
+            Nw = (N + 3) // 4
+            padN = Nw * 4
+            MSA = cp.zeros((B, padN), dtype=cp.int8)
+            MSA[:, :N] = cp.asarray(self.matrix, dtype=cp.int8)
+            simM = cp.ones(B, dtype=cp.int32)   # every sequence matches itself
 
+            TILE, TY = 32, 8                    # must match RW_TILE / RW_TY
+            ntile = math.ceil(B / TILE)
             cuda_module = get_cuda_module()
-            pairwise_similarity = cuda_module.get_function('pairwise_similarity')
-            pairwise_similarity((bx, by), (tx, ty), (MSA, simM, np.int32(B), np.int32(N), np.float32(identical_threshold)))
+            pairwise_similarity = cuda_module.get_function('pairwise_similarity_tiled')
+            pairwise_similarity(
+                (ntile, ntile), (TILE, TY),
+                (MSA.view(cp.uint32), simM, np.int32(B), np.int32(Nw),
+                 np.int32(padN - N), np.float32(identical_threshold)))
             cp.cuda.runtime.deviceSynchronize()
 
-            w_d = 1.0 / simM.astype(cp.float32)
-            Beff = cp.sum(w_d)
-            w = cp.asnumpy(w_d)
-            del MSA, simM, w_d
+            m = cp.asnumpy(simM).astype(np.int64)
+            del MSA, simM
         else:
-            m = np.ones(B, dtype=np.int64)      # every sequence matches itself
-            block = max(1, int(2 ** 24 // max(1, N)))
-            for b in range(B - 1):
-                row = self.matrix[b]
-                lo = b + 1
-                while lo < B:
-                    hi = min(lo + block, B)
-                    hits = (np.count_nonzero(self.matrix[lo:hi] == row, axis=1)
-                            >= identical_threshold)
-                    m[b] += int(np.count_nonzero(hits))
-                    m[lo:hi] += hits
-                    lo = hi
+            m = np.asarray(
+                cpp_bindings.reweightNeighbourCounts(
+                    np.ascontiguousarray(self.matrix, dtype=np.int8),
+                    identical_threshold, int(n_threads)),
+                dtype=np.int64)
             w = 1.0 / m
             Beff = w.sum()
 
