@@ -1,6 +1,7 @@
 import importlib
 import logging
 import os
+import subprocess
 
 # Prefix applied to every POSIX shared-memory segment massivora allocates, so
 # cleanup can recognise its own segments and never touch unrelated ones. Kept
@@ -116,3 +117,31 @@ def get_cuda_module(kernel_source_path=None, device_id=None):
 
     return _CUDA_KERNELS[cache_key]
 
+def visible_gpu_devices():
+    """
+    Device ids this process is allowed to use, in the order CUDA sees them.
+
+    Returns
+    -------
+    `list`
+        Device ids as strings, at least one entry.
+    """
+    cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if cuda_visible is not None and cuda_visible.strip() != "":
+        devices = [d.strip() for d in cuda_visible.split(',') if d.strip()]
+        if devices:
+            return devices
+        logging.warning("CUDA_VISIBLE_DEVICES is set but empty; falling back to all GPUs")
+
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'],
+            capture_output=True, text=True, check=True)
+        devices = [d.strip() for d in result.stdout.strip().split('\n') if d.strip()]
+        if devices:
+            return devices
+    except Exception as e:
+        logging.warning(f"Could not query nvidia-smi for the GPU count ({e})")
+
+    logging.warning("Could not detect GPU count; defaulting to device 0")
+    return ['0']

@@ -699,11 +699,10 @@ class BinaryAlignment(object):
                     np.ascontiguousarray(self.matrix, dtype=np.int8),
                     identical_threshold, int(n_threads)),
                 dtype=np.int64)
-            w = 1.0 / m
-            Beff = w.sum()
 
+        w = 1.0 / m
         self.weights = w.tolist()
-        self.Beff = float(Beff)
+        self.Beff = float(w.sum())
 
     def To_Text(self, restore_gaps=True, filename=None):
         # Create reverse mapping from numbers back to characters

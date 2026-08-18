@@ -20,8 +20,10 @@ def usage():
         "examples:\n"
         "  massivora new [project_name] [--overwrite]\n"
         "  massivora run align <project_config.yml> [--system-config <system.yml>]\n"
+        "  massivora run concat <project_config.yml> [--system-config <system.yml>]\n"
         "  massivora run couple <project_config.yml> [--system-config <system.yml>]\n"
         "  massivora batch align <project_config.yml> [--system-config <system.yml>]\n"
+        "  massivora batch concat <project_config.yml> [--system-config <system.yml>]\n"
         "  massivora batch couple <project_config.yml> [--system-config <system.yml>]\n"
         "  massivora sysconf\n\n"
     )
@@ -56,6 +58,7 @@ def _add_stage_subparsers(parent_parser):
     stage_sub = parent_parser.add_subparsers(dest='stage', required=True)
     for stage, helptext in (
         ('align', 'Run download + alignment stage'),
+        ('concat', 'Run concatenation stage'),
         ('couple', 'Run coupling stage'),
     ):
         sp = stage_sub.add_parser(stage, help=helptext)
@@ -174,6 +177,8 @@ def cmd_run(project_config, system_config, stage, mode):
 
         # Then run alignment
         loader.run_align()
+    elif stage == 'concat':
+        loader.run_concatenate()
     elif stage == 'couple':
         loader.run_couple()
 

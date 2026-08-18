@@ -73,13 +73,14 @@ concatenate:
   db_table: couplings
   # method for pairing sequences in concatenated alignment
   method: best_hit
-  reweighting: 
+  reweighting:
     enabled: true
     threshold: 0.8
   # downsample settings (optional)
   downsample:
     enabled: true
     to: 30000
+  claim_batch_size: 'auto'  # 'auto' or integer
 
 couple:
   db_table: couplings

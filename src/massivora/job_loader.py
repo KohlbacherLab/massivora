@@ -128,21 +128,7 @@ class LocalJobLoader(BaseJobLoader):
         return self._run_detached(cmd, 'align')
 
     def run_concatenate(self):
-        align_table = quote_identifier(self.table_names['alignments'])
-
-        conn = connect_db(self.config)
-        cursor = conn.cursor()
-        cursor.execute(f"SELECT pid from {align_table} where status = ?", (STATUS['DONE'],))
-        done_alignments = [pid for (pid,) in cursor]
-        jobs = list(combinations(done_alignments, 2))
-        conn.close()
-
-        jobs_file = os.path.join(self.project_path, "concat_jobs.txt")
-        with open(jobs_file, 'w') as f:
-            for job in jobs:
-                f.write(f"{','.join(job)}\n")
-
-        cmd = ['massiworker', 'concat', '--config', self.config_path, jobs_file]
+        cmd = ['massiworker', 'concat', '--config', self.config_path]
         return self._run_detached(cmd, 'concat')
 
     def run_couple(self):
@@ -267,47 +253,13 @@ class SlurmJobLoader(BaseJobLoader):
             conn.close()
 
     def run_concatenate(self):
-        align_table = quote_identifier(self.table_names['alignments'])
-
-        conn = connect_db(self.config)
-        cursor = conn.cursor()
-        cursor.execute(f"SELECT pid from {align_table} where status = ?", (STATUS['DONE'],))
-        done_alignments = [pid for (pid,) in cursor]
-        jobs = list(combinations(done_alignments, 2))
-        conn.close()
-
         batch = self.config.get('batch')
-        concatenate = self.config.get('concatenate')
         maximum_nodes = int(batch.get('maximum_nodes', 1))
-        portion = float(concatenate.get('portion', 1.0))
-        portion_start = float(concatenate.get('portion_start', 0.0))
-
-        total_concats = len(jobs)
-        total_concats_this_slurm = int(total_concats * portion)
-        starting_job_index = int(total_concats * portion_start)
-        jobs_per_node = total_concats_this_slurm // maximum_nodes + 1
-
+        
         for node in range(maximum_nodes):
-            if starting_job_index >= total_concats_this_slurm + starting_job_index:
-                break
-
-            this_node_start = starting_job_index + node * jobs_per_node
-            this_node_end = min(
-                this_node_start + jobs_per_node,
-                total_concats_this_slurm + starting_job_index,
-            )
-            node_jobs = jobs[this_node_start:this_node_end]
-            if not node_jobs:
-                continue
-
-            this_node_jobs_file = os.path.join(self.script_dir, f"concat_node_{node}.txt")
-            with open(this_node_jobs_file, 'w') as f:
-                for job in node_jobs:
-                    f.write(f"{','.join(job)}\n")
-
             job_name = f"{self.job_name_prefix}_cc{node}"
-            header = self.default_sbatch_header(job_name, cpus_per_task=self.cpu_count, time_limit=self.time_limit, log_dir=self.log_dir, modules=self.modules)
-            cmd = f"conda run -p {self.conda_prefix} massiworker concat --config {self.config_path} {this_node_jobs_file}\n"
+            header = self.default_sbatch_header(job_name, cpus_per_task=self.cpu_count, time_limit=self.time_limit, log_dir=self.log_dir, modules=self.modules, extra_directives=self.sbatch_directives)
+            cmd = f"conda run -p {self.conda_prefix} massiworker concat --config {self.config_path}"
 
             script_path = os.path.join(self.script_dir, f"concat_node_{node}.sh")
             self.write_script(script_path, header + cmd)
@@ -347,7 +299,7 @@ class SlurmJobLoader(BaseJobLoader):
             conn.close()
 
     # Map a monitored pipeline stage to the sbatch scripts it generates.
-    _STAGE_SCRIPT_PREFIX = {'align': 'align_node_', 'couple': 'coupling_node_'}
+    _STAGE_SCRIPT_PREFIX = {'align': 'align_node_', 'concat': 'concat_node_', 'couple': 'coupling_node_'}
 
     def resubmit(self, stage):
         """
