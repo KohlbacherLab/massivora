@@ -11,10 +11,9 @@ from Bio import SeqIO
 
 from massivora.alignment import TextAlignment
 from massivora.config import load_project_and_system_config
-from massivora.db import (STATUS, connect_db_ro, connect_db_rw, get_db_path,
-                          quote_identifier)
+from massivora.db import STATUS, connect_db_ro, connect_db_rw, quote_identifier
 from massivora.massiveilance import compute_id_range
-from massivora.utils import worker_id, setup_logging
+from massivora.utils import setup_logging, worker_id
 
 
 def _claim_batch(cfg, job_id, batch_size, table_name='alignments', id_range=None):

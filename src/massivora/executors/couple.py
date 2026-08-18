@@ -6,7 +6,6 @@ import signal
 import sqlite3
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import shared_memory
 
 import dask
@@ -23,11 +22,9 @@ from massivora.config import load_project_and_system_config
 from massivora.db import (STATUS, compute_file_hash, connect_db_rw,
                           ensure_columns, get_db_path, get_hashed_file_path,
                           get_table_names, quote_identifier)
-from massivora.utils import (SHM_PREFIX, compute_id_range, get_cuda_module,
-                             gpu_is_available, massivora_pkg_dir,
-                             setup_logging, worker_id)
-if gpu_is_available():
-    import cupy as cp
+from massivora.utils import (SHM_PREFIX, compute_id_range, gpu_is_available,
+                             massivora_pkg_dir, setup_logging,
+                             visible_gpu_devices, worker_id)
 
 
 class LoggingWorkerPlugin(WorkerPlugin):
@@ -417,6 +414,7 @@ class BaseCouplingExecutor(object):
             cluster, client = self._create_cluster()
 
         try:
+            # restore logging when worker restarts
             client.forward_logging()
             client.register_plugin(
                 LoggingWorkerPlugin(self._config),
@@ -801,24 +799,7 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
 
     def _create_cluster(self):
         """Create a Dask cluster with one worker per GPU."""
-        devices = None
-        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES')
-        if cuda_visible is not None and cuda_visible.strip() != "":
-            devices = [d.strip() for d in cuda_visible.split(',') if d.strip()]
-            if not devices:
-                logging.warning("CUDA_VISIBLE_DEVICES is set but empty; falling back to all GPUs")
-                devices = None
-
-        if devices is None:
-            try:
-                result = subprocess.run(
-                    ['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'],
-                    capture_output=True, text=True, check=True)
-                devices = [d.strip() for d in result.stdout.strip().split('\n') if d.strip()]
-            except Exception:
-                devices = ['0']
-                logging.warning("Could not detect GPU count; defaulting to device 0")
-
+        devices = visible_gpu_devices()
         n_gpus = len(devices)
         compute_threads = max(1, n_gpus * 2)
         logging.info(f"Creating GPU cluster with {n_gpus} workers (one per GPU)")
@@ -1318,7 +1299,6 @@ if __name__ == '__main__':
     cpu_cls, gpu_cls = executor_pair
     if gpu_is_available():
         ExecutorClass = gpu_cls
-        import cupy as cp
     else:
         ExecutorClass = cpu_cls
     logging.info(f"Using executor: {ExecutorClass.__name__}")
