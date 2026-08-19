@@ -1006,7 +1006,10 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
         super().__init__(config)
         coupling_cfg = config.get('couple')
         self.pseudocount = float(coupling_cfg.get('pseudocount', 0.8))
-        self.n_threads = max(1, int(coupling_cfg.get('gauss_threads', 1)))
+        threads_cfg = coupling_cfg.get('gauss_threads', 2)
+        self.auto_threads = (isinstance(threads_cfg, str)
+                             and threads_cfg.strip().lower() == 'auto')
+        self.n_threads = None if self.auto_threads else max(1, int(threads_cfg))
         massivora_dir = massivora_pkg_dir()
         self.gauss_infer_exe = os.path.join(massivora_dir, 'bin', 'gauss_infer')
 
@@ -1023,12 +1026,12 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
             out = subprocess.run([self.gauss_infer_exe, '--info'],
                                  capture_output=True, text=True, timeout=30)
             info = dict(l.split('=', 1) for l in out.stdout.splitlines() if '=' in l)
-            if info.get('lapack') == '0':
+            if info.get('ilp64') == '0':
                 logging.warning(
-                    "%s was built without a LAPACK; the covariance inverse will run "
-                    "single-threaded through the Eigen fallback (roughly 50x slower "
-                    "on wide alignments). Rebuild with openblas available.",
-                    self.gauss_infer_exe)
+                    "%s is not an ILP64 build; pairs wider than 2317 columns will "
+                    "fall back to a serial inverse and use ~3.7x the memory "
+                    "reserved for them. Reinstall massivora against an ILP64 "
+                    "openblas.", self.gauss_infer_exe)
             if configured:
                 return int(configured)
             if 'cov_bytes' in info:
@@ -1038,6 +1041,22 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
                             f"({e}); assuming float64. A single-precision build will "
                             f"then be over-reserved by 2x.")
         return 8
+
+    # Width tiers for gauss_threads: auto
+    _THREAD_TIERS = ((500, 1), (1000, 2), (1500, 4), (2000, 8))
+    _THREAD_TIER_MAX = 16
+
+    def _threads_for(self, N, budget):
+        """Threads to give one gauss_infer run for an alignment of width N."""
+        if not self.auto_threads:
+            want = self.n_threads
+        else:
+            want = self._THREAD_TIER_MAX
+            for upper, tier in self._THREAD_TIERS:
+                if N <= upper:
+                    want = tier
+                    break
+        return max(1, min(int(want), int(budget)))
 
     def _pair_memory_mb(self, N):
         """Peak resident memory of one gauss_infer run, in MB."""
@@ -1152,7 +1171,7 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
         }
         return params
 
-    def infer(self, params):
+    def infer(self, params, n_threads=1):
         q = params["q"]
         N = params["N"]
         B = params["B"]
@@ -1167,14 +1186,16 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
         except FileExistsError:
             pass  # already created; nothing to do
 
-        n_threads = max(1, int(getattr(self, 'n_threads', 1)))
+        # Must match the 'compute' slots calc_graph reserved for this task,
+        # otherwise the admission control and the process disagree.
+        n_threads = max(1, int(n_threads))
         cmd = [self.gauss_infer_exe, msa_name, str(B), str(N), str(q),
                str(self.pseudocount), str(n_threads)]
 
         # gauss_infer inverts the covariance through a threaded LAPACK
         # avoid to oversubscribe the machine
         env = dict(os.environ)
-        for var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        for var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS"):
             env[var] = str(n_threads)
 
         logging.debug(f"Running GaussDCA inference with cmd {' '.join(cmd)}")
@@ -1234,7 +1255,6 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
 
     def calc_graph(self, pair, priority=0, **kwargs):
         budget = mp.cpu_count()
-        n_threads = max(1, min(int(getattr(self, 'n_threads', 1)), budget))
 
         N = pair.get('length')
         if not N:
@@ -1245,6 +1265,7 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
                 f"select length from {quote_identifier(self.align_table)} where pid = ?",
                 (pair.get('pid2'),)).fetchone()[0]
             N = length1 + length2
+        n_threads = self._threads_for(N, budget)
         per_pair_mb = max(1.0, min(self._pair_memory_mb(N), self.mem_budget_mb))
 
         # estimate the memory load of pairs
@@ -1257,7 +1278,7 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
             params = delayed(self.load_pair)(pair, **kwargs)
         with annotate(resources={'compute': n_threads, 'memory_mb': per_pair_mb},
                       priority=priority + self._COUPLE_PRIORITY):
-            rc = delayed(self.infer)(params)
+            rc = delayed(self.infer)(params, n_threads)
         with annotate(resources={'compute': 1, 'memory_mb': 1.0},
                       priority=priority + 2 * self._COUPLE_PRIORITY):
             out_d = delayed(self.collect_results)(rc, params)

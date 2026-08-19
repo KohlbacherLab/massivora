@@ -63,7 +63,7 @@ align:
   row_gap_threshold: 0.5
   col_gap_threshold: 0.5
   keep_original_msa: false
-  claim_batch_size: 'auto'  # 'auto' or integer
+  claim_batch_size: auto  # 'auto' or integer
 
   # Applies when one wants to split the calculation to multiple clusters
   # portion: 1.0
@@ -80,11 +80,11 @@ concatenate:
   downsample:
     enabled: true
     to: 30000
-  claim_batch_size: 'auto'  # 'auto' or integer
+  claim_batch_size: auto  # 'auto' or integer
 
 couple:
   db_table: couplings
-  claim_batch_size: 'auto'  # 'auto' or integer
+  claim_batch_size: auto  # 'auto' or integer
   memory_limit: 0.9
 
   method: plm
@@ -97,7 +97,7 @@ couple:
 
   # GaussDCA parameters
   pseudocount: 0.8
-  gauss_threads: 2
+  gauss_threads: auto  # 'auto' or integer
 
   # Applies when one wants to split the calculation to multiple clusters
   # portion: 1.0
