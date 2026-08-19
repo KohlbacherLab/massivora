@@ -48,41 +48,71 @@
 
 namespace gaussdca {
 
-// Single precision is the default
-// This applies only to compute_score_into()
+// Width of the scalar the covariance is stored and factorised in. Independent
+// of the LAPACK integer width: ILP64 (see blas_int below) is what lifts the
+// 2317-column cap, and it does so at either precision. float32 is the default
+// because it halves the largest allocation in the program, and its error is far
+// below what the float16 scores it feeds into can resolve.
+// This applies only to compute_score_into().
 #ifdef GAUSSDCA_DOUBLE_PRECISION
 using CovScalar = double;
 #else
 using CovScalar = float;
 #endif
 
-#ifdef GAUSSDCA_USE_LAPACK
-extern "C" {
-// LAPACK (column-major, LP64). `?potrf` factorises an SPD matrix in place;
-// `?potri` overwrites that factor with the inverse of the original matrix.
-void dpotrf_(const char* uplo, const int* n, double* a, const int* lda, int* info);
-void dpotri_(const char* uplo, const int* n, double* a, const int* lda, int* info);
-void spotrf_(const char* uplo, const int* n, float* a, const int* lda, int* info);
-void spotri_(const char* uplo, const int* n, float* a, const int* lda, int* info);
-}
-inline void lapack_potrf(const char* u, const int* n, double* a, const int* l, int* i) {
-    dpotrf_(u, n, a, l, i);
-}
-inline void lapack_potri(const char* u, const int* n, double* a, const int* l, int* i) {
-    dpotri_(u, n, a, l, i);
-}
-inline void lapack_potrf(const char* u, const int* n, float* a, const int* l, int* i) {
-    spotrf_(u, n, a, l, i);
-}
-inline void lapack_potri(const char* u, const int* n, float* a, const int* l, int* i) {
-    spotri_(u, n, a, l, i);
-}
-// Thread-count hooks, weak so the binary still links against a BLAS that lacks
-// them. Without these a threaded BLAS would ignore n_threads and grab every
-// core, which breaks the executor's resource accounting.
-extern "C" void openblas_set_num_threads(int) __attribute__((weak));
-extern "C" void mkl_set_num_threads(int*) __attribute__((weak));
+// LAPACK is used through its ILP64 interface only.
+using blas_int = std::int64_t;
+
+// OpenBLAS built with SYMBOLSUFFIX renames every Fortran symbol to <name>_64_,
+// while one built with just INTERFACE64=1 keeps the plain name and only widens
+// the integers. CMake works out which by linking a probe, and defines
+// GAUSS_BLAS_SUFFIX_64 for the suffixed spelling.
+#ifdef GAUSS_BLAS_SUFFIX_64
+#  define GAUSS_LAPACK_SYM(name) name##_64_
+#else
+#  define GAUSS_LAPACK_SYM(name) name##_
 #endif
+
+extern "C" {
+// `?potrf` factorises an SPD matrix in place (column-major); `?potri` then
+// overwrites that factor with the inverse of the original matrix.
+void GAUSS_LAPACK_SYM(dpotrf)(const char* uplo, const blas_int* n, double* a,
+                              const blas_int* lda, blas_int* info);
+void GAUSS_LAPACK_SYM(dpotri)(const char* uplo, const blas_int* n, double* a,
+                              const blas_int* lda, blas_int* info);
+void GAUSS_LAPACK_SYM(spotrf)(const char* uplo, const blas_int* n, float* a,
+                              const blas_int* lda, blas_int* info);
+void GAUSS_LAPACK_SYM(spotri)(const char* uplo, const blas_int* n, float* a,
+                              const blas_int* lda, blas_int* info);
+}
+inline void lapack_potrf(const char* u, const blas_int* n, double* a,
+                         const blas_int* l, blas_int* i) {
+    GAUSS_LAPACK_SYM(dpotrf)(u, n, a, l, i);
+}
+inline void lapack_potri(const char* u, const blas_int* n, double* a,
+                         const blas_int* l, blas_int* i) {
+    GAUSS_LAPACK_SYM(dpotri)(u, n, a, l, i);
+}
+inline void lapack_potrf(const char* u, const blas_int* n, float* a,
+                         const blas_int* l, blas_int* i) {
+    GAUSS_LAPACK_SYM(spotrf)(u, n, a, l, i);
+}
+inline void lapack_potri(const char* u, const blas_int* n, float* a,
+                         const blas_int* l, blas_int* i) {
+    GAUSS_LAPACK_SYM(spotri)(u, n, a, l, i);
+}
+
+// Thread-count hook, weak so the binary still links against a BLAS that lacks
+// it (an OpenBLAS built without threading). Without it a threaded BLAS would
+// ignore n_threads and grab every core, which breaks the executor's resource
+// accounting. A SYMBOLSUFFIX build renames this one too.
+extern "C" {
+#ifdef GAUSS_BLAS_SUFFIX_64
+void openblas_set_num_threads64_(int) __attribute__((weak));
+#else
+void openblas_set_num_threads(int) __attribute__((weak));
+#endif
+}
 
 // Thread count used for the pair-frequency accumulation and the reductions.
 inline int hardware_threads() {
@@ -112,13 +142,12 @@ inline void parallel_for(long total, int nthreads, F&& f) {
     for (auto& th : pool) th.join();
 }
 
-// Tell a threaded BLAS how many cores it may use.
+// Tell OpenBLAS how many cores it may use.
 inline void set_blas_threads(int n) {
-#ifdef GAUSSDCA_USE_LAPACK
-    if (openblas_set_num_threads) openblas_set_num_threads(n);
-    if (mkl_set_num_threads) { int nn = n; mkl_set_num_threads(&nn); }
+#ifdef GAUSS_BLAS_SUFFIX_64
+    if (openblas_set_num_threads64_) openblas_set_num_threads64_(n);
 #else
-    (void)n;
+    if (openblas_set_num_threads) openblas_set_num_threads(n);
 #endif
 }
 
@@ -141,49 +170,21 @@ private:
     T* p_ = nullptr;
 };
 
-// Largest n an LP64 LAPACK can be trusted with: n*n must stay inside a signed
-// 32-bit index. n = 46340 corresponds to ~2317 alignment columns.
-inline constexpr long LAPACK_LP64_MAX_N = 46340L;
-
 // Invert the SPD matrix held in the lower triangle of `A` (n x n, column-major,
 // leading dimension n), in place. Only the lower triangle is read; on return
 // only the lower triangle is valid.
 template <class S>
 inline void invert_spd_lower_inplace(S* A, long n, int nthreads) {
-#ifdef GAUSSDCA_USE_LAPACK
-    if (n <= LAPACK_LP64_MAX_N) {
-        set_blas_threads(nthreads);
-        const char uplo = 'L';
-        int ni = static_cast<int>(n), info = 0;
-        lapack_potrf(&uplo, &ni, A, &ni, &info);
-        if (info != 0)
-            throw std::runtime_error("Cholesky factorization failed (C not SPD), potrf info=" +
-                                     std::to_string(info));
-        lapack_potri(&uplo, &ni, A, &ni, &info);
-        if (info != 0)
-            throw std::runtime_error("Inversion failed, potri info=" + std::to_string(info));
-        return;
-    }
-    // Past the LP64 limit an ILP64 build would be needed, so rather than fail on
-    // a very wide pair fall through to the Eigen path: slower and single
-    // threaded, but it still produces the couplings.
-    std::fprintf(stderr,
-                 "gauss_infer: NQ = %ld exceeds the LP64 LAPACK limit (%ld); "
-                 "using the single-threaded Eigen inverse. Link an ILP64 BLAS "
-                 "to keep the threaded path for alignments this wide.\n",
-                 n, LAPACK_LP64_MAX_N);
-#endif
-    // Eigen fallback: in-place Cholesky
-    (void)nthreads;
-    using CovMatrix = Eigen::Matrix<S, Eigen::Dynamic, Eigen::Dynamic>;
-    Eigen::Map<CovMatrix> C(A, n, n);
-    Eigen::LLT<Eigen::Ref<CovMatrix>> llt(C);
-    if (llt.info() != Eigen::Success)
-        throw std::runtime_error("Cholesky factorization failed (C not SPD)");
-    CovMatrix Linv = CovMatrix::Identity(n, n);
-    C.template triangularView<Eigen::Lower>().solveInPlace(Linv);
-    C.setZero();
-    C.template selfadjointView<Eigen::Lower>().rankUpdate(Linv.transpose());
+    set_blas_threads(nthreads);
+    const char uplo = 'L';
+    blas_int ni = static_cast<blas_int>(n), info = 0;
+    lapack_potrf(&uplo, &ni, A, &ni, &info);
+    if (info != 0)
+        throw std::runtime_error("Cholesky factorization failed (C not SPD), potrf info=" +
+                                 std::to_string(info));
+    lapack_potri(&uplo, &ni, A, &ni, &info);
+    if (info != 0)
+        throw std::runtime_error("Inversion failed, potri info=" + std::to_string(info));
 }
 
 // Assemble the lower triangle of C = fij - fi*fi^T (with pseudocount) into `C`

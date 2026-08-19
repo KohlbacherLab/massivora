@@ -1,4 +1,6 @@
-cmake_minimum_required(VERSION 3.18)
+# 3.22 is the floor for FindBLAS's BLA_SIZEOF_INTEGER, which the ILP64
+# search in cmake/GaussBLAS.cmake relies on.
+cmake_minimum_required(VERSION 3.22)
 
 # GPU support is optional and auto-detected. ENABLE_CUDA accepts:
 #   AUTO (default) - build the CUDA backend iff a CUDA compiler is found
@@ -228,17 +230,13 @@ set(MASSIVORA_BIN_INSTALL_DIR "massivora/bin")
 # gauss_infer/cpp_bindings spend nearly all of their time in dense linear
 # algebra. Three build-time choices dominate speed and memory:
 #
+#   MASSIVORA_DOUBLE_PRECISION  factorise in float64 instead of the float32
+#                               default, doubling the memory a pair costs.
 #   MASSIVORA_ARCH              the ISA the compiler may emit. A plain -O3 build
 #                               targets baseline x86-64 (SSE2, no FMA), which
 #                               costs ~3.5x on the Cholesky/inverse. "native"
 #                               tunes for the build machine; use e.g.
 #                               x86-64-v3 for a redistributable build, or OFF.
-#   MASSIVORA_USE_LAPACK        ?potrf + ?potri for the inverse, internally
-#                               threaded. Without it a correct but
-#                               single-threaded Eigen fallback is used, which
-#                               is ~50x slower on a wide alignment.
-#   MASSIVORA_DOUBLE_PRECISION  factorise in float64 instead of the float32
-#                               default, doubling the memory a pair costs.
 include(CheckCXXCompilerFlag)
 
 set(MASSIVORA_ARCH "native" CACHE STRING
@@ -266,73 +264,10 @@ else()
   message(STATUS "massivora: GaussDCA covariance in float32 (default)")
 endif()
 
-option(MASSIVORA_USE_LAPACK "Use a threaded LAPACK for the GaussDCA inverse" ON)
-set(MASSIVORA_LAPACK_LIBS "")
-set(MASSIVORA_LAPACK_DEFS "")
-if(MASSIVORA_USE_LAPACK)
-  # find_package(LAPACK) resolves through find_library, which searches system
-  # paths only. Every documented install path puts the BLAS somewhere else:
-  #
-  #   conda / micromamba    $CONDA_PREFIX          (set by `conda activate`)
-  #   conda-build           $PREFIX / $BUILD_PREFIX
-  #   pip install .         the target interpreter's prefix -- and pip's build
-  #                         isolation means CONDA_PREFIX may not be exported at
-  #                         all, so derive it from Python_EXECUTABLE too.
-  #
-  # Without these hints the env's openblas is missed, GAUSSDCA_USE_LAPACK is
-  # never defined, and the inverse silently drops to the single-threaded Eigen
-  # fallback.
-  set(_massivora_blas_hints "")
-  foreach(_v CONDA_PREFIX PREFIX BUILD_PREFIX)
-    if(DEFINED ENV{${_v}})
-      list(APPEND _massivora_blas_hints "$ENV{${_v}}")
-    endif()
-  endforeach()
-  if(Python_EXECUTABLE)
-    get_filename_component(_massivora_py_bin "${Python_EXECUTABLE}" DIRECTORY)
-    get_filename_component(_massivora_py_prefix "${_massivora_py_bin}" DIRECTORY)
-    list(APPEND _massivora_blas_hints "${_massivora_py_prefix}")
-  endif()
-  if(_massivora_blas_hints)
-    list(REMOVE_DUPLICATES _massivora_blas_hints)
-    list(PREPEND CMAKE_PREFIX_PATH ${_massivora_blas_hints})
-  endif()
-
-  find_package(LAPACK QUIET)
-  if(LAPACK_FOUND)
-    set(MASSIVORA_LAPACK_LIBS ${LAPACK_LIBRARIES})
-    set(MASSIVORA_LAPACK_DEFS GAUSSDCA_USE_LAPACK)
-    message(STATUS "massivora: GaussDCA inverse via LAPACK ${LAPACK_LIBRARIES}")
-  else()
-    # Hard error rather than a warning: `pip install .` hides build warnings, so
-    # a degraded binary would install cleanly and simply be slow, which is a
-    # miserable thing to debug from the far side.
-    string(REPLACE ";" "\n      " _massivora_searched "${_massivora_blas_hints}")
-    message(FATAL_ERROR
-      "massivora: no BLAS/LAPACK found.\n"
-      "\n"
-      "  gauss_infer inverts the GaussDCA covariance with ?potrf/?potri. Without\n"
-      "  a LAPACK it falls back to a single-threaded Eigen path that is roughly\n"
-      "  50x slower on wide alignments and needs ~2.5x the memory.\n"
-      "\n"
-      "  Install one and reinstall:\n"
-      "      conda install -c conda-forge liblapack\n"
-      "      apt install libopenblas-dev          # Debian/Ubuntu\n"
-      "      dnf install openblas-devel           # Fedora/RHEL\n"
-      "\n"
-      "  Prefixes searched, in addition to the system paths:\n"
-      "      ${_massivora_searched}\n"
-      "\n"
-      "  To build the slow fallback deliberately:\n"
-      "      cmake -DMASSIVORA_USE_LAPACK=OFF ...\n"
-      "      pip install . -C cmake.define.MASSIVORA_USE_LAPACK=OFF\n")
-  endif()
-else()
-  message(WARNING
-    "massivora: MASSIVORA_USE_LAPACK=OFF -- gauss_infer will use the "
-    "single-threaded Eigen inverse (~50x slower on wide alignments). "
-    "Check `gauss_infer --info` reports lapack=0 as intended.")
-endif()
+# An ILP64 BLAS is mandatory -- it is the only inverse path there is -- so this
+# is not a build-time choice. See cmake/GaussBLAS.cmake.
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(GaussBLAS)
 
 # Apply the tuning above to a target.
 function(massivora_tune tgt)
@@ -342,10 +277,10 @@ function(massivora_tune tgt)
   if(MASSIVORA_PRECISION_DEFS)
     target_compile_definitions(${tgt} PRIVATE ${MASSIVORA_PRECISION_DEFS})
   endif()
-  if(MASSIVORA_LAPACK_DEFS)
-    target_compile_definitions(${tgt} PRIVATE ${MASSIVORA_LAPACK_DEFS})
-    target_link_libraries(${tgt} PRIVATE ${MASSIVORA_LAPACK_LIBS})
-  endif()
+  # gauss::blas carries the ILP64 library plus GAUSS_BLAS_ILP64 and the
+  # symbol-suffix macro the headers paste onto every LAPACK call. GaussBLAS.cmake
+  # either defines it or fails the configure, so it is always present here.
+  target_link_libraries(${tgt} PRIVATE gauss::blas)
 endfunction()
 
 # --- pybind11 extension module ---

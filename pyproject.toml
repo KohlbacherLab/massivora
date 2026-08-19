@@ -45,7 +45,7 @@ build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
 # Build the native extension via CMake.
-cmake.version = ">=3.18"
+cmake.version = ">=3.22"   # FindBLAS BLA_SIZEOF_INTEGER, used by the ILP64 search
 build-dir = "build/{wheel_tag}"
 wheel.packages = ["src/massivora"]
 # CMake is the sole provider of the compiled artifacts.

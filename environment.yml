@@ -19,14 +19,14 @@ dependencies:
   # --- Native build toolchain (used by `pip install . --no-build-isolation`) ---
   - c-compiler
   - cxx-compiler
-  - cmake>=3.18
+  - cmake>=3.22
   - ninja
   - pkg-config
   - scikit-build-core
   - pybind11>=2.12
   - eigen
   - nlopt
-  - liblapack
+  - openblas-ilp64
 
   # --- Runtime dependency only available via conda (bioconda) ---
   - openstructure

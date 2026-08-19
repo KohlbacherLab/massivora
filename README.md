@@ -43,14 +43,9 @@ on `PATH` — no extra flag needed. Force it on/off with
 
 ### 2. pip
 
-Dependencies: `eigen`, `nlopt`, and a **BLAS/LAPACK**. Eigen and NLopt are
-fetched and built automatically if they are missing; a BLAS/LAPACK is **not**,
-so install one first — the build stops with instructions if it cannot find one:
-
-```bash
-sudo apt install libopenblas-dev     # Debian/Ubuntu
-sudo dnf install openblas-devel      # Fedora/RHEL
-```
+Dependencies: `eigen`, `nlopt`, and an **ILP64 BLAS/LAPACK**. Eigen and NLopt
+are fetched and built automatically if they are missing; the BLAS is **not**, so
+install `openblas-ilp64` first — the build stops with instructions if it cannot find one.
 
 If you wish to use the analysis module of massivora, you also need to install `openstructure` manually.
 
@@ -103,19 +98,24 @@ python -c "import massivora, os, subprocess; \
 ```
 
 ```
-cov_bytes=4
-lapack=1
+cov_bytes=8
+blas_int_bytes=8
+ilp64=1
 ```
 
-* **`lapack=1`** is what you want. `lapack=0` means the build fell back to a
-  single-threaded Eigen inverse — roughly 50x slower on a wide alignment, and
-  about 2.5x the memory. The GaussDCA path will then appear to ignore its thread
-  argument. Installing a BLAS/LAPACK and reinstalling fixes it; the build
-  refuses to produce a `lapack=0` binary unless you pass
-  `-C cmake.define.MASSIVORA_USE_LAPACK=OFF` on purpose.
-* **`cov_bytes=4`** is the default single-precision factorisation. `8` means the
-  build used `-C cmake.define.MASSIVORA_DOUBLE_PRECISION=ON`, which doubles the
-  memory each pair needs for accuracy well below what the stored scores resolve.
+* **`ilp64=1`** is what you want, and it is the only value a successful build
+  can produce — the configure step runs the check described below and fails
+  outright otherwise. Seeing it here confirms the installed binary is the one
+  that build produced.
+* **`cov_bytes=4`** is the covariance scalar — the default single-precision
+  factorisation. `8` means the build used
+  `-C cmake.define.MASSIVORA_DOUBLE_PRECISION=ON`, which doubles the memory each
+  pair needs (measured at N=2320: 4.43 GiB against 8.53 GiB) for accuracy well
+  below what the stored float16 scores resolve.
+
+  Note this is the *floating-point* scalar and is independent of `ilp64`, which
+  is the *integer* width of LAPACK's arguments. ILP64 is what lifts the
+  2317-column cap, and it does so at either precision.
 
 ## System configuration
 

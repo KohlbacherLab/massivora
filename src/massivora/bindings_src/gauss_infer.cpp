@@ -109,20 +109,13 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> pos;
     for (int i = 1; i < argc; ++i) pos.push_back(argv[i]);
 
-    // Report the build configuration so the caller can size its memory
-    // reservation without being told separately which precision this binary
-    // was compiled for.
+    // Report the build configuration. Nothing depends on this at run time --
+    // the precision and the BLAS interface are both fixed -- but it is the
+    // quickest way to confirm an installed binary is the one you think it is.
     if (pos.size() == 1 && pos[0] == "--info") {
         std::cout << "cov_bytes=" << sizeof(gaussdca::CovScalar) << "\n";
-#ifdef GAUSSDCA_USE_LAPACK
-        std::cout << "lapack=1\n";
-#else
-        // Built without a LAPACK: the inverse runs on the single-threaded Eigen
-        // fallback, which is roughly 50x slower on a wide alignment. Reported
-        // here so a mis-built binary is visible at run time instead of just
-        // being slow.
-        std::cout << "lapack=0\n";
-#endif
+        std::cout << "blas_int_bytes=" << sizeof(gaussdca::blas_int) << "\n";
+        std::cout << "ilp64=" << (sizeof(gaussdca::blas_int) == 8 ? 1 : 0) << "\n";
         return 0;
     }
 
