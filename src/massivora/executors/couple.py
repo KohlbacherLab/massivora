@@ -119,7 +119,7 @@ class BaseCouplingExecutor(object):
         concatenated = align1 + align2
         if downsample:
             concatenated.Downsample_Randomly(to=downsample_to)
-        concatenated.Gap_Columns_Control(self._config.get('align').get('col_gap_threshold', 0.5))
+        concatenated.Mask_Gap_Columns(self._config.get('align').get('col_gap_threshold', 0.5))
         return concatenated
 
     # -- DB helpers --
@@ -348,6 +348,65 @@ class BaseCouplingExecutor(object):
             logging.info(
                 f"Cleaned up {removed} stale shared-memory segment(s) for job_id={self.job_id}"
             )
+
+    @staticmethod
+    def _expand_score(score, saved_columns, lengthes):
+        """Scatter a reduced score matrix back to the full alignment width.
+
+        fast_approximation optimizes only the columns the gap mask keeps, but
+        the couplings array has to stay the size of the complete alignment so
+        the analyzers can go on indexing it by residue number.
+
+        The Zarr archive still holds the whole alignment, so its own metadata
+        says where a reduced column belongs: `saved_columns` holds one list of
+        monomer-local indices per monomer and `lengthes` the monomers' original
+        widths, so a column's global index is its local index plus the offset
+        of its monomer. Positions that were never optimized are left at zero.
+
+        Parameters
+        ----------
+        `score` — np.ndarray
+            The (n, n) score over the reduced columns
+        `saved_columns` — list of list of int
+            Per-monomer local indices of the kept columns
+        `lengthes` — list of int
+            Original width of each monomer
+
+        Returns
+        -------
+        `np.ndarray`
+            The score at the full alignment width, or `score` itself when the
+            metadata describes no reduction
+
+        Raises
+        ------
+        `RuntimeError`
+            If the mask keeps a different number of columns than were
+            optimized, which would place every value in the wrong cell
+        """
+        if not saved_columns or not lengthes or len(saved_columns) != len(lengthes):
+            logging.warning(
+                "saved_columns does not describe this alignment; "
+                "writing the score as it is")
+            return score
+
+        columns = []
+        offset = 0
+        for local_cols, length in zip(saved_columns, lengthes):
+            columns.extend(offset + int(col) for col in local_cols)
+            offset += int(length)
+        n_full = offset
+
+        if not columns or len(columns) == n_full:
+            return score  # the mask keeps every column; nothing was dropped
+        if len(columns) != score.shape[0]:
+            raise RuntimeError(
+                f"saved_columns keeps {len(columns)} columns but the score covers "
+                f"{score.shape[0]}; refusing to write a misaligned coupling matrix")
+
+        full = np.zeros((n_full, n_full), dtype=score.dtype)
+        full[np.ix_(columns, columns)] = score
+        return full
 
     @staticmethod
     def compute_score(J, q=21, gap_idx=0):
@@ -658,13 +717,18 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
             align.Reweight_Sequence(reweighting_threshold)
             align.To_Zarr(filename, overwrite=True)
 
+        q = int(align.matrix.max()) + 1
+
+        # Optimize only the columns the gap mask keeps
+        if self.fast_approximation:
+            align.Mask_Gap_Columns(self._config.get('align').get('col_gap_threshold',0.5))
+            align.Drop_Masked_Gap_Columns()
+
         MSA = np.ascontiguousarray(align.matrix, dtype=np.int8)
         B, N = MSA.shape
         W = np.array(align.weights, dtype=np.float64)
         Beff = float(align.Beff)
         W /= Beff
-
-        q = int(MSA.max()) + 1
 
         # Create MSA shared memory
         msa_size = MSA.nbytes
@@ -708,7 +772,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
         maxit = params["maxit"]
         plm_opt_exe = params["plm_opt_exe"]
 
-        if r >= N: 
+        if r >= N:
             logging.error(f"Invalid site index r={r} for {msa_name}, whose N={N}")
             return r, 1  # Invalid site index; return non-zero code to indicate failure
 
@@ -746,14 +810,19 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
         score = self.compute_score(J, q=q).astype(np.float16)
         logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
         grp = zarr.open_group(store=filename)
-        # TODO: Compression need implementing
+        if self.fast_approximation:
+            # Expand the shrinked score matrix to its original size
+            align_attrs = grp['align'].attrs
+            score = self._expand_score(score, align_attrs.get('saved_columns'),
+                                      align_attrs.get('lengthes'))
+        n_full = int(score.shape[0])
         z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
         z[:] = score
 
         result = {
             'id': params["pair_id"],
             'effnumber': params["Beff"],
-            'length': int(params["N"]),
+            'length': n_full,
             'number': int(params["B"]),
             'file_hash': params.get("file_hash"),
         }
@@ -869,15 +938,18 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
             align.Reweight_Sequence(reweighting_threshold, use_GPU=True)
             align.To_Zarr(filename, overwrite=True)
 
+        q = int(align.matrix.max()) + 1
+
+        # Optimize only the columns the gap mask keeps
         if self.fast_approximation:
-            pass
-        else:
-            MSA = np.ascontiguousarray(align.matrix, dtype=np.int8)
+            align.Mask_Gap_Columns(self._config.get('align').get('col_gap_threshold',0.5))
+            align.Drop_Masked_Gap_Columns()
+
+        MSA = np.ascontiguousarray(align.matrix, dtype=np.int8)
         B, N = MSA.shape
         W = np.asarray(align.weights, dtype=np.float64)
         Beff = float(align.Beff)
         W /= Beff
-        q = int(MSA.max()) + 1
 
         # Create MSA shared memory
         msa_size = MSA.nbytes
@@ -964,7 +1036,12 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
 
         logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
         grp = zarr.open_group(store=filename)
-        # TODO: Compression need implementing
+        if self.fast_approximation:
+            # Expand the shrinked score matrix to its original size
+            align_attrs = grp['align'].attrs
+            score = self._expand_score(score, align_attrs.get('saved_columns'),
+                                      align_attrs.get('lengthes'))
+        n_full = int(score.shape[0])
         z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
         z[:] = score
 
@@ -974,7 +1051,7 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
         result = {
             'id': params["pair_id"],
             'effnumber': params["Beff"],
-            'length': int(params["N"]),
+            'length': n_full,
             'number': int(params["B"]),
             'file_hash': params.get("file_hash"),
         }

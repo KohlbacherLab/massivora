@@ -124,7 +124,7 @@ def _run_concatenate(task, monomers_path, output_dir, downsample=False,
             Beff = concatenated_align.Beff
         else:
             Beff = B
-        concatenated_align.Gap_Columns_Control(col_gap_threshold)
+        concatenated_align.Mask_Gap_Columns(col_gap_threshold)
     except Exception as e:
         logging.error(f"Failed to concatenate pair '{name}': {e}")
         return None

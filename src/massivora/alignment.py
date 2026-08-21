@@ -591,7 +591,7 @@ class BinaryAlignment(object):
 
         return new_instance
 
-    def Gap_Columns_Control(self, gap_ratio=0.5):
+    def Mask_Gap_Columns(self, gap_ratio=0.5):
         """
         Before this call, saved_columns is a list of per-monomer masks.
         After this call, it becomes a list of per-monomer per-column index maps
@@ -643,6 +643,49 @@ class BinaryAlignment(object):
                     break
 
         self.saved_columns = new_saved_columns
+
+    def Drop_Masked_Gap_Columns(self):
+        """
+        Shrink `matrix` to the columns that `saved_columns` keeps.
+
+        The sequence weights can be slightly different after dropping columns.
+        Call `Reweight_Sequence` when needed.
+        """
+        saved = getattr(self, 'saved_columns', None)
+        if not saved or not self.lengthes or len(saved) != len(self.lengthes):
+            logger.warning(
+                "saved_columns does not describe this alignment; keeping every column")
+            return
+
+        columns = []
+        offset = 0
+        for local_cols, length in zip(saved, self.lengthes):
+            length = int(length)
+            for col in local_cols:
+                col = int(col)
+                if not 0 <= col < length:
+                    logger.warning(
+                        "saved_columns holds column %d for a monomer of length %d; "
+                        "keeping every column", col, length)
+                    return
+                columns.append(offset + col)
+            offset += length
+
+        n_cols = self.matrix.shape[1]
+        if n_cols != offset:
+            if n_cols == len(columns):
+                logger.debug("Alignment is already reduced to its saved columns")
+            else:
+                logger.warning(
+                    "lengthes sum (%d) does not match the alignment width (%d); "
+                    "keeping every column", offset, n_cols)
+            return
+        if len(columns) == n_cols:
+            logger.debug("The saved columns cover the whole alignment; nothing to drop")
+            return
+
+        self.matrix = np.ascontiguousarray(self.matrix[:, columns])
+        logger.info(f'Alignment reduced: {n_cols} -> {self.matrix.shape[1]} columns')
 
     def Downsample_Randomly(self, to):
         if to >= self.matrix.shape[0]:

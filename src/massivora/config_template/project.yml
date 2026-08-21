@@ -94,6 +94,7 @@ couple:
   lambda_J: 0.01
   eps_conv: 3e-4
   maxit: 200
+  fast_approximation: false
 
   # GaussDCA parameters
   pseudocount: 0.8
