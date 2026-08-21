@@ -344,6 +344,29 @@ __global__ void broadcast_hr_to_energies(
         dst[idx] = __half2float(hr_pad[idx % q_pad]);
 }
 
+/* =========================================================================
+ * msa_one_hot – expand the (B, N) int8 MSA into the (B, N*q_pad) fp16 one-hot
+ *   matrix the pll GEMMs consume:
+ *       MSA_pad[(b*N + i)*q_pad + l] = (l == MSA[b*N + i]) ? 1 : 0
+ *   Building it here keeps a B*N*q_pad*2 byte buffer off the host and off the
+ *   PCIe bus; only the B*N int8 matrix is uploaded.
+ *   Flat grid-stride launch: consecutive threads write consecutive elements.
+ * =========================================================================*/
+__global__ void msa_one_hot(
+    const signed char* __restrict__ MSA,      /* (B, N)       int8 */
+    __half*            __restrict__ MSA_pad,  /* (B, N*q_pad) fp16 */
+    long long total,                          /* B * N * q_pad     */
+    int q_pad)
+{
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += stride) {
+        const int l = (int)(idx % q_pad);
+        const int s = MSA[idx / q_pad];
+        MSA_pad[idx] = __float2half(l == s ? 1.0f : 0.0f);
+    }
+}
+
 extern "C" __global__ void NAdam_step(
     float*             __restrict__ param,        // (n_elem,) fp32 in/out          
     const float*       __restrict__ grad,         // (n_elem,) fp32 read-only

@@ -571,8 +571,8 @@ class BaseCouplingExecutor(object):
 class PLMCouplingExecutor(BaseCouplingExecutor):
     def __init__(self, config):
         super().__init__(config)
-        massivora_dir = massivora_pkg_dir()
-        self.plm_opt_exe = os.path.join(massivora_dir, 'bin', 'plm_opt_site')
+        self.plm_opt_exe = os.path.join(massivora_pkg_dir(), 'bin', 'plm_opt_site')
+        self.fast_approximation = bool(config.get('couple').get('fast_approximation', False))
 
     def _create_cluster(self):
         total_cpus = mp.cpu_count()
@@ -658,7 +658,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
             align.Reweight_Sequence(reweighting_threshold)
             align.To_Zarr(filename, overwrite=True)
 
-        MSA = align.matrix.astype(np.int32)
+        MSA = np.ascontiguousarray(align.matrix, dtype=np.int8)
         B, N = MSA.shape
         W = np.array(align.weights, dtype=np.float64)
         Beff = float(align.Beff)
@@ -668,12 +668,13 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
 
         # Create MSA shared memory
         msa_size = MSA.nbytes
+        w_offset = (msa_size + 7) & ~7
         w_size = W.nbytes
         logging.debug(f"MSA size (bytes): {msa_size}, Weights size (bytes): {w_size}")
         logging.debug(f"MSA dimensions: {MSA.shape}, Weights length: {W.shape}")
-        msa_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +pair_name, create=True, size=msa_size+w_size)
-        msa_arr = np.ndarray(MSA.shape, dtype=np.int32, buffer=msa_shm.buf)
-        w_arr = np.ndarray(W.shape, dtype=np.float64, buffer=msa_shm.buf[msa_size:])
+        msa_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +pair_name, create=True, size=w_offset+w_size)
+        msa_arr = np.ndarray(MSA.shape, dtype=np.int8, buffer=msa_shm.buf)
+        w_arr = np.ndarray(W.shape, dtype=np.float64, buffer=msa_shm.buf[w_offset:])
         np.copyto(msa_arr, MSA)
         np.copyto(w_arr, W)
 
@@ -792,10 +793,10 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
 class PLMCouplingExecutorGPU(BaseCouplingExecutor):
     def __init__(self, config):
         super().__init__(config)
-        massivora_dir = massivora_pkg_dir()
         # Same executable as the CPU path; invoked with --use-gpu so it runs the
         # CUDA code (requires the binary to be built with -DENABLE_CUDA=ON).
-        self.plm_opt_exe = os.path.join(massivora_dir, 'bin', 'plm_opt_site')
+        self.plm_opt_exe = os.path.join(massivora_pkg_dir(), 'bin', 'plm_opt_site')
+        self.fast_approximation = bool(config.get('couple').get('fast_approximation', False))
 
     def _create_cluster(self):
         """Create a Dask cluster with one worker per GPU."""
@@ -868,7 +869,10 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
             align.Reweight_Sequence(reweighting_threshold, use_GPU=True)
             align.To_Zarr(filename, overwrite=True)
 
-        MSA = np.asarray(align.matrix, dtype=np.int32)
+        if self.fast_approximation:
+            pass
+        else:
+            MSA = np.ascontiguousarray(align.matrix, dtype=np.int8)
         B, N = MSA.shape
         W = np.asarray(align.weights, dtype=np.float64)
         Beff = float(align.Beff)
@@ -877,16 +881,17 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
 
         # Create MSA shared memory
         msa_size = MSA.nbytes
+        w_offset = (msa_size + 7) & ~7
         w_size = W.nbytes
         logging.debug(f"Pair {pair_id} '{pair_name}': MSA size (bytes): {msa_size}, Weights size (bytes): {w_size}")
         logging.debug(f"Pair {pair_id} '{pair_name}': MSA dimensions: {MSA.shape}, Weights length: {W.shape}")
         try:
-            msa_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +pair_name, create=True, size=msa_size+w_size)
+            msa_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +pair_name, create=True, size=w_offset+w_size)
         except FileExistsError:
             logging.warning(f"Shared memory for pair {pair_id} '{pair_name}' already exists; reusing it.")
             msa_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +pair_name)
-        msa_arr = np.ndarray(MSA.shape, dtype=np.int32, buffer=msa_shm.buf)
-        w_arr = np.ndarray(W.shape, dtype=np.float64, buffer=msa_shm.buf[msa_size:])
+        msa_arr = np.ndarray(MSA.shape, dtype=np.int8, buffer=msa_shm.buf)
+        w_arr = np.ndarray(W.shape, dtype=np.float64, buffer=msa_shm.buf[w_offset:])
         np.copyto(msa_arr, MSA)
         np.copyto(w_arr, W)
 
@@ -897,12 +902,10 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
             "B": B,
             "N": N,
             "q": q,
-            "MSA": MSA,
-            "W": W,
             "Beff": Beff,
             "file_hash": file_hash
         })
-        del align
+        del MSA, W, align
 
         return kwargs
 

@@ -11,6 +11,24 @@
 #include "cuda_kernels.cuh"
 
 
+extern "C" void cudaBuildMsaOneHot(
+    const signed char* MSA,           /* (B, N)       int8 device ptr */
+    __half*            MSA_pad,       /* (B, N*q_pad) fp16 device ptr */
+    int B, int N, int q_pad,
+    cudaStream_t stream)
+{
+    const long long total = (long long)B * N * q_pad;
+    if (total <= 0) return;
+
+    const int threads = 256;
+    const long long want       = (total + threads - 1) / threads;
+    const long long max_blocks = 65535LL * 16;   /* grid-stride covers the rest */
+    const int blocks = (int)(want < max_blocks ? want : max_blocks);
+
+    msa_one_hot<<<blocks, threads, 0, stream>>>(MSA, MSA_pad, total, q_pad);
+}
+
+
 extern "C" void cudaFillPllGradients(
     const __half*      MSA_pad_flat,  /* (B, N*q_pad)             fp16 device ptr */
     const __half*      x_pad,         /* (q_pad + N*q_pad*q_pad,) fp16 device ptr – x0_pad[r] */

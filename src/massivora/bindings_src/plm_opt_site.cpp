@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstring>
 #include <cstdlib>
+#include <utility>
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -15,6 +16,11 @@
 #include <nlopt.hpp>
 
 using PLMV = double;
+
+// The MSA in Zarr is int8
+using MSAScalar = signed char;
+using MSAMap = Eigen::Map<const Eigen::Matrix<MSAScalar, -1, -1, Eigen::RowMajor>>;
+using WMap   = Eigen::Map<const Eigen::Matrix<PLMV, -1, 1>>;
 
 
 // ===========================================================================
@@ -27,7 +33,7 @@ Eigen::Matrix<PLMV, -1, 1> getEnergies(
     int q,
     int N,
     int b,
-    const Eigen::MatrixXi& MSA) {
+    const MSAMap& MSA) {
 
     Eigen::Matrix<PLMV, -1, 1> energies = Eigen::Matrix<PLMV, -1, 1>::Zero(q);
 
@@ -75,8 +81,8 @@ std::tuple<PLMV, Eigen::Matrix<PLMV, -1, 1>> perSitePllGradient(
     int q,
     int N,
     int B,
-    const Eigen::MatrixXi& MSA,
-    const Eigen::Matrix<PLMV, -1, 1>& W,
+    const MSAMap& MSA,
+    const WMap& W,
     PLMV lambdaH,
     PLMV lambdaJ) {
 
@@ -125,8 +131,8 @@ struct NLoptContext {
     int q = 0;
     int N = 0;
     int B = 0;
-    const Eigen::MatrixXi* MSA = nullptr;
-    const Eigen::Matrix<PLMV, -1, 1>* W = nullptr;
+    const MSAMap* MSA = nullptr;
+    const WMap* W = nullptr;
     PLMV lambdaH = 0.01;
     PLMV lambdaJ = 0.01;
 };
@@ -158,8 +164,8 @@ double pllTarget(const std::vector<double> &x, std::vector<double> &grad, void* 
 
 Eigen::Matrix<PLMV, -1, 1> perSiteNLopt(
     int r,
-    const Eigen::MatrixXi& MSA,
-    const Eigen::Matrix<PLMV, -1, 1>& W,
+    const MSAMap& MSA,
+    const WMap& W,
     int N,
     int B,
     int q,
@@ -207,24 +213,46 @@ void applyIsingGauge(Eigen::Matrix<PLMV, -1, 1>& J, int q) {
 }
 
 
-struct MSAData {
-    Eigen::MatrixXi MSA;
-    Eigen::Matrix<PLMV, -1, 1> W;
-};
-
 struct ShmMapping {
     void* ptr = nullptr;
     size_t size = 0;
     int fd = -1;
 
-    ~ShmMapping() {
-        if (ptr && ptr != MAP_FAILED) {
-            munmap(ptr, size);
-        }
-        if (fd >= 0) {
-            close(fd);
-        }
+    ShmMapping() = default;
+    ShmMapping(const ShmMapping&) = delete;
+    ShmMapping& operator=(const ShmMapping&) = delete;
+
+    // Movable so a mapping can be owned by the MSAData it backs.
+    ShmMapping(ShmMapping&& o) noexcept : ptr(o.ptr), size(o.size), fd(o.fd) {
+        o.ptr = nullptr; o.size = 0; o.fd = -1;
     }
+    ShmMapping& operator=(ShmMapping&& o) noexcept {
+        if (this != &o) {
+            reset();
+            ptr = o.ptr; size = o.size; fd = o.fd;
+            o.ptr = nullptr; o.size = 0; o.fd = -1;
+        }
+        return *this;
+    }
+
+    void reset() {
+        if (ptr && ptr != MAP_FAILED) munmap(ptr, size);
+        if (fd >= 0) close(fd);
+        ptr = nullptr; size = 0; fd = -1;
+    }
+
+    ~ShmMapping() { reset(); }
+};
+
+// MSA and W are views into the mapping this struct keeps alive -- nothing is
+// copied out of shared memory.
+struct MSAData {
+    ShmMapping mapping;
+    MSAMap MSA;
+    WMap   W;
+
+    MSAData(ShmMapping&& m, const MSAScalar* msa_ptr, const PLMV* w_ptr, int B, int N)
+        : mapping(std::move(m)), MSA(msa_ptr, B, N), W(w_ptr, B) {}
 };
 
 static const std::string SHM_PREFIX = "Massivora_";
@@ -256,22 +284,27 @@ ShmMapping openShm(const std::string& name, size_t expected_size = 0) {
     return m;
 }
 
-// Shared-memory layout is identical for the CPU and GPU pipelines:
-//   MSA : (B, N) int32  (row-major)
-//   W   : (B,)   float64
-// The GPU path converts these into the int8 / fp32 / fp16 buffers the CUDA
-// kernels expect after loading.
-const MSAData loadData(const std::string& pairName, int B, int N) {
-    size_t msa_size = (size_t)B * N * sizeof(int);
-    size_t w_size = (size_t)B * sizeof(PLMV);
-    ShmMapping mapping = openShm(pairName, msa_size + w_size);
+// Shared-memory layout, identical for the CPU and GPU pipelines and written by
+// the executors in couple.py:
+//   MSA : (B, N) int8    (row-major, at offset 0)
+//   W   : (B,)   float64 (at msaBytes rounded up to 8, so the doubles are aligned)
+// Both are mapped in place: the CPU path indexes them directly and the GPU path
+// uploads the int8 bytes as-is, so there is no dtype conversion on the host.
+static inline size_t weightsOffset(int B, int N) {
+    const size_t msa_size = (size_t)B * N * sizeof(MSAScalar);
+    return (msa_size + alignof(PLMV) - 1) & ~(size_t)(alignof(PLMV) - 1);
+}
 
-    Eigen::Map<Eigen::Matrix<int, -1, -1, Eigen::RowMajor>> MSA(
-            static_cast<int*>(mapping.ptr), B, N);
+MSAData loadData(const std::string& pairName, int B, int N) {
+    const size_t w_off  = weightsOffset(B, N);
+    const size_t w_size = (size_t)B * sizeof(PLMV);
+    ShmMapping mapping = openShm(pairName, w_off + w_size);
 
-    Eigen::Matrix<PLMV, -1, 1> W(B);
-    std::memcpy(W.data(), static_cast<char*>(mapping.ptr) + msa_size, w_size);
-    return MSAData{MSA, W};
+    char* base = static_cast<char*>(mapping.ptr);
+    const MSAScalar* msa_ptr = reinterpret_cast<const MSAScalar*>(base);
+    const PLMV*      w_ptr   = reinterpret_cast<const PLMV*>(base + w_off);
+
+    return MSAData(std::move(mapping), msa_ptr, w_ptr, B, N);
 }
 
 
@@ -311,8 +344,10 @@ int runGpu(const std::string& pairName, int B, int N, int q,
            float lambdaH, float lambdaJ, float eps_conv, int maxeval,
            int n_streams) {
     MSAData data = loadData(pairName, B, N);
-    const Eigen::MatrixXi& MSA = data.MSA;
-    const Eigen::Matrix<PLMV, -1, 1>& W = data.W;
+    // Points straight into the shared-memory mapping; already the dtype the
+    // kernels want, so it is uploaded byte-for-byte.
+    const MSAScalar* msaHost = data.MSA.data();
+    const WMap& W = data.W;
 
     const int q_pad = ((q + 7) / 8) * 8;
     const size_t n_params = (size_t)q_pad + (size_t)N * q_pad * q_pad;
@@ -320,20 +355,12 @@ int runGpu(const std::string& pairName, int B, int N, int q,
     // size the stream budget below.
     const int m_corr_hint = 8;
 
-    // ---- Convert host inputs into the dtypes the CUDA kernels expect ----
-    std::vector<signed char> msaHost((size_t)B * N);
-    std::vector<float>        wHost((size_t)B);
-    std::vector<__half>       msaPadHost((size_t)B * N * q_pad, __float2half(0.0f));
-
-    for (int b = 0; b < B; ++b) {
-        wHost[b] = static_cast<float>(W(b));
-        for (int i = 0; i < N; ++i) {
-            const int s = MSA(b, i);
-            msaHost[(size_t)b * N + i] = static_cast<signed char>(s);
-            // One-hot encode into (B, N, q_pad) fp16.
-            msaPadHost[((size_t)b * N + i) * q_pad + s] = __float2half(1.0f);
-        }
-    }
+    // ---- The only host-side conversion left is the (B,) weight vector ----
+    // The MSA goes up as the int8 it already is, and the (B, N, q_pad) fp16
+    // one-hot is expanded on the device (see cudaBuildMsaOneHot below), so it
+    // never costs B*N*q_pad*2 bytes of host RAM nor the same again over PCIe.
+    std::vector<float> wHost((size_t)B);
+    for (int b = 0; b < B; ++b) wHost[b] = static_cast<float>(W(b));
 
     // ---- Upload to device ----
     signed char* d_MSA      = nullptr;
@@ -344,27 +371,28 @@ int runGpu(const std::string& pairName, int B, int N, int q,
     // and keep the rest on CPU.
     __half*      d_x0       = nullptr;  // (N, n_params) fp16, one row per site
 
-    CUDA_CHECK(cudaMalloc(&d_MSA,     msaHost.size()    * sizeof(signed char)));
-    CUDA_CHECK(cudaMalloc(&d_W,       wHost.size()      * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_MSA_pad, msaPadHost.size() * sizeof(__half)));
+    const size_t msa_elems     = (size_t)B * N;
+    const size_t msa_pad_elems = msa_elems * (size_t)q_pad;
+
+    CUDA_CHECK(cudaMalloc(&d_MSA,     msa_elems    * sizeof(signed char)));
+    CUDA_CHECK(cudaMalloc(&d_W,       wHost.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_MSA_pad, msa_pad_elems * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_x0,      (size_t)N * n_params * sizeof(__half)));
 
-    CUDA_CHECK(cudaMemcpy(d_MSA,     msaHost.data(),
-                          msaHost.size() * sizeof(signed char), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_W,       wHost.data(),
-                          wHost.size() * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_MSA_pad, msaPadHost.data(),
-                          msaPadHost.size() * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_MSA, msaHost, msa_elems * sizeof(signed char),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W,   wHost.data(), wHost.size() * sizeof(float),
+                          cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_x0, 0, (size_t)N * n_params * sizeof(__half)));
 
-    // Host one-hot is no longer needed; free it before the GPU optimization.
-    std::vector<__half>().swap(msaPadHost);
+    // Expand the one-hot on the device from the int8 MSA. It runs on the legacy
+    // default stream, which the per-site non-blocking streams do NOT sync
+    // against, so the barrier below is what makes it visible to them.
+    cudaBuildMsaOneHot(d_MSA, d_MSA_pad, B, N, q_pad, /*stream=*/0);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // ---- Cap n_streams to what actually fits in free device memory ----
-    // Each concurrent cudaOptimizeSite call allocates its own scratch buffers.
-    // The one-hot MSA is no longer among them -- it is shared read-only across
-    // sites -- so per-stream cost is now dominated by the L-BFGS state, and far
-    // more streams fit than before.
     if (n_streams < 1) n_streams = 1;
     {
         const size_t per_stream =

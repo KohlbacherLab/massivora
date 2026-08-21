@@ -10,6 +10,18 @@ from massivora.executors.couple import BaseCouplingExecutor
 from massivora.analyzer import ComplexAnalyzer, MonomerAnalyzer
 import zarr
 
+def write_plm_shm(name, MSA, W):
+    assert MSA.dtype == np.int8, f"MSA must be int8, got {MSA.dtype}"
+    msa_size = MSA.nbytes
+    w_offset = (msa_size + 7) & ~7
+    shm = shared_memory.SharedMemory(name=name, create=True, size=w_offset + W.nbytes)
+    msa_arr = np.ndarray(MSA.shape, dtype=np.int8, buffer=shm.buf)
+    w_arr = np.ndarray(W.shape, dtype=np.float64, buffer=shm.buf[w_offset:])
+    np.copyto(msa_arr, MSA)
+    np.copyto(w_arr, W)
+    return shm
+
+
 J_file = os.path.join(os.path.dirname(__file__), "J.npy")
 TEST_ZARR = os.path.join(os.path.dirname(__file__), "RL4_ECOLI-RL31_ECOLI")
 STANDARD_SCORE = os.path.join(os.path.dirname(__file__), "score.npy")
@@ -24,7 +36,7 @@ def test_compute_score():
 
 def test_coupling_CPU():
     align = BinaryAlignment(TEST_ZARR)
-    MSA = align.matrix.astype(np.int32)
+    MSA = np.ascontiguousarray(align.matrix, dtype=np.int8)
     B, N = MSA.shape
     print(f"MSA shape: {MSA.shape}, Beff: {align.Beff}", flush=True)
     W = np.array(align.weights, dtype=np.float64)
@@ -33,13 +45,7 @@ def test_coupling_CPU():
 
     q = int(MSA.max()) + 1
 
-    msa_size = MSA.nbytes
-    w_size = W.nbytes
-    msa_shm = shared_memory.SharedMemory(name="Massivora_RL4_ECOLI-RL31_ECOLI", create=True, size=msa_size+w_size)
-    msa_arr = np.ndarray(MSA.shape, dtype=np.int32, buffer=msa_shm.buf)
-    w_arr = np.ndarray(W.shape, dtype=np.float64, buffer=msa_shm.buf[msa_size:])
-    np.copyto(msa_arr, MSA)
-    np.copyto(w_arr, W)
+    msa_shm = write_plm_shm("Massivora_RL4_ECOLI-RL31_ECOLI", MSA, W)
 
     J_shm = shared_memory.SharedMemory(name="Massivora_RL4_ECOLI-RL31_ECOLI_J", create=True, size=N*N*q*q*8)
 
@@ -94,7 +100,7 @@ def test_coupling_GPU_executable():
         assert False, "GPU is not available for testing"
 
     align = BinaryAlignment(TEST_ZARR)
-    MSA = align.matrix.astype(np.int32)
+    MSA = np.ascontiguousarray(align.matrix, dtype=np.int8)
     B, N = MSA.shape
     print(f"MSA shape: {MSA.shape}, Beff: {align.Beff}", flush=True)
     W = np.array(align.weights, dtype=np.float64)
@@ -103,14 +109,7 @@ def test_coupling_GPU_executable():
 
     q = int(MSA.max()) + 1
 
-    # Shared-memory layout is identical to the CPU pipeline: int32 MSA + float64 W.
-    msa_size = MSA.nbytes
-    w_size = W.nbytes
-    msa_shm = shared_memory.SharedMemory(name="Massivora_RL4_ECOLI-RL31_ECOLI", create=True, size=msa_size+w_size)
-    msa_arr = np.ndarray(MSA.shape, dtype=np.int32, buffer=msa_shm.buf)
-    w_arr = np.ndarray(W.shape, dtype=np.float64, buffer=msa_shm.buf[msa_size:])
-    np.copyto(msa_arr, MSA)
-    np.copyto(w_arr, W)
+    msa_shm = write_plm_shm("Massivora_RL4_ECOLI-RL31_ECOLI", MSA, W)
 
     # The GPU executable writes J as float32 (4 bytes), unlike the CPU's float64.
     J_shm = shared_memory.SharedMemory(name="Massivora_RL4_ECOLI-RL31_ECOLI_J", create=True, size=N*N*q*q*4)

@@ -1,6 +1,15 @@
 #ifndef BINDINGS_CUH
 #define BINDINGS_CUH
 
+/* Expand the (B, N) int8 MSA already resident on the device into the
+ * (B, N*q_pad) fp16 one-hot matrix the pll GEMMs consume. */
+extern "C" void cudaBuildMsaOneHot(
+    const signed char* MSA,
+    __half*            MSA_pad,
+    int B, int N, int q_pad,
+    cudaStream_t stream
+);
+
 extern "C" void cudaFillPllGradients(
     const __half*      MSA_pad_flat,
     const __half*      x_pad,
