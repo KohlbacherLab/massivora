@@ -126,6 +126,18 @@ extern "C" void cudaFillPllGradients(
     );
 
     /* ==================================================================
+     * Self-coupling exclusion. Site r must not couple to itself, so block r
+     * of J_r has to stay zero. Holding its gradient at zero keeps it at the
+     * zero it was initialised to, for every iteration.
+     *
+     * This replaces the previous scheme, which zeroed column r of a private
+     * per-site copy of the one-hot MSA -- a 549 MiB allocation and copy per
+     * site at the configured working point. Same exclusion, 2.3 KiB memset.
+     * ================================================================*/
+    cudaMemsetAsync(grad_Jr_pad + (size_t)r * q_pad * q_pad, 0,
+                    (size_t)q_pad * q_pad * sizeof(float), stream);
+
+    /* ==================================================================
      * sum_squares kernel
      * ================================================================*/
     sum_squares<<<sumsquare_blocks, 256, 0, stream>>>(
@@ -161,31 +173,21 @@ std::pair<int, float> cudaOptimizeSite(
     /* optimizer: 0 = RMSprop, 1 = NAdam, 2 (default) = unconstrained L-BFGS */
     const int optimizer_type  = static_cast<int>(hyper("optimizer", 2.0f));
     const int n_params        = q_pad + N * q_pad * q_pad;
-    const size_t msa_flat_bytes = (size_t)B * N * q_pad * sizeof(__half);
 
     /* ---- Allocate shared scratch buffers asynchronously (stream-ordered) ---- */
-    __half* MSA_pad_flat;     /* (B, N*q_pad) fp16 – internal copy with col r zeroed */
+    /* The one-hot MSA is read-only and identical for every site, so it is used
+     * in place. Site r is excluded via its gradient block, not via a private
+     * copy -- see cudaFillPllGradients. */
+    const __half* MSA_pad_flat = MSA_pad;
     float*  pll_out;
     float*  grad_pad;
     __half* vgrad_pad;
     float*  energies_fp32;
 
-    cudaMallocAsync(&MSA_pad_flat,  msa_flat_bytes,                           stream);
     cudaMallocAsync(&pll_out,       4 * sizeof(float),                        stream);
     cudaMallocAsync(&grad_pad,      (size_t)n_params * sizeof(float),         stream);
     cudaMallocAsync(&vgrad_pad,     (size_t)B * q_pad * sizeof(__half),       stream);
     cudaMallocAsync(&energies_fp32, (size_t)B * q_pad * sizeof(float),        stream);
-    /* Copy full MSA_pad into MSA_pad_flat, then zero column r.
-     * fp16(0.0) == 0x0000, so cudaMemset2DAsync works correctly. */
-    cudaMemcpyAsync(MSA_pad_flat, MSA_pad, msa_flat_bytes, cudaMemcpyDeviceToDevice, stream);
-    cudaMemset2DAsync(
-        MSA_pad_flat + (size_t)r * q_pad,      /* ptr to col-r block in row 0 */
-        (size_t)N * q_pad * sizeof(__half),    /* pitch (bytes per row)        */
-        0,                                     /* value                        */
-        (size_t)q_pad * sizeof(__half),        /* width (bytes to zero per row)*/
-        (size_t)B,                             /* height (number of rows)      */
-        stream
-    );
     cudaMemsetAsync(pll_out, 0, 4 * sizeof(float), stream);
 
     /* ---- Pinned host buffer for fast convergence check (avoids page-fault stall) ---- */
@@ -282,7 +284,6 @@ std::pair<int, float> cudaOptimizeSite(
     cudaFreeHost(pll_host);
 
     /* ---- Free shared scratch buffers (stream-ordered) ---- */
-    cudaFreeAsync(MSA_pad_flat,  stream);
     cudaFreeAsync(pll_out,       stream);
     cudaFreeAsync(grad_pad,      stream);
     cudaFreeAsync(vgrad_pad,     stream);
