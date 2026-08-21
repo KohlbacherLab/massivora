@@ -704,7 +704,7 @@ class BinaryAlignment(object):
         self.weights = w.tolist()
         self.Beff = float(w.sum())
 
-    def To_Text(self, restore_gaps=True, filename=None):
+    def To_Text(self, filename=None, restore_gaps=True):
         # Create reverse mapping from numbers back to characters
         valid_chars = 'acdefghiklmnpqrstvwy-ACDEFGHIKLMNPQRSTVWY'
         values = np.arange(-20, 21, dtype=np.int8)

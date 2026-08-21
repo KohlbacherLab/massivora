@@ -1,22 +1,21 @@
 import logging
-import zarr
-import os
-import pickle
 
-import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
-from scipy.stats import spearmanr, ecdf
+import numpy as np
+import pandas as pd
+import zarr
 from ost import io
 from ost.geom import MinDistance, Vec3List
+from scipy.stats import ecdf, spearmanr
 
 logger = logging.getLogger(__name__)
 
 class BaseAnalyzer(object):
-    def __init__(self, EC_threshold=0.7, distance_cutoff=8, min_seq_length=1):
+    def __init__(self, EC_threshold=0.7, group_name="couplings", distance_cutoff=8, min_seq_length=1):
         self.distance_cutoff = distance_cutoff
         self.EC_threshold = EC_threshold
         self.min_seq_length = min_seq_length
+        self.group_name = group_name
 
     @staticmethod
     def _to_one_based_labels(labels):
@@ -112,14 +111,14 @@ class BaseAnalyzer(object):
         data = pd.DataFrame(arr)
         return self._ensure_one_based_df(data)
 
-    def ParseZarrOutput(self, ECfile):
+    def ParseZarrOutput(self, ECfile, group_name="couplings"):
         try:
             grp = zarr.open_group(ECfile, mode='r')
         except Exception as e:
             logger.error(f"Error opening Zarr file {ECfile}: {e}")
             return pd.DataFrame(), None
         saved_columns = grp["align"].attrs.get('saved_columns', None)
-        arr = grp["couplings"][:]
+        arr = grp[group_name][:]
         data = pd.DataFrame(arr)
         data = self._ensure_one_based_df(data)
         return data, saved_columns
@@ -163,8 +162,8 @@ class BaseAnalyzer(object):
         return res
 
 class MonomerAnalyzer(BaseAnalyzer):
-    def __init__(self, structure_file=None, chain_name=None, ECfile_baseline=None, EC_threshold=0.7, distance_cutoff=8, min_seq_length=1):
-        super().__init__(EC_threshold, distance_cutoff, min_seq_length)
+    def __init__(self, ECfile_baseline=None, group_name="couplings", structure_file=None, chain_name=None, EC_threshold=0.7, distance_cutoff=8, min_seq_length=1):
+        super().__init__(EC_threshold, group_name, distance_cutoff, min_seq_length)
         self.nTP = None
         self.positive_couplings = None
         if structure_file is not None:
@@ -189,21 +188,7 @@ class MonomerAnalyzer(BaseAnalyzer):
         elif isinstance(ECfile_baseline, np.ndarray):
             self.raw_couplings = pd.DataFrame(ECfile_baseline)
         else:
-            self.raw_couplings, _ = self.ParseZarrOutput(ECfile_baseline)
-        self.positive_couplings = self.AnalyzeCouplings()
-        if not self.positive_couplings: 
-            self.positive_couplings = {}
-            print(f'No couplings found under the threshold {self.EC_threshold}')
-
-    def AnalyzeCouplings(self):
-        positives = {}
-        for pair, score in self.raw_couplings.items():
-            pos1, pos2 = pair
-            if score >= self.EC_threshold:
-                if abs(pos1 - pos2) >= self.min_seq_length:
-                    positives[(pos1, pos2)] = score
-        if not positives: return None
-        return positives
+            self.raw_couplings, _ = self.ParseZarrOutput(ECfile_baseline, self.group_name)
 
     def TruePositiveCount(self):
         if not self.nTP:
@@ -231,10 +216,23 @@ class MonomerAnalyzer(BaseAnalyzer):
         Tuple[float, float]
             The Spearman correlation coefficient and p-value.
         """
-        if not query_analyzer:
-            return 0, 0
-        ranked_baseline = dict(sorted(self.raw_couplings.items(), key=lambda item: (item[0][0], item[0][1])))
-        ranked_query = dict(sorted(query_analyzer.raw_couplings.items(), key=lambda item: (item[0][0], item[0][1])))
+        def _df_to_pair_dict(df):
+            dfn = df.apply(pd.to_numeric, errors="coerce")
+            stacked = dfn.stack(future_stack=True)
+            return {(i, j): float(v) for (i, j), v in stacked.items()}
+
+        ranked_baseline = dict(
+            sorted(
+                _df_to_pair_dict(self.raw_couplings).items(),
+                key=lambda item: (item[0][0], item[0][1]),
+            )
+        )
+        ranked_query = dict(
+            sorted(
+                _df_to_pair_dict(query_analyzer.raw_couplings).items(),
+                key=lambda item: (item[0][0], item[0][1]),
+            )
+        )
         corr, pval = super().SpearmanCorrelation(ranked_baseline, ranked_query)
         return float(corr), float(pval)
 
@@ -301,8 +299,8 @@ class MonomerAnalyzer(BaseAnalyzer):
         return plt.gcf()
 
 class ComplexAnalyzer(BaseAnalyzer):
-    def __init__(self, ECfile_baseline=None, saved_columns=None, EC_threshold=0.7, structure_file=None, chainA_name="A", chainA_length=None, chainB_name=None, distance_cutoff=8, switch_order=False):
-        super().__init__(EC_threshold, distance_cutoff)
+    def __init__(self, ECfile_baseline=None, group_name="couplings", saved_columns=None, EC_threshold=0.7, structure_file=None, chainA_name="A", chainA_length=None, chainB_name=None, distance_cutoff=8, switch_order=False):
+        super().__init__(EC_threshold, group_name, distance_cutoff)
         self.nTP = None
         self.positive_couplings = pd.DataFrame()
         self.saved_columns = saved_columns
@@ -319,12 +317,14 @@ class ComplexAnalyzer(BaseAnalyzer):
         self.interface = self.AnalyzeProteinInterface(chainA_handle, chainB_handle, self.distance_cutoff)
 
     def ReadCouplings(self, ECfile_baseline, switch_order=False):
+        # Python object as input: either a DataFrame or a numpy array
         if isinstance(ECfile_baseline, pd.DataFrame):
             self.raw_couplings = self._ensure_one_based_df(ECfile_baseline)
             self.interprotein_couplings = self._ensure_one_based_df(ECfile_baseline)
         elif isinstance(ECfile_baseline, np.ndarray):
             self.raw_couplings = self._ensure_one_based_df(pd.DataFrame(ECfile_baseline))
             self.AnalyzeInterProteinCouplings(chainA_length=self.chainA_length, saved_columns=self.saved_columns)
+        # File input: determine the format based on the file extension
         else:
             if ECfile_baseline.endswith('.csv'):
                 self.raw_couplings = self.ParseCSVOutput(ECfile_baseline)
@@ -333,7 +333,8 @@ class ComplexAnalyzer(BaseAnalyzer):
             elif ECfile_baseline.endswith('.npy'):
                 self.raw_couplings = self.ParseNumpyOutput(ECfile_baseline)
             else:
-                self.raw_couplings, self.saved_columns = self.ParseZarrOutput(ECfile_baseline)
+                # Zarr format has no extension, we treat it as the default case
+                self.raw_couplings, self.saved_columns = self.ParseZarrOutput(ECfile_baseline, self.group_name)
             self.raw_couplings = self._ensure_one_based_df(self.raw_couplings)
             self.AnalyzeInterProteinCouplings(chainA_length=self.chainA_length, saved_columns=self.saved_columns)
         self.interprotein_couplings = self._ensure_one_based_df(self.interprotein_couplings)
@@ -341,7 +342,7 @@ class ComplexAnalyzer(BaseAnalyzer):
             self.interprotein_couplings = self.interprotein_couplings.T
         self.AnalyzePositiveCouplings()
 
-    def AnalyzeInterProteinCouplings(self, chainA_length=None, saved_columns=None, switch_order=False):
+    def AnalyzeInterProteinCouplings(self, chainA_length=None, saved_columns=None):
         # Determine inter-protein extraction method:
         # chainA_length takes precedence; then an explicit saved_columns; then columns
         # embedded in the zarr file; raise only if none of these are available.

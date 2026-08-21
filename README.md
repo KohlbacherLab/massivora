@@ -98,7 +98,7 @@ python -c "import massivora, os, subprocess; \
 ```
 
 ```
-cov_bytes=8
+cov_bytes=4
 blas_int_bytes=8
 ilp64=1
 ```
