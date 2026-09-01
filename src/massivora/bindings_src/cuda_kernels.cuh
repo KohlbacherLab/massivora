@@ -95,6 +95,95 @@ extern "C" __global__ void fused_vgrad(
     }
 }
 
+extern "C" __global__ void fused_vgrad_h(
+    const float*       __restrict__ energies,   // (B, q_pad) float32 
+    const signed char* __restrict__ MSA,        // (B, N)     int8    
+    const float*       __restrict__ W,          // (B,)       float32 
+    const __half*      __restrict__ hr_pad,     /* (q_pad,) fp16 field, added here instead of a broadcast kernel */
+    int r,
+    int B,
+    int N,
+    int q,                                      
+    int q_pad,
+    float* __restrict__ pll_out,                // (1,)       float32 – atomic 
+    float* __restrict__ grad_h,                 // (q_pad,)   float32 – atomic 
+    __half* __restrict__ vgrad_pad              // (B, q_pad) float16 
+)
+{
+    // Thread layout mirrors the Python kernel:
+    //   blockDim.x = q_pad   (tx iterates over alphabet dimension)
+    //   blockDim.y = nb      (ty iterates over sequences within the block)
+    //   b = blockIdx.x * blockDim.y + ty
+
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+    const int b  = blockIdx.x * blockDim.y + ty;
+
+    if (b >= B || tx >= q_pad) return;
+
+    __shared__ float sh_E   [MAX_NB][MAX_Q];
+    __shared__ float sh_logZ[MAX_NB];
+
+    // ------------------------------------------------------------------ 
+    // 1. Load energy into shared memory (zero-pad if tx >= q)             
+    // ------------------------------------------------------------------ 
+    sh_E[ty][tx] = (tx < q) ? energies[b * q_pad + tx] + __half2float(hr_pad[tx]) : 0.0f;
+    __syncthreads();
+
+    // ------------------------------------------------------------------ 
+    // 2. logsumexp per sequence b – computed by thread tx == 0            
+    // ------------------------------------------------------------------ 
+    if (tx == 0) {
+        float max_e = sh_E[ty][0];
+        for (int l = 1; l < q; ++l) {
+            float v = sh_E[ty][l];
+            if (v > max_e) max_e = v;
+        }
+
+        float sum_exp = 0.0f;
+        for (int l = 0; l < q; ++l)
+            sum_exp += expf(sh_E[ty][l] - max_e);
+
+        sh_logZ[ty] = max_e + logf(sum_exp);
+    }
+    __syncthreads();
+
+    const float logZ = sh_logZ[ty];
+
+    // ------------------------------------------------------------------ 
+    // 3. Softmax probability p_l = exp(E_l - logZ)                        
+    // ------------------------------------------------------------------ 
+    const float p_l = (tx < q) ? expf(sh_E[ty][tx] - logZ) : 0.0f;
+
+    // ------------------------------------------------------------------ 
+    // 4. vgrad = W[b] * (indicator(tx == s_r) - p_l)                     
+    // ------------------------------------------------------------------ 
+    const int   s_r = (int)MSA[b * N + r];
+    const float w_b = W[b];
+
+    if (tx < q) {
+        const float vg = (tx == s_r) ? w_b * (1.0f - p_l)
+                                      : -w_b * p_l;
+
+        // grad_h[tx] -= vg  (accumulate over all b) 
+        atomicAdd(&grad_h[tx], -vg);
+
+        // store fp16 vgrad for downstream GEMM 
+        vgrad_pad[b * q_pad + tx] = __float2half(vg);
+    } else {
+        vgrad_pad[b * q_pad + tx] = __float2half(0.0f);
+    }
+
+    // ------------------------------------------------------------------ 
+    // 5. PLL contribution: -w_b * (E[s_r] - logZ)                        
+    //    One thread per sequence (tx == 0) to avoid redundant adds.       
+    // ------------------------------------------------------------------ 
+    if (tx == 0) {
+        const float e_sr = sh_E[ty][s_r];
+        atomicAdd(pll_out, -w_b * (e_sr - logZ));
+    }
+}
+
 /* =========================================================================
  * pairwise_similarity - sequence reweighting neighbour counts.
  *

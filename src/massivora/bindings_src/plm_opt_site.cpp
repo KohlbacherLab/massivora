@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
 #include <utility>
 
 #include <sys/mman.h>
@@ -317,6 +318,7 @@ MSAData loadData(const std::string& pairName, int B, int N) {
 #include <cublas_v2.h>
 #include <map>
 #include <thread>
+#include <atomic>
 #include "bindings.cuh"
 
 #define CUDA_CHECK(call)                                                       \
@@ -388,6 +390,18 @@ int runGpu(const std::string& pairName, int B, int N, int q,
     // Expand the one-hot on the device from the int8 MSA. It runs on the legacy
     // default stream, which the per-site non-blocking streams do NOT sync
     // against, so the barrier below is what makes it visible to them.
+    // Keep the async-alloc pool warm across sites: the default release
+    // threshold (0) returns freed memory to the OS at every sync point, so the
+    // per-site cudaMallocAsync/cudaFreeAsync churn pays real page-map cost.
+    {
+        int dev = 0; cudaGetDevice(&dev);
+        cudaMemPool_t pool;
+        if (cudaDeviceGetDefaultMemPool(&pool, dev) == cudaSuccess) {
+            uint64_t thresh = ~0ull;
+            cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &thresh);
+        }
+    }
+
     cudaBuildMsaOneHot(d_MSA, d_MSA_pad, B, N, q_pad, /*stream=*/0);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -424,6 +438,7 @@ int runGpu(const std::string& pairName, int B, int N, int q,
 
     // ---- Optimize every site, distributing them across CUDA streams ----
 
+    std::atomic<int> next_site{0};
     auto worker = [&](int tid) {
         cudaStream_t stream;
         cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
@@ -434,7 +449,9 @@ int runGpu(const std::string& pairName, int B, int N, int q,
         // site. Hoisting it is worth ~1.25x on the whole optimize phase.
         cublasHandle_t handle;
         cublasCreate(&handle);
-        for (int r = tid; r < N; r += n_streams) {
+        for (int r = next_site.fetch_add(1, std::memory_order_relaxed);
+             r < N;
+             r = next_site.fetch_add(1, std::memory_order_relaxed)) {
             cudaOptimizeSite(
                 d_MSA_pad, d_MSA, d_W,
                 r, B, N, q, q_pad,

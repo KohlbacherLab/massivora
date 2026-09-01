@@ -11,6 +11,15 @@
 #include "cuda_kernels.cuh"
 #include "bindings.cuh"
 
+extern "C" void cudaFillPllGradients_F(
+    const __half*, const __half*, const signed char*, const float*,
+    int, int, int, int, int, float, float,
+    float*, float*, __half*, float*, cublasHandle_t, cudaStream_t);
+extern "C" void cudaFillPllGradients_G(
+    const __half*, const __half*,
+    int, int, int, int, int, float, float,
+    float*, __half*, cublasHandle_t, cudaStream_t);
+
 namespace cg = cooperative_groups;
 
 /* =========================================================================
@@ -147,6 +156,20 @@ __global__ void lbfgs_axpby(float* out, const float* x, const float* y,
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += gridDim.x * blockDim.x)
         out[i] = a * x[i] + b * y[i];
+}
+
+/* History commit, fused (P4): sv = x_trial - x, yv = grad - g_cur, and
+ * g_cur <- grad, one pass. Same arithmetic shape as lbfgs_axpby(a=1,b=-1). */
+__global__ void lbfgs_hist_commit(float* sv, float* yv, float* g_cur,
+                                  const float* x_trial, const float* x_fp32,
+                                  const float* grad, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        sv[i] = 1.0f * x_trial[i] + (-1.0f) * x_fp32[i];
+        const float g = grad[i];
+        yv[i] = 1.0f * g + (-1.0f) * g_cur[i];
+        g_cur[i] = g;
+    }
 }
 
 /* First two-loop sweep, fused: alpha = rho·dot; *alpha_out = alpha; q -= alpha·y.
@@ -424,17 +447,34 @@ struct LBFGS_Unconstrained {
      *   GEMMs consume. cudaFillPllGradients needs host-pointer cuBLAS scalars,
      *   so we drop to HOST pointer mode for the call and restore DEVICE after.
      * ===================================================================*/
-    void evaluate(const float* x_in) {
+    /* f-only evaluation: GEMM1 + fused_vgrad + sum_squares + pll_l2. Leaves
+     * vgrad_pad ready for the gradient suffix. A rejected line-search trial
+     * never pays for GEMM2/grad_l2. */
+    void evaluate_f(const float* x_in) {
         float2half_copy<<<param_blks, 256, 0, stream_>>>(x_in, x_pad, n_params);
-        broadcast_hr_to_energies<<<(B * q_pad + 255) / 256, 256, 0, stream_>>>(
-            x_pad, energies_fp32, q_pad, B * q_pad);
+        /* N2: no broadcast -- energies is zeroed in _F and h is added in
+         * fused_vgrad_h, keeping GEMM1's call (and kernel selection) identical. */
 
         cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST);
         cublasSetStream(handle, stream_);
-        cudaFillPllGradients(
+        cudaFillPllGradients_F(
             MSA_pad_flat, x_pad, MSA, W,
             r, B, N, q, q_pad, lambdaH, lambdaJ,
             pll_out, grad_pad, vgrad_pad, energies_fp32,
+            handle, stream_);
+        cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_DEVICE);
+    }
+
+    /* gradient suffix for the point last passed to evaluate_f: GEMM2 +
+     * grad_l2 + self-coupling memset, identical kernels and order as the
+     * unsplit path. Call exactly once per accepted point. */
+    void complete_grad() {
+        cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST);
+        cublasSetStream(handle, stream_);
+        cudaFillPllGradients_G(
+            MSA_pad_flat, x_pad,
+            r, B, N, q, q_pad, lambdaH, lambdaJ,
+            grad_pad, vgrad_pad,
             handle, stream_);
         cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_DEVICE);
     }
@@ -556,7 +596,8 @@ struct LBFGS_Unconstrained {
         half2float_copy<<<param_blks, 256, 0, stream_>>>(x_pad, x_fp32, n_params);
 
         /* initial evaluation: f0, g0 */
-        evaluate(x_fp32);
+        evaluate_f(x_fp32);
+        complete_grad();
         cudaMemcpyAsync(g_cur, grad_pad, nbytes,
                         cudaMemcpyDeviceToDevice, stream_);
         float f_cur = read_scalar(&pll_out[1]);
@@ -595,10 +636,11 @@ struct LBFGS_Unconstrained {
                 lbfgs_axpby<<<param_blks, 256, 0, stream_>>>(
                     x_trial, x_fp32, dir, 1.0f, step, n_params);
 
-                evaluate(x_trial);
+                evaluate_f(x_trial);
                 f_trial = read_scalar(&pll_out[1]);
 
                 if (f_trial <= f_cur + kArmijoC1 * step * gTd) {
+                    complete_grad();   /* gradient only for the accepted point */
                     accepted = true;
                     break;
                 }
@@ -612,10 +654,8 @@ struct LBFGS_Unconstrained {
             const int slot = head;
             float* sv = s_buf + (size_t)slot * n_params;
             float* yv = y_buf + (size_t)slot * n_params;
-            lbfgs_axpby<<<param_blks, 256, 0, stream_>>>(
-                sv, x_trial, x_fp32, 1.0f, -1.0f, n_params);
-            lbfgs_axpby<<<param_blks, 256, 0, stream_>>>(
-                yv, grad_pad, g_cur, 1.0f, -1.0f, n_params);
+            lbfgs_hist_commit<<<param_blks, 256, 0, stream_>>>(
+                sv, yv, g_cur, x_trial, x_fp32, grad_pad, n_params);
             cublasSdot(handle, n_params, yv, 1, sv, 1, T(WS_SY));
             lbfgs_rho<<<1, 1, 0, stream_>>>(RHO(slot), T(WS_SY));
             head = (head + 1) % m_corr;
@@ -624,8 +664,7 @@ struct LBFGS_Unconstrained {
             /* commit accepted step: x_trial becomes the new x_fp32 by pointer
              * swap (no copy); g_cur <- ∇f at the accepted point. */
             std::swap(x_fp32, x_trial);
-            cudaMemcpyAsync(g_cur, grad_pad, nbytes,
-                            cudaMemcpyDeviceToDevice, stream_);
+            /* g_cur already updated inside lbfgs_hist_commit (P4) */
             const float f_prev = f_cur;
             f_cur = f_trial;
 

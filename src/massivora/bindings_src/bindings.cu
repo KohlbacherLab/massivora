@@ -170,6 +170,186 @@ extern "C" void cudaFillPllGradients(
 }
 
 
+extern "C" void cudaFillPllGradients_F(
+    const __half*      MSA_pad_flat,  /* (B, N*q_pad)             fp16 device ptr */
+    const __half*      x_pad,         /* (q_pad + N*q_pad*q_pad,) fp16 device ptr – x0_pad[r] */
+    const signed char* MSA,           /* (B, N)                   int8 device ptr */
+    const float*       W,             /* (B,)                     fp32 device ptr */
+    int r, int B, int N, int q, int q_pad,
+    float lambdaH, float lambdaJ,
+    float* pll_out,                   /* (4,)                     fp32 – [0]=prev kept, [1:] zeroed */
+    float* grad_pad,                  /* (q_pad + N*q_pad*q_pad,) fp32 – zeroed internally */
+    __half* vgrad_pad,                /* (B, q_pad)               fp16 – scratch, zeroed internally */
+    float*  energies_fp32,            /* (B, q_pad)               fp32 – scratch, caller-allocated */
+    cublasHandle_t ext_handle,        /* pass nullptr to create internally */
+    cudaStream_t stream = 0           /* CUDA stream (default: null stream) */
+)
+{
+    const int Jr_pad_total_params = N * q_pad * q_pad;
+    const int x_pad_total         = q_pad + Jr_pad_total_params;
+    const int sumsquare_blocks    = (Jr_pad_total_params + 255) / 256;
+    const int nb                  = 10;
+    const dim3 threads_vgrad(q_pad, nb);
+    const dim3 blocks_vgrad((B + nb - 1) / nb);
+
+    /* ------------------------------------------------------------------
+     * Split flat buffers into h and J views (no copy – pointer arithmetic)
+     * ----------------------------------------------------------------*/
+    const __half* hr_pad     = x_pad;           /* (q_pad,)          fp16 */
+    const __half* Jr_pad     = x_pad + q_pad;   /* (N*q_pad, q_pad)  fp16 */
+    float*        grad_hr_pad = grad_pad;        /* (q_pad,)          fp32 */
+    float*        grad_Jr_pad = grad_pad + q_pad; /* (N*q_pad, q_pad) fp32 */
+
+    /* ------------------------------------------------------------------
+     * Zero:  pll_out[1:3],  grad_pad[:],  vgrad_pad[:]
+     * Matches Python:  pll_out[1:]=0; grad_hr_pad[:]=0; grad_Jr_pad[:]=0; vgrad_pad[:]=0
+     * ----------------------------------------------------------------*/
+    cudaMemsetAsync(pll_out + 1,  0, 3 * sizeof(float),                 stream);
+    /* N3: only grad_h needs zeroing (atomic accumulation); grad_Jr is fully
+     * overwritten by GEMM2 with beta=0, and vgrad_pad by fused_vgrad_h. */
+    cudaMemsetAsync(grad_pad,     0, (size_t)q_pad * sizeof(float), stream);
+    /* N2: energies zeroed so GEMM1's beta=1 epilogue is an exact no-op add;
+     * the h field is added inside fused_vgrad_h instead. */
+    cudaMemsetAsync(energies_fp32, 0, (size_t)B * q_pad * sizeof(float), stream);
+
+    /* ------------------------------------------------------------------
+     * cuBLAS handle
+     * ----------------------------------------------------------------*/
+    cublasHandle_t handle;
+    bool own_handle = (ext_handle == nullptr);
+    if (own_handle)
+        cublasCreate(&handle);
+    else
+        handle = ext_handle;
+    cublasSetStream(handle, stream);
+
+    const float  alpha32 = 1.0f;
+    const float  beta32  = 0.0f;
+
+    /* ==================================================================
+     * GEMM 1: energies_fp32 (B, q_pad) = MSA_pad_flat (B, N*q_pad)
+     *                                   @ Jr_pad      (N*q_pad, q_pad)
+     *
+     * Row-major C = A @ B  <==>  col-major C^T = B^T @ A^T
+     *   m=q_pad, n=B, k=N*q_pad
+     *   A_col = Jr_pad        (q_pad × N*q_pad,  lda=q_pad,    OP_N)
+     *   B_col = MSA_pad_flat  (N*q_pad × B,      ldb=N*q_pad,  OP_N)
+     *   C_col = energies_fp32 (q_pad × B,        ldc=q_pad)
+     * ================================================================*/
+     cublasGemmEx(handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        q_pad, B, N * q_pad,                            // m, n, k
+        &alpha32, Jr_pad, CUDA_R_16F, q_pad,            // A
+        MSA_pad_flat, CUDA_R_16F, N * q_pad, &alpha32,  // B
+        energies_fp32,  CUDA_R_32F, q_pad,              // C
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT);
+
+    /* ==================================================================
+     * fused_vgrad kernel
+     * ================================================================*/
+    fused_vgrad_h<<<blocks_vgrad, threads_vgrad, 0, stream>>>(
+        energies_fp32, MSA, W, hr_pad,
+        r, B, N, q, q_pad,
+        pll_out + 1,    /* pll_out[1] */
+        grad_hr_pad,
+        vgrad_pad
+    );
+
+    if (own_handle)
+        cublasDestroy(handle);
+
+    /* ==================================================================
+     * sum_squares kernel
+     * ================================================================*/
+    sum_squares<<<sumsquare_blocks, 256, 0, stream>>>(
+        hr_pad, Jr_pad, pll_out,
+        q, q_pad, Jr_pad_total_params
+    );
+
+    /* ==================================================================
+     * pll_l2:  pll_out[1] += lambdaH * pll_out[2] + 0.5f * lambdaJ * pll_out[3]
+     * ================================================================*/
+    pll_l2<<<1, 1, 0, stream>>>(pll_out, lambdaH, lambdaJ);
+}
+
+
+
+
+extern "C" void cudaFillPllGradients_G(
+    const __half*      MSA_pad_flat,
+    const __half*      x_pad,
+    int r, int B, int N, int q, int q_pad,
+    float lambdaH, float lambdaJ,
+    float* grad_pad,
+    __half* vgrad_pad,
+    cublasHandle_t ext_handle,
+    cudaStream_t stream = 0
+)
+{
+    const __half* hr_pad      = x_pad;
+    const __half* Jr_pad      = x_pad + q_pad;
+    float*        grad_hr_pad = grad_pad;
+    float*        grad_Jr_pad = grad_pad + q_pad;
+
+    cublasHandle_t handle;
+    bool own_handle = (ext_handle == nullptr);
+    if (own_handle)
+        cublasCreate(&handle);
+    else
+        handle = ext_handle;
+    cublasSetStream(handle, stream);
+
+    const float  alpha32 = 1.0f;
+    const float  beta32  = 0.0f;
+
+    /* ==================================================================
+     * GEMM 2: grad_Jr_pad (N*q_pad, q_pad) fp32
+     *       = MSA_pad_flat.T (N*q_pad, B) fp16
+     *       @ vgrad_pad      (B, q_pad)   fp16
+     *
+     * Row-major C = A^T @ B  <==>  col-major C^T = B^T @ A
+     *   m=q_pad, n=N*q_pad, k=B
+     *   A_col = vgrad_pad    (q_pad  × B,       lda=q_pad,      OP_N)
+     *   B_col = MSA_pad_flat (N*q_pad × B,      ldb=N*q_pad,    OP_T → B × N*q_pad)
+     *   C_col = grad_Jr_pad  (q_pad × N*q_pad,  ldc=q_pad)   fp32
+     * ================================================================*/
+    cublasGemmEx(handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        q_pad, N * q_pad, B,                            // m, n, k
+        &alpha32, vgrad_pad, CUDA_R_16F, q_pad,         // A
+        MSA_pad_flat, CUDA_R_16F, N * q_pad, &beta32,   // B
+        grad_Jr_pad,  CUDA_R_32F, q_pad,                // C
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT);
+
+    if (own_handle)
+        cublasDestroy(handle);
+
+    /* ==================================================================
+     * grad_l2:  (N,) blocks × (q_pad, q_pad) threads
+     * ================================================================*/
+    grad_l2<<<N, dim3(q_pad, q_pad), 0, stream>>>(
+        grad_hr_pad, grad_Jr_pad,
+        hr_pad, Jr_pad,
+        N, q, q_pad, lambdaH, lambdaJ
+    );
+
+    /* ==================================================================
+     * Self-coupling exclusion. Site r must not couple to itself, so block r
+     * of J_r has to stay zero. Holding its gradient at zero keeps it at the
+     * zero it was initialised to, for every iteration.
+     *
+     * This replaces the previous scheme, which zeroed column r of a private
+     * per-site copy of the one-hot MSA -- a 549 MiB allocation and copy per
+     * site at the configured working point. Same exclusion, 2.3 KiB memset.
+     * ================================================================*/
+    cudaMemsetAsync(grad_Jr_pad + (size_t)r * q_pad * q_pad, 0,
+                    (size_t)q_pad * q_pad * sizeof(float), stream);
+
+}
+
+
 std::pair<int, float> cudaOptimizeSite(
     const __half*      MSA_pad,       /* (B, N, q_pad) fp16 – full one-hot */
     const signed char* MSA,           /* (B, N)        int8               */
