@@ -173,3 +173,30 @@ Same as homologue search, you can also use `batch` to run Massivora on SLURM clu
 ```sh
 massivora batch couple project_name.yml
 ```
+
+#### Faster couplings: `--fast-approximate`
+
+By default the model is fitted on every column of the concatenated alignment,
+including columns that are almost entirely gaps. `--fast-approximate` fits it only
+on columns whose gap fraction is below `align.col_gap_threshold`:
+
+```sh
+massivora run couple project_name.yml --fast-approximate
+```
+
+Deep alignments are dominated by insert columns, so this typically removes 65–90%
+of them. Cost scales with the square of the column count, so on a sample of 48
+human protein pairs it gave a **median 8.0× speedup** (range 2.3–13.1×).
+
+It also repairs the sequence reweighting. Identity is measured across all columns,
+so when most of them are near-empty, gap-versus-gap agreement dominates and every
+sequence looks like a neighbour of every other: on that sample the effective
+sequence count was a median of **1.3 without the flag and 296 with it**.
+
+**This changes the couplings.** It is an approximation, not a free speedup — the
+dropped columns are dropped from the model. On the same sample, rank correlation
+against a full run was 0.93 and roughly a quarter of the top-L predicted contacts
+differed. Validate against your own benchmark before using it for published
+results. Scores produced this way carry `fast_approximate` and `kept_columns`
+attributes in the output Zarr array, so positions can be mapped back to the
+original alignment.

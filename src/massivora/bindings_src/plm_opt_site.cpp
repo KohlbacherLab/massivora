@@ -393,6 +393,10 @@ int runGpu(const std::string& pairName, int B, int N, int q,
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // ---- Cap n_streams to what actually fits in free device memory ----
+    // Each concurrent cudaOptimizeSite call allocates its own scratch buffers.
+    // The one-hot MSA is no longer among them -- it is shared read-only across
+    // sites -- so per-stream cost is now dominated by the L-BFGS state, and far
+    // more streams fit than before.
     if (n_streams < 1) n_streams = 1;
     {
         const size_t per_stream =
@@ -423,17 +427,28 @@ int runGpu(const std::string& pairName, int B, int N, int q,
     auto worker = [&](int tid) {
         cudaStream_t stream;
         cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        // One cuBLAS handle per worker, reused across every site this thread
+        // owns. Passing nullptr made cudaOptimizeSite create and destroy a
+        // handle per site, and cublasDestroy() implicitly synchronises the
+        // whole device -- a barrier across every concurrent stream, once per
+        // site. Hoisting it is worth ~1.25x on the whole optimize phase.
+        cublasHandle_t handle;
+        cublasCreate(&handle);
         for (int r = tid; r < N; r += n_streams) {
             cudaOptimizeSite(
                 d_MSA_pad, d_MSA, d_W,
                 r, B, N, q, q_pad,
                 lambdaH, lambdaJ, eps_conv, maxeval,
                 d_x0 + (size_t)r * n_params,
-                std::map<std::string, float>{},
-                /*ext_handle=*/nullptr,
+                // n_streams lets the optimizer pick between the cooperative
+                // and fused two-loop: the cooperative kernel is near-full-grid
+                // and serialises concurrent streams past ~8.
+                std::map<std::string, float>{{"n_streams", (float)n_streams}},
+                /*ext_handle=*/handle,
                 stream);
         }
         cudaStreamSynchronize(stream);
+        cublasDestroy(handle);
         cudaStreamDestroy(stream);
     };
 

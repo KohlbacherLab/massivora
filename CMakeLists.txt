@@ -310,6 +310,15 @@ target_include_directories(gauss_infer PRIVATE ${BINDINGS_SRC})
 target_link_libraries(gauss_infer PRIVATE Eigen3::Eigen Threads::Threads)
 massivora_tune(gauss_infer)
 
+# Optional: parallelises the fp16 -> fp32 crop of the coupling blocks on the GPU
+# path. Falls back to a serial loop when OpenMP is unavailable.
+find_package(OpenMP QUIET COMPONENTS CXX)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(plm_opt_site PRIVATE OpenMP::OpenMP_CXX)
+else()
+    message(STATUS "OpenMP not found; plm_opt_site will crop coupling blocks serially")
+endif()
+
 # --- CUDA backend library (only if CUDA is enabled) ---
 if(ENABLE_CUDA)
     add_library(cuda_bindings SHARED ${BINDINGS_SRC}/bindings.cu)

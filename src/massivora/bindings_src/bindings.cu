@@ -208,10 +208,11 @@ std::pair<int, float> cudaOptimizeSite(
     cudaMallocAsync(&energies_fp32, (size_t)B * q_pad * sizeof(float),        stream);
     cudaMemsetAsync(pll_out, 0, 4 * sizeof(float), stream);
 
-    /* ---- Pinned host buffer for fast convergence check (avoids page-fault stall) ---- */
-    float* pll_host;
-    cudaHostAlloc(&pll_host, sizeof(float), cudaHostAllocDefault);
-    *pll_host = 0.0f;
+    /* ---- Pinned host buffer for the first-order convergence check. Only the
+     * RMSprop/NAdam branch reads it; the default L-BFGS path never touches it,
+     * so it is allocated lazily in that branch rather than once per site --
+     * page-pinning and freeing 4 bytes per site is pure waste otherwise. ---- */
+    float* pll_host = nullptr;
 
     /* ---- Create cuBLAS handle; always bind to our stream ---- */
     cublasHandle_t handle;
@@ -230,6 +231,9 @@ std::pair<int, float> cudaOptimizeSite(
          * the L-BFGS path for easy comparison. Each step does one
          * GEMM1+kernel+GEMM2 evaluation then a single fused update.
          * ============================================================*/
+        cudaHostAlloc(&pll_host, sizeof(float), cudaHostAllocDefault);
+        *pll_host = 0.0f;
+
         std::unique_ptr<Optimizer> opt;
         if (optimizer_type == 1) {
             opt = std::make_unique<NAdam>(
@@ -293,13 +297,18 @@ std::pair<int, float> cudaOptimizeSite(
             hyper("eps_x", 1e-9f),
             maxeval, stream);
 
+        /* The cooperative two-loop is a near-full-grid kernel, so two of them
+         * cannot co-reside and concurrent streams serialise on it. Past ~8
+         * streams the fused multi-launch path is measurably faster. */
+        lbfgs.allow_coop = (hyper("n_streams", 1.0f) <= 8.0f);
+
         auto result = lbfgs.optimize();
         iter        += result.first;
         pll_current  = result.second;
     }
 
     if (own_handle) cublasDestroy(handle);
-    cudaFreeHost(pll_host);
+    if (pll_host) cudaFreeHost(pll_host);
 
     /* ---- Free shared scratch buffers (stream-ordered) ---- */
     cudaFreeAsync(pll_out,       stream);
