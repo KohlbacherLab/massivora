@@ -86,6 +86,8 @@ couple:
   db_table: couplings
   claim_batch_size: auto  # 'auto' or integer
   memory_limit: 0.9
+  keep_coupling_matrix: false
+  coupling_matrix_keep_option: all  # 'all' or 'top'
 
   method: plm
 

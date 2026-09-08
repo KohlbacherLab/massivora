@@ -167,6 +167,7 @@ def cmd_run(project_config, system_config, stage, mode):
             conn.commit()
 
             # check if all the proteins are downloaded
+            # downloading failed protein will have status NULL
             cursor.execute(f"SELECT pid FROM {align_table} WHERE status IS NULL")
             protein_to_download = [row[0] for row in cursor.fetchall()]
         finally:

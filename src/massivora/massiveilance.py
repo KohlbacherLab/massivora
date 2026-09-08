@@ -8,8 +8,11 @@ import time
 from datetime import datetime
 from multiprocessing import shared_memory
 
+import zarr
+
 from massivora.config import load_project_and_system_config
-from massivora.db import STATUS, connect_db, connect_db_ro, get_table_names, quote_identifier
+from massivora.db import (STATUS, connect_db, connect_db_ro, get_hashed_file_path,
+                          get_table_names, quote_identifier)
 from massivora.job_loader import SlurmJobLoader
 from massivora.utils import SHM_PREFIX, compute_id_range, setup_logging
 
@@ -307,6 +310,42 @@ def remove_cron_entry(cron_line):
     return True
 
 
+def _coupling_result_info(output_dir, couple_table, pair_name, file_hash):
+    """Read a finished pair's coupling result from zarr, or ``None`` if absent."""
+    filename, _ = get_hashed_file_path(pair_name, file_hash, output_dir)
+    if not os.path.exists(filename):
+        return None
+    try:
+        grp = zarr.open_group(store=filename, mode='r')
+        arrays = set(grp.array_keys())
+        if couple_table not in arrays:
+            return None
+        info = {'length': int(grp[couple_table].shape[0]), 'number': None, 'effnumber': None}
+        if 'align' in arrays:
+            align = grp['align']
+            info['number'] = int(align.shape[0])
+            beff = align.attrs.get('Beff')
+            info['effnumber'] = None if beff is None else float(beff)
+        return info
+    except Exception:
+        return None
+
+
+def _alignment_result_info(monomers_dir, pid):
+    """Read a finished protein's alignment result from zarr, or ``None`` if absent."""
+    store = os.path.join(monomers_dir, pid)
+    if not os.path.exists(store):
+        return None
+    try:
+        grp = zarr.open_group(store=store, mode='r')
+        if 'align' not in set(grp.array_keys()):
+            return None
+        shape = grp['align'].shape
+        return {'length': int(shape[1]), 'filtered_nseqs': int(shape[0])}
+    except Exception:
+        return None
+
+
 def fix_zombie_tasks(cfg, command):
     """
     Fix tasks that are RUNNING/RETRYING but whose SLURM job_id no longer exists. Always clears claimed_at/job_id.
@@ -328,15 +367,27 @@ def fix_zombie_tasks(cfg, command):
     table_names = _get_table_names(cfg)
     if command == 'align':
         task_table = quote_identifier(table_names['alignments'])
-        select_columns = 'id, pid, status, job_id'
+        select_columns = 'id, pid, status, job_id, length, align_nseqs, filtered_nseqs'
         is_coupling_task = False
     elif command == 'couple':
         task_table = quote_identifier(table_names['couplings'])
-        select_columns = 'id, pid1, pid2, status, job_id'
+        select_columns = 'id, name, pid1, pid2, status, job_id, file_hash, number, length, effnumber'
         is_coupling_task = True
     else:
         logging.error(f"massiveilance on {WORKER_NAME}: invalid command {command} for zombie task recovery")
         return 0
+
+    # Resolve the output locations used to tell a finished task from a dead one
+    # (the zarr the executor writes on success), exactly as the executors do.
+    project_path = cfg.get('project').get('project_path')
+    couplings_output_dir = None
+    couple_table_name = None
+    monomers_dir = None
+    if is_coupling_task:
+        couplings_output_dir = os.path.join(project_path, cfg.get('paths').get('couplings'))
+        couple_table_name = table_names['couplings']
+    else:
+        monomers_dir = os.path.join(project_path, cfg.get('paths').get('monomers'))
 
     conn = connect_db(cfg)
 
@@ -369,15 +420,38 @@ def fix_zombie_tasks(cfg, command):
                 continue
 
             old_status = r['status']
-            if old_status == STATUS['RETRYING']:
+
+            # A dead job whose executor already wrote its result zarr actually
+            # finished; only its DB status update was lost. Mark it DONE instead
+            # of re-queuing it
+            if is_coupling_task: # TODO: check the probabilities records as well
+                result = _coupling_result_info(
+                    couplings_output_dir, couple_table_name, r['name'], r['file_hash']
+                )
+            else:
+                result = _alignment_result_info(monomers_dir, r['pid'])
+
+            set_clauses = ["status = ?", "claimed_at = NULL", "job_id = NULL"]
+            values = []
+            if result is not None:
+                new_status = STATUS['DONE']
+                # Backfill any metric the executor never got to write (its
+                # completion update was lost), leaving present values untouched.
+                for col, val in result.items():
+                    if val is not None and r[col] is None:
+                        set_clauses.append(f"{col} = ?")
+                        values.append(val)
+            elif old_status == STATUS['RETRYING']:
                 new_status = STATUS['PENDING']
             else:
                 new_status = STATUS['NOOPT']
 
             # fix db record
+            values.insert(0, new_status)
+            values.append(r['id'])
             cursor.execute(
-                f"UPDATE {task_table} SET status = ?, claimed_at = NULL, job_id = NULL WHERE id = ?",
-                (new_status, r['id']),
+                f"UPDATE {task_table} SET {', '.join(set_clauses)} WHERE id = ?",
+                values,
             )
 
             if is_coupling_task:
@@ -545,8 +619,9 @@ def main(argv=None):
     logging.info(f'massiveilance {args.command} {args.config}: Regular massiveilance run started on node {socket.gethostname()}.')
 
     # 0) update job status
-    update_slurm_job_status(cfg, args.command)
-    logging.info(f"massiveilance on {WORKER_NAME} {args.command} {args.config}: job status in database has been updated")
+    if args.mode == 'batch':
+        update_slurm_job_status(cfg, args.command)
+        logging.info(f"massiveilance on {WORKER_NAME} {args.command} {args.config}: job status in database has been updated")
 
     # 1) completion check
     if _project_is_complete(cfg, args.command) or _too_many_failures(cfg, args.command, args.mode):

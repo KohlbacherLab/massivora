@@ -63,7 +63,7 @@ class BaseJobLoader(object):
             logging.error(f"Failed to fetch protein {protein}: {e}")
             cursor.execute(
                 f"UPDATE {align_table} SET status = ? WHERE pid = ?",
-                (STATUS['FAILED'], protein),
+                (None, protein),
             )
             conn.commit()
             conn.close()

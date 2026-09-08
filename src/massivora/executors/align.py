@@ -56,13 +56,13 @@ def _claim_batch(cfg, job_id, batch_size, table_name='alignments', id_range=None
             params['start_id'] = start_id
             params['end_id'] = end_id
 
-        # For align job, status null is claimable
+        # For align job, status null is not claimable
         cursor.execute(
             f"""
             WITH to_claim AS (
                 SELECT id, pid, status AS prev_status
                 FROM {table}
-                WHERE (status IS NULL OR status IN (:noopt, :pending))
+                WHERE (status IS NOT NULL AND status IN (:noopt, :pending))
                   AND claimed_at IS NULL
                   {where_range_sql}
                 ORDER BY id
