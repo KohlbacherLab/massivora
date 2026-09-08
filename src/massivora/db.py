@@ -1,5 +1,6 @@
 import hashlib
 import os
+import re
 import sqlite3
 import sys
 
@@ -461,6 +462,26 @@ def ensure_columns(cfg: dict):
     conn.close()
 
 
+def _index_name(table, suffix):
+    """
+    Build an index name scoped to its table.
+
+    Parameters
+    ----------
+    `table` — str
+        Unquoted table name
+    `suffix` — str
+        Short description of the indexed columns
+
+    Returns
+    -------
+    `str`
+        Index name that stays unique when a project overrides `db_table`
+    """
+    safe = re.sub(r'\W+', '_', table).strip('_')
+    return f"idx_{safe}_{suffix}"
+
+
 def create_job_db(cfg: dict):
     """
     Create job database with configurable table names.
@@ -506,6 +527,11 @@ def create_job_db(cfg: dict):
         length INTEGER,
         number INTEGER,
         effnumber INTEGER,
+        pcontact REAL,
+        neffoverL REAL,
+        log_lr_raw REAL,
+        confidence_flag BOOLEAN,
+        high_precision_hit BOOLEAN,
         status INTEGER,
         job_id TEXT,
         claimed_at REAL,
@@ -521,6 +547,17 @@ def create_job_db(cfg: dict):
     cursor.execute(
         f'CREATE INDEX IF NOT EXISTS idx_couplings_file_hash ON {couple_table}(file_hash)'
     )
+
+    # Covering indexes for protein interaction-network lookups
+    couple_name = tables['couplings']
+    for suffix, columns in (
+        ('net1', 'pid1, pcontact DESC, pid2, neffoverL'),
+        ('net2', 'pid2, pcontact DESC, pid1, neffoverL'),
+    ):
+        index_name = quote_identifier(_index_name(couple_name, suffix))
+        cursor.execute(
+            f'CREATE INDEX IF NOT EXISTS {index_name} ON {couple_table}({columns})'
+        )
 
     cursor.execute(
         '''

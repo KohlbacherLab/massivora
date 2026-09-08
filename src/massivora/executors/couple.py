@@ -25,7 +25,8 @@ from massivora.db import (STATUS, compute_file_hash, connect_db_rw,
 from massivora.utils import (SHM_PREFIX, compute_id_range, gpu_is_available,
                              massivora_pkg_dir, setup_logging,
                              visible_gpu_devices, worker_id)
-
+from massivora.analyzer import (BuiltinGaussCalibrator, BuiltinPLMCalibrator,
+                                ComplexAnalyzer)
 
 class LoggingWorkerPlugin(WorkerPlugin):
     def __init__(self, cfg):
@@ -208,6 +209,11 @@ class BaseCouplingExecutor(object):
                         effnumber = ?,
                         number = ?,
                         length = ?,
+                        pcontact = ?,
+                        neffoverL = ?,
+                        log_lr_raw = ?,
+                        confidence_flag = ?,
+                        high_precision_hit = ?,
                         file_hash = ?,
                         claimed_at = NULL,
                         job_id = NULL
@@ -219,6 +225,11 @@ class BaseCouplingExecutor(object):
                             x.get('effnumber'),
                             int(x.get('number')),
                             int(x.get('length')),
+                            x.get('pcontact', 0),
+                            x.get('neffoverL', 0),
+                            x.get('log_lr_raw', 0),
+                            x.get('confidence_flag', False),
+                            x.get('high_precision_hit', False),
                             x.get('file_hash'),
                             x.get('id'),
                         )
@@ -627,7 +638,7 @@ class BaseCouplingExecutor(object):
 # CPU PLM executor
 # ---------------------------------------------------------------------------
 
-class PLMCouplingExecutor(BaseCouplingExecutor):
+class PLMCouplingExecutor(BaseCouplingExecutor, BuiltinPLMCalibrator):
     def __init__(self, config):
         super().__init__(config)
         self.plm_opt_exe = os.path.join(massivora_pkg_dir(), 'bin', 'plm_opt_site')
@@ -758,7 +769,9 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
             "eps_conv": eps_conv,
             "maxit": maxit,
             "plm_opt_exe": plm_opt_exe,
-            "file_hash": file_hash
+            "file_hash": file_hash,
+            "saved_columns": list(align.saved_columns),
+            "lengthes": list(align.lengthes),
         }
         return shared
 
@@ -808,16 +821,27 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
         J = np.ndarray((N*q*q, N), dtype=np.float64, buffer=J_shm.buf)
 
         score = self.compute_score(J, q=q).astype(np.float16)
-        logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
-        grp = zarr.open_group(store=filename)
-        if self.fast_approximation:
-            # Expand the shrinked score matrix to its original size
-            align_attrs = grp['align'].attrs
-            score = self._expand_score(score, align_attrs.get('saved_columns'),
-                                      align_attrs.get('lengthes'))
-        n_full = int(score.shape[0])
-        z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
-        z[:] = score
+        # logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
+        # grp = zarr.open_group(store=filename)
+        # if self.fast_approximation:
+        #     # Expand the shrinked score matrix to its original size
+        #     align_attrs = grp['align'].attrs
+        #     analyzer = ComplexAnalyzer(score, saved_columns=[list(range(len(params['saved_columns'][0]))),
+        #                                                      list(range(len(params['saved_columns'][1])))],
+        #                                 chainA_length=len(params['saved_columns'][0]),
+        #                                 EC_threshold=0)
+        #     score = self._expand_score(score, align_attrs.get('saved_columns'),
+        #                               align_attrs.get('lengthes'))
+        # n_full = int(score.shape[0])
+        # z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
+        # z[:] = score
+
+        analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
+                                       chainA_length=params['lengthes'][0],
+                                       EC_threshold=0)
+        calibrated = self.Calibrate(analyzer, params["Beff"])
+
+        # TODO: Put the score matrix and Beff and w to parquet
 
         result = {
             'id': params["pair_id"],
@@ -825,6 +849,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
             'length': n_full,
             'number': int(params["B"]),
             'file_hash': params.get("file_hash"),
+            **calibrated,
         }
         try:
             del J
@@ -859,7 +884,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor):
 # GPU PLM executor
 # ---------------------------------------------------------------------------
 
-class PLMCouplingExecutorGPU(BaseCouplingExecutor):
+class PLMCouplingExecutorGPU(BaseCouplingExecutor, BuiltinPLMCalibrator):
     def __init__(self, config):
         super().__init__(config)
         # Same executable as the CPU path; invoked with --use-gpu so it runs the
@@ -975,7 +1000,9 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
             "N": N,
             "q": q,
             "Beff": Beff,
-            "file_hash": file_hash
+            "file_hash": file_hash,
+            "saved_columns": list(align.saved_columns),
+            "lengthes": list(align.lengthes),
         })
         del MSA, W, align
 
@@ -1035,15 +1062,22 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
         score = self.compute_score(J.T, q=q).astype(np.float16)
 
         logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
-        grp = zarr.open_group(store=filename)
-        if self.fast_approximation:
-            # Expand the shrinked score matrix to its original size
-            align_attrs = grp['align'].attrs
-            score = self._expand_score(score, align_attrs.get('saved_columns'),
-                                      align_attrs.get('lengthes'))
-        n_full = int(score.shape[0])
-        z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
-        z[:] = score
+        # grp = zarr.open_group(store=filename)
+        # if self.fast_approximation:
+        #     # Expand the shrinked score matrix to its original size
+        #     align_attrs = grp['align'].attrs
+        #     score = self._expand_score(score, align_attrs.get('saved_columns'),
+        #                               align_attrs.get('lengthes'))
+        # n_full = int(score.shape[0])
+        # z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
+        # z[:] = score
+
+        analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
+                                       chainA_length=params['lengthes'][0],
+                                       EC_threshold=0)
+        calibrated = self.Calibrate(analyzer, params["Beff"])
+
+        # TODO: Put the score matrix and Beff and w to parquet
 
         # Release GPU buffers and free CuPy pools to return memory to the driver.
         del z, grp, score
@@ -1054,6 +1088,7 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
             'length': n_full,
             'number': int(params["B"]),
             'file_hash': params.get("file_hash"),
+            **calibrated,
         }
         try:
             del J
@@ -1081,7 +1116,7 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor):
 # GaussDCA executor
 # ---------------------------------------------------------------------------
 
-class GaussCouplingExecutor(BaseCouplingExecutor):
+class GaussCouplingExecutor(BaseCouplingExecutor, BuiltinGaussCalibrator):
     def __init__(self, config):
         super().__init__(config)
         coupling_cfg = config.get('couple')
@@ -1248,6 +1283,8 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
             "Beff": Beff,
             "output_dir": output_dir,
             "file_hash": file_hash,
+            "saved_columns": list(align.saved_columns),
+            "lengthes": list(align.lengthes),
         }
         return params
 
@@ -1309,10 +1346,17 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
         # Frobenius norm and the APC, so this is the finished score matrix.
         J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name + '_J', size=N * N * 4)
         score = np.ndarray((N, N), dtype=np.float32, buffer=J_shm.buf).astype(np.float16)
-        logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
-        grp = zarr.open_group(store=filename)
-        z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
-        z[:] = score
+        # logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
+        # grp = zarr.open_group(store=filename)
+        # z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
+        # z[:] = score
+
+        analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
+                                       chainA_length=params['lengthes'][0],
+                                       EC_threshold=0)
+        calibrated = self.Calibrate(analyzer, params["Beff"])
+        
+        # TODO: Put the score matrix and Beff and w to parquet
 
         result = {
             'id': params["pair_id"],
@@ -1320,6 +1364,7 @@ class GaussCouplingExecutor(BaseCouplingExecutor):
             'length': int(params["N"]),
             'number': int(params["B"]),
             'file_hash': file_hash,
+            **calibrated,
         }
         try:
             J_shm.close()

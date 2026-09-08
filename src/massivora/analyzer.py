@@ -99,7 +99,8 @@ class BaseAnalyzer(object):
         positions = np.sort(
             pd.unique(pd.concat([long_df["res1"], long_df["res2"]], ignore_index=True))
         )
-        df = pd.DataFrame(0, index=positions, columns=positions, dtype=float)
+
+        df = pd.DataFrame(np.nan, index=positions, columns=positions, dtype=float)
         row_idx = np.searchsorted(positions, long_df["res1"].to_numpy())
         col_idx = np.searchsorted(positions, long_df["res2"].to_numpy())
         df_values = df.to_numpy(copy=False)
@@ -219,7 +220,7 @@ class MonomerAnalyzer(BaseAnalyzer):
         def _df_to_pair_dict(df):
             dfn = df.apply(pd.to_numeric, errors="coerce")
             stacked = dfn.stack(future_stack=True)
-            return {(i, j): float(v) for (i, j), v in stacked.items()}
+            return {(i, j): float(v) for (i, j), v in stacked.items() if np.isfinite(v)}
 
         ranked_baseline = dict(
             sorted(
@@ -297,6 +298,11 @@ class MonomerAnalyzer(BaseAnalyzer):
         plt.xlim(-0.1, 1.8)
 
         return plt.gcf()
+
+class LegacyComplexAnalyzer(BaseAnalyzer):
+    def __init__(self, ECfile_baseline=None):
+        super().__init__()
+        
 
 class ComplexAnalyzer(BaseAnalyzer):
     def __init__(self, ECfile_baseline=None, group_name="couplings", saved_columns=None, EC_threshold=0.7, structure_file=None, chainA_name="A", chainA_length=None, chainB_name=None, distance_cutoff=8, switch_order=False):
@@ -395,52 +401,57 @@ class ComplexAnalyzer(BaseAnalyzer):
         inter.columns = col_labels
         return inter
 
-    def SumUpRawCouplings(self):
-        if self.raw_couplings.empty:
-            raise RuntimeError('No raw couplings found')
-        vals = pd.to_numeric(self.raw_couplings.values.ravel(), errors="coerce")
-        if np.isnan(vals).all():
-            raise RuntimeError('No raw couplings found')
-        return float(np.nansum(vals))
+    def NormalizedCouplings(self, N_eff, full=False):
+        """
+        Convert the original coupling scores to EVcomplex scores.
+        Source: Hopf et al. eLife 2014;3:e03430
 
-    def SumUpNormalizedCouplings(self, N_eff, L):
-        if self.raw_couplings.empty:
-            raise RuntimeError('No raw couplings found')
+        Parameters
+        ----------
+        `N_eff` — float
+            The effective number of sequences in the MSA
+        `full` — bool
+            If True, return the full normalized matrix; otherwise, return only the interprotein couplings.
+
+        Returns
+        -------
+        `pandas.DataFrame`
+            The normalized coupling score matrix
+
+        Raises
+        ------
+        `RuntimeError`
+            If no interprotein coupling was found or the minimum coupling score is 0.
+        """
+        if full:
+            if self.raw_couplings.empty:
+                raise RuntimeError('No couplings found')
+            else:
+                df = self.raw_couplings.apply(pd.to_numeric, errors="coerce")
+        else:
+            if self.interprotein_couplings.empty:
+                raise RuntimeError('No interprotein couplings found')
+            else:
+                df = self.interprotein_couplings.apply(pd.to_numeric, errors="coerce")
+        if df.to_numpy().size == 0 or np.isnan(df.to_numpy()).all():
+            raise RuntimeError('No couplings found')
+
+        # The normaliser comes from the same matrix being normalised - the block
+        # is self-normalised.  Scaling one block by another block's minimum is
+        # not a self-consistent statistic.
+        L = self.raw_couplings.shape[0]
         constant = 1 + (N_eff / L) ** -0.5
-        vals = pd.to_numeric(self.raw_couplings.values.ravel(), errors="coerce")
-        vals = vals[~np.isnan(vals)]
-        if vals.size == 0:
-            raise RuntimeError('No raw couplings found')
-        abs_min = abs(np.nanmin(vals))
+        abs_min = abs(np.nanmin(df.to_numpy()))
         if abs_min == 0:
             raise RuntimeError('Cannot normalize: minimum absolute score is 0')
-        return float(np.sum((vals / abs_min) / constant))
 
-    def SumUpNormalizedInterProtCouplings(self, N_eff, L):
-        if self.interprotein_couplings.empty:
-            raise RuntimeError('No interprotein couplings found')
-        constant = 1 + (N_eff / L) ** -0.5
-        vals = pd.to_numeric(self.interprotein_couplings.values.ravel(), errors="coerce")
-        vals = vals[~np.isnan(vals)]
-        if vals.size == 0:
-            raise RuntimeError('No interprotein couplings found')
-        abs_min = abs(np.nanmin(vals))
-        if abs_min == 0:
-            raise RuntimeError('Cannot normalize: minimum absolute score is 0')
-        return float(np.sum((vals / abs_min) / constant))
+        return (df / abs_min) / constant
 
-    def MaxNormalizedInterProtCouplings(self, N_eff, L):
-        if self.interprotein_couplings.empty:
-            raise RuntimeError('No interprotein couplings found')
-        constant = 1 + (N_eff / L) ** -0.5
-        vals = pd.to_numeric(self.interprotein_couplings.values.ravel(), errors="coerce")
-        vals = vals[~np.isnan(vals)]
-        if vals.size == 0:
-            raise RuntimeError('No interprotein couplings found')
-        abs_min = abs(np.nanmin(vals))
-        if abs_min == 0:
-            raise RuntimeError('Cannot normalize: minimum absolute score is 0')
-        return float(np.nanmax((vals / abs_min) / constant))
+    def SumUpNormalizedCouplings(self, N_eff, full=False):
+        return float(np.nansum(self.NormalizedCouplings(N_eff, full).to_numpy()))
+
+    def MaxNormalizedCouplings(self, N_eff, full=False):
+        return float(np.nanmax(self.NormalizedCouplings(N_eff, full).to_numpy()))
 
     def GetBenchmarkIndex(self, ECfile_query):
         if type(self.interface) == None or not self.couplings_baseline: raise RuntimeError('No interface or couplings found')
@@ -472,7 +483,7 @@ class ComplexAnalyzer(BaseAnalyzer):
         def _df_to_pair_dict(df):
             dfn = df.apply(pd.to_numeric, errors="coerce")
             stacked = dfn.stack(future_stack=True)
-            return {(i, j): float(v) for (i, j), v in stacked.items()}
+            return {(i, j): float(v) for (i, j), v in stacked.items() if np.isfinite(v)}
 
         ranked_baseline = dict(
             sorted(
@@ -676,3 +687,175 @@ class ComplexAnalyzer(BaseAnalyzer):
         tp_count = self.TruePositiveCount(self.interface, top_k.to_dict())
 
         return tp_count / k
+
+
+class BaseCalibrator(object):
+    """Maps a pair's coupling matrix into a calibrated interaction probability.
+
+    ``RANKER``
+        Selected to maximise AUPRC at the benchmark prevalence.  Scores EVERY
+        pair on a graded scale, which is what `log_lr` and `pcontact` need.
+    ``DETECTOR``
+        Selected to maximise AUPRC at `PI`, i.e. tuned on the extreme head of the
+        ranking where a proteome-scale screen actually operates.  Decides
+        `high_precision_hit` and nothing else.
+    """
+
+    #: assumed proteome-wide interaction prevalence
+    PI = 1e-3
+    #: logit of the 0.12343 training prevalence the slopes were fitted at
+    LOGIT_TAU = -1.9603207131817926
+    LOGIT_PI = -6.906754778648554
+    #: log(3984 labelled negatives) - the finest likelihood ratio they can show
+    MAX_LOG_LR = 8.290041618704489
+    LOW_CUT = 0.8734290196703057
+
+    RANKER = None
+    DETECTOR = None
+
+    def __init__(self, pi=None):
+        if pi is not None:
+            self.PI = float(pi)
+            self.LOGIT_PI = float(np.log(self.PI / (1.0 - self.PI)))
+
+    # -- feature helpers ------------------------------------------------------
+    @staticmethod
+    def _normalized_entropy(counts, k):
+        """Shannon entropy of `counts` over log(k), so it does not track size.
+
+        Normalising by log(k) rather than by the number of residues is what makes
+        this size-invariant: k top pairs can touch at most k distinct residues,
+        however long the proteins are.
+        """
+        p = counts[counts > 0].astype(np.float64)
+        if p.size == 0 or k <= 1:
+            return 0.0
+        p = p / p.sum()
+        return float(-(p * np.log(p)).sum() / np.log(k))
+
+    def _feature(self, S, flat, name):
+        if name == "mean_cn":
+            return float(flat.mean())
+        if name.startswith("frac_above_"):
+            t = float(name[len("frac_above_"):].replace("p", "."))
+            return float((flat >= t).sum()) / flat.size
+        if name == "max_cn":
+            return float(flat.max())
+        if name == "max_cn_sq":
+            peak = float(flat.max())
+            return float(np.sign(peak) * peak * peak)
+        if name == "max_cn_log":
+            return float(np.log1p(max(float(flat.max()), 0.0)))
+        if name.startswith("conc_entropy_"):
+            k = min(int(name[len("conc_entropy_"):]), flat.size)
+            idx = np.argpartition(flat, flat.size - k)[flat.size - k:]
+            rows, cols = np.unravel_index(idx, S.shape)
+            return 0.5 * (self._normalized_entropy(np.bincount(rows), k)
+                          + self._normalized_entropy(np.bincount(cols), k))
+        raise KeyError(f"unknown calibration feature {name!r}")
+
+    def _model_log_lr(self, analyzer, model, N_eff):
+        """Evidence (log likelihood ratio) one model assigns to this pair."""
+        S = analyzer.NormalizedCouplings(N_eff).to_numpy(dtype=float)
+        flat = S.ravel()
+        flat = flat[np.isfinite(flat)]
+        if flat.size == 0:
+            raise ValueError("normalised matrix has no finite entries")
+        x = np.array([self._feature(S, flat, n) for n in model["features"]])
+        x = (x - np.asarray(model["mean"])) / np.asarray(model["scale"])
+        return float(x @ np.asarray(model["coef"]) + model["b0"] - self.LOGIT_TAU)
+
+    # -- public API -----------------------------------------------------------
+    def ConfidenceFlag(self, coverage):
+        """Reliability flag from coverage-per-length (M_eff / L): `low` or `high`.
+
+        A DATA-QUALITY judgement - is the alignment deep enough for DCA to say
+        anything - and independent of how high the pair scores.
+        """
+        return False if coverage < self.LOW_CUT else True
+
+    def Calibrate(self, analyzer, N_eff):
+        """Score one pair.
+
+        Parameters
+        ----------
+        `analyzer` — ComplexAnalyzer
+            Built on the pair's coupling matrix, so that `interprotein_couplings`
+            holds the inter-protein block restricted to the retained columns.
+        `N_eff` — float
+            Effective (reweighted) sequence count of the concatenated alignment.
+
+        Returns
+        -------
+        dict with `log_lr_raw`, `pcontact` (that evidence as a probability at PI),
+        `confidence_flag` (`False` for low /`True` for high) and `high_precision_hit`.
+        """
+        if self.RANKER is None or self.DETECTOR is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} defines no RANKER/DETECTOR constants")
+        L = int(analyzer.raw_couplings.shape[0])
+        log_lr_raw = self._model_log_lr(analyzer, self.RANKER, N_eff)
+        # logit(P at prior q) = log_lr + logit(q), so log_lr is the prevalence-free part
+        # Capped because with 3984 labelled negatives no likelihood ratio finer than 1/3984 can be demonstrated
+        log_lr = min(log_lr_raw, self.MAX_LOG_LR)
+        hit_log_lr = self._model_log_lr(analyzer, self.DETECTOR, N_eff)
+        coverage = float(N_eff) / float(L)
+        return {
+            "log_lr_raw": log_lr_raw,
+            "pcontact": float(1.0 / (1.0 + np.exp(-(log_lr + self.LOGIT_PI)))),
+            "confidence_flag": self.ConfidenceFlag(coverage),
+            "high_precision_hit": bool(hit_log_lr >= self.DETECTOR["hit_log_lr"]),
+            "neffoverL": coverage,
+        }
+
+
+class BuiltinPLMCalibrator(BaseCalibrator):
+    """Calibration fitted on plmDCA couplings.
+
+    Held out: ranker AUC 0.879, AUPRC 0.803, ECE 0.040.
+    """
+
+    LOW_CUT = 0.8734290196703057
+
+    RANKER = {
+        "features": ("frac_above_0", "max_cn_sq", "conc_entropy_10"),
+        "coef": (1.261770011395687, 4.421236943580058, -0.44171569920052084),
+        "mean": (0.1871615664329687, 0.7600967167561608, 0.9547690956719593),
+        "scale": (0.08127383738222799, 2.416452373788886, 0.04797641421035466),
+        "b0": -2.4838705529482583,
+    }
+    DETECTOR = {
+        "features": ("frac_above_1p25",),
+        "coef": (49.21454021348768,),
+        "mean": (1.0326145352227491e-05,),
+        "scale": (0.0001812544100640886,),
+        "b0": 0.5211322518556427,
+        # held-out 0.1%-FPR operating point; fires on 159 positives / 2 negatives
+        "hit_log_lr": 1.4813428297931597,
+    }
+
+
+class BuiltinGaussCalibrator(BaseCalibrator):
+    """Calibration fitted on GaussDCA couplings.
+
+    Held out: ranker AUC 0.890, AUPRC 0.801, ECE 0.033.
+    """
+
+    LOW_CUT = 1.5964534737486649
+
+    RANKER = {
+        "features": ("frac_above_0", "max_cn_sq"),
+        "coef": (1.58675901061756, 1.39192051940705),
+        "mean": (0.16203104713451555, 0.7566148060584378),
+        "scale": (0.09029099655236972, 2.4423143207822986),
+        "b0": -2.9314009156717273,
+    }
+    DETECTOR = {
+        "features": ("frac_above_0p001", "max_cn_log"),
+        "coef": (1.517195400105569, 0.5592752338008525),
+        "mean": (0.1603621965835015, 0.5276021495776804),
+        "scale": (0.08956596002756717, 0.18479331879786745),
+        "b0": -3.0370236622651228,
+        # held-out 0.1%-FPR operating point; fires on 148 positives / 5 negatives
+        "hit_log_lr": 3.1020144107309235,
+    }
