@@ -30,12 +30,12 @@ endif()
 # Configure CUDA language + toolkit when enabled.
 if(ENABLE_CUDA)
     # Default target GPU architectures (override with
-    #   -C cmake.define.CMAKE_CUDA_ARCHITECTURES="80;90"  via pip).
+    #   -C cmake.define.CMAKE_CUDA_ARCHITECTURES="80;90"  via pip)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES "80;86;90")
     endif()
     enable_language(CUDA)
-    find_package(CUDAToolkit REQUIRED COMPONENTS cublas)
+    find_package(CUDAToolkit REQUIRED COMPONENTS cublas cusolver)
     include_directories(${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     if(TARGET CUDA::cublas)
       set(MASSIVORA_CUBLAS_TARGET CUDA::cublas)
@@ -49,6 +49,13 @@ if(ENABLE_CUDA)
       if(CUDAToolkit_LIBRARY_DIRS)
         list(APPEND MASSIVORA_CUDA_LIB_DIRS ${CUDAToolkit_LIBRARY_DIRS})
       endif()
+    endif()
+    if(TARGET CUDA::cusolver)
+      set(MASSIVORA_CUSOLVER_TARGET CUDA::cusolver)
+    elseif(TARGET CUDAToolkit::cusolver)
+      set(MASSIVORA_CUSOLVER_TARGET CUDAToolkit::cusolver)
+    else()
+      set(MASSIVORA_CUSOLVER_TARGET cusolver)
     endif()
 endif()
 
@@ -269,10 +276,41 @@ endif()
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(GaussBLAS)
 
+# Everything a target needs in order to be part of a CUDA-enabled build
+function(massivora_cuda tgt)
+  if(NOT ENABLE_CUDA)
+    return()
+  endif()
+  target_compile_definitions(${tgt} PRIVATE ENABLE_CUDA)
+  target_include_directories(${tgt} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  if(MASSIVORA_CUDA_LIB_DIRS)
+    target_link_directories(${tgt} PRIVATE ${MASSIVORA_CUDA_LIB_DIRS})
+  endif()
+  target_link_libraries(${tgt} PRIVATE CUDA::cudart)
+  target_compile_options(${tgt} PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+      $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>
+      $<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=20012>
+      $<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=20013>
+      $<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=20015>)
+  # Let a freshly built binary find the toolkit it was linked against without
+  # LD_LIBRARY_PATH. Build tree only; the installed copy uses the system's
+  # usual CUDA discovery, like the rest of the package.
+  if(CUDAToolkit_LIBRARY_DIR)
+    set_property(TARGET ${tgt} APPEND PROPERTY BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
+  endif()
+endfunction()
+
 # Apply the tuning above to a target.
 function(massivora_tune tgt)
   if(MASSIVORA_ARCH_FLAGS)
-    target_compile_options(${tgt} PRIVATE ${MASSIVORA_ARCH_FLAGS})
+    # Host-ISA flags have to reach the host compiler through -Xcompiler on a
+    # CUDA source, so they are applied per language rather than verbatim.
+    foreach(_flag IN LISTS MASSIVORA_ARCH_FLAGS)
+      target_compile_options(${tgt} PRIVATE
+        "$<$<COMPILE_LANGUAGE:CXX>:${_flag}>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xcompiler ${_flag}>")
+    endforeach()
   endif()
   if(MASSIVORA_PRECISION_DEFS)
     target_compile_definitions(${tgt} PRIVATE ${MASSIVORA_PRECISION_DEFS})
@@ -284,19 +322,11 @@ function(massivora_tune tgt)
 endfunction()
 
 # --- pybind11 extension module ---
+pybind11_add_module(cpp_bindings ${BINDINGS_SRC}/bindings.cpp)
+target_include_directories(cpp_bindings PRIVATE ${BINDINGS_SRC})
+massivora_cuda(cpp_bindings)
 if(ENABLE_CUDA)
-    pybind11_add_module(cpp_bindings ${BINDINGS_SRC}/bindings.cpp)
-    target_compile_definitions(cpp_bindings PRIVATE ENABLE_CUDA)
-    target_include_directories(cpp_bindings PRIVATE
-        ${BINDINGS_SRC}
-        ${CUDAToolkit_INCLUDE_DIRS}
-    )
-    if(MASSIVORA_CUDA_LIB_DIRS)
-      target_link_directories(cpp_bindings PRIVATE ${MASSIVORA_CUDA_LIB_DIRS})
-    endif()
     target_link_libraries(cpp_bindings PRIVATE cuda_bindings ${MASSIVORA_CUBLAS_TARGET})
-else()
-    pybind11_add_module(cpp_bindings ${BINDINGS_SRC}/bindings.cpp)
 endif()
 
 # --- Standalone executable plm_opt_site ---
@@ -310,34 +340,30 @@ target_include_directories(gauss_infer PRIVATE ${BINDINGS_SRC})
 target_link_libraries(gauss_infer PRIVATE Eigen3::Eigen Threads::Threads)
 massivora_tune(gauss_infer)
 
+# --- GaussDCA CUDA core as an importable module -----------------------------
+if(ENABLE_CUDA)
+    pybind11_add_module(gauss_cuda ${BINDINGS_SRC}/gauss_cuda_py.cu)
+    target_include_directories(gauss_cuda PRIVATE ${BINDINGS_SRC})
+    massivora_cuda(gauss_cuda)
+    target_link_libraries(gauss_cuda PRIVATE
+        ${MASSIVORA_CUBLAS_TARGET} ${MASSIVORA_CUSOLVER_TARGET})
+    set_property(TARGET gauss_cuda PROPERTY POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # --- CUDA backend library (only if CUDA is enabled) ---
 if(ENABLE_CUDA)
     add_library(cuda_bindings SHARED ${BINDINGS_SRC}/bindings.cu)
-    target_include_directories(cuda_bindings PRIVATE
-        ${BINDINGS_SRC}
-        ${CUDAToolkit_INCLUDE_DIRS}
-    )
-    if(MASSIVORA_CUDA_LIB_DIRS)
-      target_link_directories(cuda_bindings PRIVATE ${MASSIVORA_CUDA_LIB_DIRS})
-    endif()
+    target_include_directories(cuda_bindings PRIVATE ${BINDINGS_SRC})
+    massivora_cuda(cuda_bindings)
     target_link_libraries(cuda_bindings PRIVATE ${MASSIVORA_CUBLAS_TARGET})
     # RDC (for cooperative-groups grid.sync in the L-BFGS two-loop)
     set_property(TARGET cuda_bindings PROPERTY CUDA_SEPARABLE_COMPILATION ON)
     set_property(TARGET cuda_bindings PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
     # Build the standalone plm_opt_site executable against the CUDA backend.
-    target_compile_definitions(plm_opt_site PRIVATE ENABLE_CUDA)
-    target_include_directories(plm_opt_site PRIVATE
-        ${BINDINGS_SRC}
-        ${CUDAToolkit_INCLUDE_DIRS}
-    )
-    if(MASSIVORA_CUDA_LIB_DIRS)
-      target_link_directories(plm_opt_site PRIVATE ${MASSIVORA_CUDA_LIB_DIRS})
-    endif()
-    target_link_libraries(plm_opt_site PRIVATE
-        cuda_bindings
-        ${MASSIVORA_CUBLAS_TARGET}
-        CUDA::cudart)
+    target_include_directories(plm_opt_site PRIVATE ${BINDINGS_SRC})
+    massivora_cuda(plm_opt_site)
+    target_link_libraries(plm_opt_site PRIVATE cuda_bindings ${MASSIVORA_CUBLAS_TARGET})
 endif()
 
 # --- Link Eigen + NLopt into the bindings module ---
@@ -353,6 +379,7 @@ endif()
 # When CUDA libs live next to the module, make them discoverable at runtime.
 if(ENABLE_CUDA AND NOT APPLE)
   set_target_properties(cpp_bindings PROPERTIES INSTALL_RPATH "$ORIGIN")
+  set_target_properties(gauss_cuda PROPERTIES INSTALL_RPATH "$ORIGIN")
   set_target_properties(plm_opt_site PROPERTIES INSTALL_RPATH "$ORIGIN/../cpp_bindings")
 endif()
 
@@ -375,5 +402,7 @@ install(FILES
 
 if(ENABLE_CUDA)
     install(TARGETS cuda_bindings
+        LIBRARY DESTINATION ${MASSIVORA_BINDINGS_INSTALL_DIR})
+    install(TARGETS gauss_cuda
         LIBRARY DESTINATION ${MASSIVORA_BINDINGS_INSTALL_DIR})
 endif()

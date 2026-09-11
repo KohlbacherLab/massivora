@@ -2,9 +2,11 @@ import argparse
 import logging
 import multiprocessing as mp
 import os
+import queue
 import signal
 import sqlite3
 import subprocess
+import threading
 import time
 from multiprocessing import shared_memory
 
@@ -821,7 +823,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor, BuiltinPLMCalibrator):
         J = np.ndarray((N*q*q, N), dtype=np.float64, buffer=J_shm.buf)
 
         score = self.compute_score(J, q=q).astype(np.float16)
-        # logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
+        logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
         # grp = zarr.open_group(store=filename)
         # if self.fast_approximation:
         #     # Expand the shrinked score matrix to its original size
@@ -1346,7 +1348,7 @@ class GaussCouplingExecutor(BaseCouplingExecutor, BuiltinGaussCalibrator):
         # Frobenius norm and the APC, so this is the finished score matrix.
         J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name + '_J', size=N * N * 4)
         score = np.ndarray((N, N), dtype=np.float32, buffer=J_shm.buf).astype(np.float16)
-        # logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
+        logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
         # grp = zarr.open_group(store=filename)
         # z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
         # z[:] = score
@@ -1410,9 +1412,153 @@ class GaussCouplingExecutor(BaseCouplingExecutor, BuiltinGaussCalibrator):
         return out_d
 
 
+# ---------------------------------------------------------------------------
+# GaussDCA executor GPU
+# ---------------------------------------------------------------------------
+
+class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
+    def __init__(self, config):
+        super().__init__(config)
+        coupling_cfg = config.get('couple')
+        self.pseudocount = float(coupling_cfg.get('pseudocount', 0.8))
+
+        self.gpu_sessions = int(coupling_cfg.get('gpu_sessions', 4))
+        self.gpu_workers = int(coupling_cfg.get('gpu_workers', 16))
+
+    def load_pair_arrays(self, pair, **kwargs):
+        pair_name = pair.get('name')
+        file_hash = pair.get('file_hash') or compute_file_hash(pair_name)
+        filename, _ = get_hashed_file_path(pair_name, file_hash,
+                                           kwargs.get('output_dir'))
+        try:
+            align = BinaryAlignment(filename)
+        except Exception:
+            align = self.concatenate(pair, kwargs.get('alignment_dir'),
+                                     downsample=kwargs.get('downsample', False),
+                                     downsample_to=kwargs.get('downsample_to'))
+            align.Reweight_Sequence(kwargs.get('reweighting_threshold', 0.8),
+                                    n_threads=getattr(self, 'reweight_threads', 0))
+            align.To_Zarr(filename, overwrite=True)
+        if getattr(align, 'weights', None) is None or align.Beff is None:
+            align.Reweight_Sequence(kwargs.get('reweighting_threshold', 0.8),
+                                    n_threads=getattr(self, 'reweight_threads', 0))
+
+        B, N = align.matrix.shape
+        MSA = np.ascontiguousarray(align.matrix.T, dtype=np.int8)      # (N, B)
+        W = np.asarray(align.weights, dtype=np.float64)
+        params = {'name': pair_name, 'pair_id': pair.get('id'), 'B': B, 'N': N,
+                'q': 21, 'Beff': float(align.Beff), 'file_hash': file_hash,
+                'saved_columns': list(align.saved_columns),
+                'lengthes': list(align.lengthes)}
+        return MSA, W, params
+
+    def collect_score(self, score, params):
+        s16 = score.astype(np.float16)
+        analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
+                                       chainA_length=params['lengthes'][0],
+                                       EC_threshold=0)
+        calibrated = self.Calibrate(analyzer, params["Beff"])
+        logging.info(f"Writing coupling score for pair {params['pair_id']} '{params['name']}' to alignment zarr")
+        # TODO: Put the score matrix and Beff and w to parquet
+        return {
+            'id': params['pair_id'],
+            'effnumber': params['Beff'],
+            'length': int(params['N']),
+            'number': int(params['B']),
+            'file_hash': params['file_hash'],
+            **calibrated,
+        }
+
+    # -- dispatch -------------------------------------------------------------
+
+    def _claimed_pairs(self, id_range=None):
+        """Stream claimed rows; the work queue bounds how far ahead we run."""
+        while True:
+            rows = self._claim_batch(self.job_id, self.claim_batch_size,
+                                     id_range=id_range)
+            if not rows:
+                return
+            for r in rows:
+                yield {k: r[k] for k in r.keys()}
+
+    def run(self, client=None, id_range=None):
+        from massivora.cpp_bindings import gauss_cuda
+
+        kwargs = dict(alignment_dir=self.alignment_dir,
+                      output_dir=self.output_dir,
+                      downsample=self.downsample,
+                      downsample_to=self.downsample_to,
+                      reweighting_threshold=self.reweighting_threshold)
+
+        devices = visible_gpu_devices()
+        sessions = queue.Queue()
+        for ordinal, device_id in enumerate(devices):
+            logging.debug("GaussDCA GPU: %d session(s) on ordinal %d (GPU %s)",
+                          self.gpu_sessions, ordinal, device_id)
+            for _ in range(self.gpu_sessions):
+                sessions.put(gauss_cuda.Session(ordinal))
+        logging.info("GaussDCA GPU: %d session(s) over %d GPU(s) (CUDA_VISIBLE_"
+                     "DEVICES=%s), %d workers", sessions.qsize(), len(devices),
+                     ",".join(devices), self.gpu_workers)
+
+        work = queue.Queue(maxsize=self.gpu_workers * 2)
+        done_updates, fail_updates = [], []
+        lock = threading.Lock()
+
+        def worker():
+            while True:
+                pair = work.get()
+                try:
+                    if pair is None:
+                        return
+                    MSA, W, params = self.load_pair_arrays(pair, **kwargs)
+                    sess = sessions.get()          # bounds concurrent device use
+                    try:
+                        score = sess.score(MSA, W, q=params['q'],
+                                           pseudocount=self.pseudocount)
+                    finally:
+                        sessions.put(sess)
+                    row = self.collect_score(score, params)
+                    with lock:
+                        done_updates.append(row)
+                except Exception:
+                    logging.exception("Pair %s failed", (pair or {}).get('id'))
+                    with lock:
+                        fail_updates.append((pair or {}).get('id'))
+                finally:
+                    work.task_done()
+
+        threads = [threading.Thread(target=worker, daemon=True)
+                   for _ in range(self.gpu_workers)]
+        for t in threads:
+            t.start()
+
+        def flush(force=False):
+            with lock:
+                if not force and len(done_updates) + len(fail_updates) < 64:
+                    return
+                d, f = list(done_updates), list(fail_updates)
+                done_updates.clear(); fail_updates.clear()
+            if d or f:
+                self._db_apply_results(d, f)
+
+        try:
+            for pair in self._claimed_pairs(id_range):
+                work.put(pair)
+                flush(force=False)
+            for _ in threads:
+                work.put(None)
+            work.join()
+        finally:
+            for t in threads:
+                t.join(timeout=30)
+            flush(force=True)
+            self.close_db_connection()
+
+
 EXECUTORS = {
     'plm': (PLMCouplingExecutor, PLMCouplingExecutorGPU),
-    'gauss': (GaussCouplingExecutor, GaussCouplingExecutor),
+    'gauss': (GaussCouplingExecutor, GaussCouplingExecutorGPU),
 }
 
 
