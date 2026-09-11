@@ -446,6 +446,14 @@ def ensure_columns(cfg: dict):
     add_col(tables['couplings'], 'claimed_at REAL')
     add_col(tables['couplings'], 'job_id TEXT')
     add_col(tables['couplings'], 'file_hash BLOB')
+    add_col(tables['couplings'], 'score_file_id INTEGER')
+    add_col(tables['couplings'], 'score_offset INTEGER')
+    add_col(tables['couplings'], 'score_len INTEGER')
+    add_col(tables['couplings'], 'pcontact REAL')
+    add_col(tables['couplings'], 'neffoverL REAL')
+    add_col(tables['couplings'], 'log_lr_raw REAL')
+    add_col(tables['couplings'], 'confidence_flag BOOLEAN')
+    add_col(tables['couplings'], 'high_precision_hit BOOLEAN')
     add_col(tables['alignments'], 'job_id TEXT')
     add_col(tables['alignments'], 'claimed_at REAL')
 
@@ -536,6 +544,9 @@ def create_job_db(cfg: dict):
         job_id TEXT,
         claimed_at REAL,
         file_hash BLOB,
+        score_file_id INTEGER,
+        score_offset INTEGER,
+        score_len INTEGER,
         UNIQUE (name),
         FOREIGN KEY (pid1) REFERENCES {align_table}(pid),
         FOREIGN KEY (pid2) REFERENCES {align_table}(pid)
@@ -551,8 +562,8 @@ def create_job_db(cfg: dict):
     # Covering indexes for protein interaction-network lookups
     couple_name = tables['couplings']
     for suffix, columns in (
-        ('net1', 'pid1, pcontact DESC, pid2, neffoverL'),
-        ('net2', 'pid2, pcontact DESC, pid1, neffoverL'),
+        ('net1', 'pid1, log_lr_raw DESC, pid2, neffoverL'),
+        ('net2', 'pid2, log_lr_raw DESC, pid1, neffoverL'),
     ):
         index_name = quote_identifier(_index_name(couple_name, suffix))
         cursor.execute(
