@@ -559,6 +559,9 @@ def create_job_db(cfg: dict):
         f'CREATE INDEX IF NOT EXISTS idx_couplings_file_hash ON {couple_table}(file_hash)'
     )
 
+    # Ensure all columns exist
+    ensure_columns(cfg)
+
     # Covering indexes for protein interaction-network lookups
     couple_name = tables['couplings']
     for suffix, columns in (
@@ -583,5 +586,3 @@ def create_job_db(cfg: dict):
     conn.commit()
     conn.close()
 
-    # Ensure all columns exist
-    ensure_columns(cfg)

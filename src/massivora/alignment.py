@@ -14,7 +14,8 @@ from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 
 from massivora import cpp_bindings
-from massivora.utils import get_cuda_module, gpu_is_available
+from massivora.utils import (get_cuda_module, gpu_is_available,
+                            saved_columns_to_bitmask)
 
 logger = logging.getLogger(__name__)
 
@@ -515,12 +516,15 @@ class TextAlignment(MultipleSeqAlignment):
             p_seq += sequence_count
         matrix = self.Get_Numpy_Array(mapped=True, string=tempstr)
         grp = zarr.open_group(store=filename)
-        z = grp.create_array(name='align', shape=(self.sequenceCount, self.sequenceLength), dtype='int8')
+        # Store all-gap chunks too (and say so), so BinaryAlignment can treat any missing chunk as corruption
+        z = grp.create_array(name='align', shape=(self.sequenceCount, self.sequenceLength), dtype='int8',
+                             config={'write_empty_chunks': True})
         z.attrs.update({
             'species_list': species_list, 
             'species_index_map': species_index_map,
             'saved_columns': [list(self.saved_columns)],
-            'lengthes': [len(self[0].seq)]
+            'lengthes': [len(self[0].seq)],
+            'all_chunks_stored': True
         })
         z[:] = matrix
 
@@ -536,6 +540,16 @@ class BinaryAlignment(object):
             try:
                 arr = zarr.open_group(filename, mode='r')
                 align = arr['align']
+                # zarr fills missing chunks with fill_value (0, i.e. gap) instead of
+                # raising, so a store with zarr.json but no chunk data reads as all gaps.
+                # Stores written before 'all_chunks_stored' legitimately omit all-gap
+                # chunks, so for those only require some data (the query row is never all gaps)
+                expected = align.nchunks if align.attrs.get('all_chunks_stored') else 1
+                if align.nchunks_initialized < expected:
+                    raise ValueError(
+                        f"only {align.nchunks_initialized}/{align.nchunks} chunks of 'align' "
+                        f"are on disk (incomplete write?); regenerate it with overwrite=True"
+                    )
                 self.matrix = align[:]
                 self.weights = align.attrs.get('weights', None)
                 self.Beff = align.attrs.get('Beff', None)
@@ -545,7 +559,7 @@ class BinaryAlignment(object):
                 self.species_index_map = align.attrs.get('species_index_map', {})
                 self.species_list_map = {species: i for i, species in enumerate(self.species_list)}
             except Exception as e:
-                raise FileNotFoundError(f"Error loading Zarr file {filename}")
+                raise FileNotFoundError(f"Error loading Zarr file {filename}: {e}") from e
 
     def __repr__(self):
         return "<%s instance (%i records of length %i) at %x>" % (
@@ -643,6 +657,46 @@ class BinaryAlignment(object):
                     break
 
         self.saved_columns = new_saved_columns
+
+    def Saved_Columns_To_Bitmask(self):
+        """
+        Encode `saved_columns` as the bitmask an msv record stores.
+
+        One bit per column of each monomer, which reproduces the retained-column
+        lists exactly in a fraction of the space the JSON attribute took. The
+        per-monomer lengths ride along in the blob, so a reader can restore the
+        residue numbering without the alignment.
+
+        Returns
+        -------
+        `bytes`
+            The bitmask blob, or `b""` when this alignment has no saved columns
+        """
+        saved = getattr(self, 'saved_columns', None)
+        if not saved:
+            return b""
+
+        lengthes = [int(length) for length in (self.lengthes or [])]
+        if not lengthes:
+            # No per-monomer split recorded: treat the alignment as one monomer
+            # spanning the whole matrix.
+            if len(saved) != 1:
+                logger.warning(
+                    "saved_columns describes %d monomers but lengthes is empty; "
+                    "cannot build a bitmask", len(saved))
+                return b""
+            lengthes = [int(self.matrix.shape[1])]
+        if len(saved) != len(lengthes):
+            logger.warning(
+                "saved_columns describes %d monomers but lengthes has %d; "
+                "cannot build a bitmask", len(saved), len(lengthes))
+            return b""
+
+        try:
+            return saved_columns_to_bitmask(saved, lengthes)
+        except ValueError as e:
+            logger.warning(f"Could not build a saved-column bitmask: {e}")
+            return b""
 
     def Drop_Masked_Gap_Columns(self):
         """
@@ -826,14 +880,17 @@ class BinaryAlignment(object):
                 logger.error(f"File {filename} already exists. Use overwrite=True to overwrite it.")
                 return
         grp = zarr.open_group(store=filename)
-        z = grp.create_array(name='align', shape=self.matrix.shape, dtype='int8')
+        # Store all-gap chunks too (and say so), so BinaryAlignment can treat any missing chunk as corruption
+        z = grp.create_array(name='align', shape=self.matrix.shape, dtype='int8',
+                             config={'write_empty_chunks': True})
         z.attrs.update({
             'saved_columns': getattr(self, 'saved_columns', None),
             'species_list': getattr(self, 'species_list', None),
             'species_index_map': getattr(self, 'species_index_map', None),
             'lengthes': getattr(self, 'lengthes', [self.matrix.shape[1]]),
             'weights': getattr(self, 'weights', None),
-            'Beff': getattr(self, 'Beff', None)
+            'Beff': getattr(self, 'Beff', None),
+            'all_chunks_stored': True
         })
 
         z[:] = self.matrix

@@ -8,6 +8,8 @@ from ost import io
 from ost.geom import MinDistance, Vec3List
 from scipy.stats import ecdf, spearmanr
 
+from massivora.utils import bitmask_to_saved_columns
+
 logger = logging.getLogger(__name__)
 
 class BaseAnalyzer(object):
@@ -137,7 +139,7 @@ class BaseAnalyzer(object):
     def TruePositiveRatio(self, baseline_cp, new_cp):
         return new_cp / baseline_cp
 
-    def TruePositiveRate(self, nTP, nCouplings):
+    def Precision(self, nTP, nCouplings):
         if not nCouplings:
             return 0
         return nTP / nCouplings
@@ -196,12 +198,12 @@ class MonomerAnalyzer(BaseAnalyzer):
             self.nTP = super().TruePositiveCount(self.interface, self.positive_couplings)
         return self.nTP
 
-    def TruePositiveRate(self):
+    def Precision(self):
         if not self.nTP:
             self.nTP = self.TruePositiveCount()
         nCouplings = len(self.positive_couplings)
         if nCouplings == 0: return 0
-        return super().TruePositiveRate(self.nTP, nCouplings)
+        return super().Precision(self.nTP, nCouplings)
     
     def SpearmanCorrelation(self, query_analyzer):
         """
@@ -251,7 +253,7 @@ class MonomerAnalyzer(BaseAnalyzer):
 
         nTP_Query = super().TruePositiveCount(self.interface, couplings_query)
         TPRfull = self.TruePositiveRatio(self.nTP, nTP_Query)
-        TPR = super().TruePositiveRate(nTP_Query, len(couplings_query))
+        TPR = super().Precision(nTP_Query, len(couplings_query))
         BI = self.BenchmarkIndex(TPRfull, TPR)
         Spearman = self.SpearmanCorrelation(query_analyzer)
         print(f'TP Baseline: {self.nTP};\tTP Query: {nTP_Query};\tTPRfull (%): {TPRfull:.2%};\tTPR (%): {TPR:.2%};\tBI: {BI:.3f};\tSpearman: {Spearman[0]:.3f}')
@@ -401,6 +403,34 @@ class ComplexAnalyzer(BaseAnalyzer):
         inter.columns = col_labels
         return inter
 
+    def FilterMaskedByBitmask(self, bitmask, source_df):
+        """
+        Restore interprotein row and column labels from an msv saved-column bitmask.
+
+        The bitmask stored beside a coupling matrix carries the same retained
+        columns the zarr `saved_columns` attribute used to, so it is unpacked
+        and handed to `FilterMaskedBySavedColumns()`. Labels come back 1-based,
+        chain A on the rows and chain B on the columns.
+
+        Parameters
+        ----------
+        `bitmask` — bytes
+            Bitmask blob from the pair's msv record
+        `source_df` — pandas.DataFrame
+            Interprotein block to relabel, as returned by
+            `GetInterProtCouplingsByChainALength()`
+
+        Returns
+        -------
+        `pandas.DataFrame`
+            The block with its residue numbering restored
+        """
+        saved_columns, _ = bitmask_to_saved_columns(bitmask)
+        if len(saved_columns) < 2:
+            raise RuntimeError(
+                'Bitmask must describe at least two monomers to label an interprotein block')
+        return self.FilterMaskedBySavedColumns(saved_columns, source_df)
+
     def NormalizedCouplings(self, N_eff, full=False):
         """
         Convert the original coupling scores to EVcomplex scores.
@@ -461,7 +491,7 @@ class ComplexAnalyzer(BaseAnalyzer):
         TP_Query = self.TruePositiveCount(self.interface, couplings_query)
         if TP_Query == 0: raise RuntimeError(f'No true positive found for {ECfile_query}')
         TPRfull = self.TruePositiveRatio(self.TP_Baseline, TP_Query)
-        TPR = self.TruePositiveRate(TP_Query, len(couplings_query))
+        TPR = self.Precision(TP_Query, len(couplings_query))
         BI = self.BenchmarkIndex(TPRfull, TPR)
         print(f'TP Baseline: {self.TP_Baseline};\tTP Query: {TP_Query};\tTPRfull (%): {TPRfull:.2%};\tTPR (%): {TPR:.2%};\tBI: {BI:.3f}')
         return {'TP Baseline': self.TP_Baseline, 'TP Query': TP_Query, 'TPRfull': TPRfull, 'TPR': TPR, 'BI': BI}
@@ -657,7 +687,7 @@ class ComplexAnalyzer(BaseAnalyzer):
             return 0
         return self.TruePositiveCount(self.interface, top_k.to_dict())
 
-    def TopKTruePositiveRate(self, k):
+    def TopKPrecision(self, k):
         """
         Calculate the true positive rate among the top-k interprotein coupling pairs.
 
