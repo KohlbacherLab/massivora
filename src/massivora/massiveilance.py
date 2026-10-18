@@ -14,7 +14,8 @@ from massivora.config import load_project_and_system_config
 from massivora.db import (STATUS, connect_db, connect_db_ro, get_hashed_file_path,
                           get_table_names, quote_identifier)
 from massivora.job_loader import SlurmJobLoader
-from massivora.utils import SHM_PREFIX, compute_id_range, setup_logging
+from massivora.utils import (MSV_EXT, SHM_PREFIX, compute_id_range, read_score_record,
+                             scan_shard_headers, setup_logging, shard_path)
 
 WORKER_NAME = socket.gethostname()
 
@@ -310,25 +311,178 @@ def remove_cron_entry(cron_line):
     return True
 
 
-def _coupling_result_info(output_dir, couple_table, pair_name, file_hash):
-    """Read a finished pair's coupling result from zarr, or ``None`` if absent."""
-    filename, _ = get_hashed_file_path(pair_name, file_hash, output_dir)
-    if not os.path.exists(filename):
+#: plmDCA and GaussDCA couplings are calibrated by different logistic models
+_CALIBRATORS = {'plm': 'BuiltinPLMCalibrator', 'gauss': 'BuiltinGaussCalibrator'}
+
+
+def _calibrator_for(cfg):
+    """
+    The calibrator belonging to the configured coupling method.
+
+    A recovered pair has to be scored by the model the run itself used, so this
+    reads `couple.method` rather than guessing.
+
+    Parameters
+    ----------
+    `cfg` — dict
+        Configuration dict
+
+    Returns
+    -------
+    `BaseCalibrator` or `None`
+        `None` when the method is unknown or the analyzer cannot be imported
+    """
+    method = str(cfg.get('couple', {}).get('method', 'plm')).lower()
+    class_name = _CALIBRATORS.get(method)
+    if class_name is None:
+        logging.error(f"massiveilance on {WORKER_NAME}: unknown coupling method {method!r}; "
+                      "finished pairs of dead jobs will be re-queued instead of recovered")
         return None
     try:
-        grp = zarr.open_group(store=filename, mode='r')
-        arrays = set(grp.array_keys())
-        if couple_table not in arrays:
-            return None
-        info = {'length': int(grp[couple_table].shape[0]), 'number': None, 'effnumber': None}
-        if 'align' in arrays:
-            align = grp['align']
-            info['number'] = int(align.shape[0])
-            beff = align.attrs.get('Beff')
-            info['effnumber'] = None if beff is None else float(beff)
-        return info
-    except Exception:
+        import massivora.analyzer as analyzer
+        return getattr(analyzer, class_name)()
+    except Exception as e:
+        logging.error(f"massiveilance on {WORKER_NAME}: cannot load the {method} calibrator: {e}")
         return None
+
+
+def _shard_file_ids(output_dir, prefix):
+    """Numbers of the `prefix_NNN.msv` shards present in `output_dir`, in order."""
+    try:
+        entries = os.listdir(output_dir)
+    except OSError:
+        return []
+    head, tail = f"{prefix}_", f".{MSV_EXT}"
+    ids = []
+    for entry in entries:
+        if entry.startswith(head) and entry.endswith(tail):
+            stem = entry[len(head):-len(tail)]
+            if stem.isdigit():
+                ids.append(int(stem))
+    return sorted(ids)
+
+
+def _score_locations(output_dir, prefix, names):
+    """
+    Find where the shards hold the scores of `names`.
+
+    One header-only pass over every shard, so the coupling matrices themselves
+    are never read. A pair that was re-queued and computed again leaves its
+    earlier records behind, so the last record written wins.
+
+    Parameters
+    ----------
+    `output_dir` — str
+        Directory holding the shards
+    `prefix` — str
+        Shard name prefix, which is the couplings table name
+    `names` — iterable of str
+        Pair names to look for
+
+    Returns
+    -------
+    `dict`
+        Pair name to `(score_file_id, score_offset, score_len)`, for those found
+    """
+    wanted = set(names)
+    found = {}
+    if not wanted:
+        return found
+    for file_id in _shard_file_ids(output_dir, prefix):
+        path = shard_path(output_dir, prefix, file_id)
+        try:
+            headers = scan_shard_headers(path)
+        except Exception as e:
+            logging.warning(f"massiveilance on {WORKER_NAME}: cannot scan shard {path}: {e}")
+            continue
+        for offset, length, name, _n in headers:
+            if name in wanted:
+                found[name] = (file_id, offset, length)
+    return found
+
+
+def _alignment_counts(output_dir, pair_name, file_hash):
+    """`number` and `effnumber` of a pair's concatenated alignment, where the executor reads them."""
+    filename, _ = get_hashed_file_path(pair_name, file_hash, output_dir)
+    if not os.path.exists(filename):
+        return None, None
+    try:
+        grp = zarr.open_group(store=filename, mode='r')
+        if 'align' not in set(grp.array_keys()):
+            return None, None
+        align = grp['align']
+        beff = align.attrs.get('Beff')
+        return int(align.shape[0]), None if beff is None else float(beff)
+    except Exception:
+        return None, None
+
+
+def _coupling_result_info(output_dir, couple_table, row, location, calibrator):
+    """
+    Rebuild a finished pair's row from its shard record, or ``None`` to re-queue it.
+
+    The executor makes a score durable before it commits the row pointing at it,
+    so a readable record proves the pair finished and only its database update
+    was lost. The probabilities are not in the record, so they are calibrated
+    again here from the score, exactly as the executor would have done.
+
+    Parameters
+    ----------
+    `output_dir` — str
+        Directory holding the shards
+    `couple_table` — str
+        Couplings table name, which is also the shard prefix
+    `row` — Mapping
+        The pair's current database row
+    `location` — tuple
+        `(score_file_id, score_offset, score_len)` from `_score_locations()`
+    `calibrator` — BaseCalibrator or None
+        Calibrator for the configured method, from `_calibrator_for()`
+
+    Returns
+    -------
+    `dict` or `None`
+        Columns to write back, or `None` when the pair has to be computed again
+    """
+    file_id, offset, length = location
+    try:
+        record = read_score_record(output_dir, couple_table, file_id, offset, length)
+    except Exception as e:
+        logging.warning(f"massiveilance on {WORKER_NAME}: the score record of '{row['name']}' "
+                        f"is unreadable: {e}")
+        return None
+
+    score = record['matrix']
+    number, beff = _alignment_counts(output_dir, row['name'], row['file_hash'])
+    # The executor takes Beff from that same archive, so the two agree.
+    n_eff = row['effnumber'] if row['effnumber'] is not None else beff
+
+    if calibrator is None or n_eff is None or not record['lengthes']:
+        # A DONE row without pcontact silently drops out of every analysis query,
+        # so leaving the pair to be computed again is the lesser evil.
+        logging.warning(f"massiveilance on {WORKER_NAME}: found the score of '{row['name']}' but "
+                        "cannot calibrate it; re-queuing the pair instead")
+        return None
+
+    try:
+        from massivora.analyzer import ComplexAnalyzer
+        analyzer = ComplexAnalyzer(score, saved_columns=record['saved_columns'],
+                                   chainA_length=record['lengthes'][0], EC_threshold=0)
+        calibrated = calibrator.Calibrate(analyzer, float(n_eff))
+    except Exception as e:
+        logging.warning(f"massiveilance on {WORKER_NAME}: cannot calibrate '{row['name']}' "
+                        f"from its score record: {e}")
+        return None
+
+    return {
+        'length': int(score.shape[0]),
+        'number': number,
+        'effnumber': float(n_eff),
+        'score_file_id': file_id,
+        'score_offset': offset,
+        'score_len': length,
+        **calibrated,
+    }
 
 
 def _alignment_result_info(monomers_dir, pid):
@@ -371,7 +525,9 @@ def fix_zombie_tasks(cfg, command):
         is_coupling_task = False
     elif command == 'couple':
         task_table = quote_identifier(table_names['couplings'])
-        select_columns = 'id, name, pid1, pid2, status, job_id, file_hash, number, length, effnumber'
+        select_columns = ('id, name, pid1, pid2, status, job_id, file_hash, number, length, '
+                          'effnumber, pcontact, neffoverL, log_lr_raw, confidence_flag, '
+                          'high_precision_hit, score_file_id, score_offset, score_len')
         is_coupling_task = True
     else:
         logging.error(f"massiveilance on {WORKER_NAME}: invalid command {command} for zombie task recovery")
@@ -413,20 +569,28 @@ def fix_zombie_tasks(cfg, command):
     job_ids_to_fix = set([str(r['job_id']) for r in rows if r['job_id']]) - alive
 
     fixed = 0
-    try:
-        for r in rows:
-            jid = str(r['job_id'])
-            if jid not in job_ids_to_fix:
-                continue
+    dead = [r for r in rows if r['job_id'] and str(r['job_id']) in job_ids_to_fix]
 
+    # Where the dead jobs' scores ended up, found in one pass over the shards
+    # rather than one per pair.
+    locations = {}
+    calibrator = None
+    if is_coupling_task and dead:
+        locations = _score_locations(couplings_output_dir, couple_table_name,
+                                     [r['name'] for r in dead])
+        if locations:
+            calibrator = _calibrator_for(cfg)
+
+    try:
+        for r in dead:
             old_status = r['status']
 
-            # A dead job whose executor already wrote its result zarr actually
-            # finished; only its DB status update was lost. Mark it DONE instead
-            # of re-queuing it
-            if is_coupling_task: # TODO: check the probabilities records as well
-                result = _coupling_result_info(
-                    couplings_output_dir, couple_table_name, r['name'], r['file_hash']
+            # A dead job whose score is already in a shard actually finished; only
+            # its DB update was lost. Rebuild the row instead of re-queuing it.
+            if is_coupling_task:
+                location = locations.get(r['name'])
+                result = None if location is None else _coupling_result_info(
+                    couplings_output_dir, couple_table_name, r, location, calibrator
                 )
             else:
                 result = _alignment_result_info(monomers_dir, r['pid'])
