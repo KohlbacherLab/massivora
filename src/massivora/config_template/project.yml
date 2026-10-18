@@ -86,6 +86,8 @@ couple:
   db_table: couplings
   claim_batch_size: auto  # 'auto' or integer
   memory_limit: 0.9
+  # Every finished pair's CN score matrix is always stored in the msv shards.
+  # These two are about the Jij coupling tensor, which is not stored yet.
   keep_coupling_matrix: false
   coupling_matrix_keep_option: all  # 'all' or 'top'
 
@@ -101,6 +103,10 @@ couple:
   # GaussDCA parameters
   pseudocount: 0.8
   gauss_threads: auto  # 'auto' or integer
+  gpu_sessions: 4  # concurrent pairs per GPU
+  gpu_memory_limit: 0.9  # share of each GPU's free memory the pairs in flight may hold
+  gpu_host_processes: auto  # processes loading alignments and analysing scores; 'auto' or integer (0: in the coordinator)
+  gpu_workers: 16  # pairs in flight; at least gpu_sessions x GPUs + gpu_host_processes
 
   # Applies when one wants to split the calculation to multiple clusters
   # portion: 1.0
