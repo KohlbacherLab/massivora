@@ -53,23 +53,41 @@ namespace cuda {
 // Error handling
 // ---------------------------------------------------------------------------
 
+// The device could not hold a pair. Its memory has been handed back and the
+// context is intact, so the next pair can run.
+struct OutOfMemory : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+// The CUDA context is gone. An illegal address, a failed launch and the like
+// are sticky: every later call in the process fails the same way, whichever
+// Session makes it, so only a new process can use the device again.
+struct DeviceLost : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 inline void cuda_check(cudaError_t e, const char* what, int line) {
-    if (e != cudaSuccess)
-        throw std::runtime_error(std::string("gauss_dca_cuda: ") + what + ": " +
-                                 cudaGetErrorString(e) + " (line " +
-                                 std::to_string(line) + ")");
+    if (e == cudaSuccess) return;
+    const std::string msg = std::string("gauss_dca_cuda: ") + what + ": " +
+                            cudaGetErrorString(e) + " (line " + std::to_string(line) + ")";
+    if (e == cudaErrorMemoryAllocation) throw OutOfMemory(msg);
+    throw std::runtime_error(msg);
 }
 inline void cublas_check(cublasStatus_t s, const char* what, int line) {
-    if (s != CUBLAS_STATUS_SUCCESS)
-        throw std::runtime_error(std::string("gauss_dca_cuda: cuBLAS ") + what +
-                                 " failed with status " + std::to_string((int)s) +
-                                 " (line " + std::to_string(line) + ")");
+    if (s == CUBLAS_STATUS_SUCCESS) return;
+    const std::string msg = std::string("gauss_dca_cuda: cuBLAS ") + what +
+                            " failed with status " + std::to_string((int)s) +
+                            " (line " + std::to_string(line) + ")";
+    if (s == CUBLAS_STATUS_ALLOC_FAILED) throw OutOfMemory(msg);
+    throw std::runtime_error(msg);
 }
 inline void cusolver_check(cusolverStatus_t s, const char* what, int line) {
-    if (s != CUSOLVER_STATUS_SUCCESS)
-        throw std::runtime_error(std::string("gauss_dca_cuda: cuSOLVER ") + what +
-                                 " failed with status " + std::to_string((int)s) +
-                                 " (line " + std::to_string(line) + ")");
+    if (s == CUSOLVER_STATUS_SUCCESS) return;
+    const std::string msg = std::string("gauss_dca_cuda: cuSOLVER ") + what +
+                            " failed with status " + std::to_string((int)s) +
+                            " (line " + std::to_string(line) + ")";
+    if (s == CUSOLVER_STATUS_ALLOC_FAILED) throw OutOfMemory(msg);
+    throw std::runtime_error(msg);
 }
 #define GD_CUDA(x)     ::gaussdca::cuda::cuda_check((x), #x, __LINE__)
 #define GD_CUBLAS(x)   ::gaussdca::cuda::cublas_check((x), #x, __LINE__)
@@ -228,6 +246,107 @@ inline cusolverStatus_t xpotrf(cusolverDnHandle_t h, int n, float* A, int lda,
 inline cusolverStatus_t xpotrf(cusolverDnHandle_t h, int n, double* A, int lda,
                                double* work, int lw, int* info) {
     return cusolverDnDpotrf(h, CUBLAS_FILL_MODE_LOWER, n, A, lda, work, lw, info);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 0 -- sequence reweighting neighbour counts
+//
+// The counts behind the weights w = 1/m, as the CPU core's
+// reweightNeighbourCounts computes them: m[b] is how many sequences, b itself
+// included, agree with sequence b at >= the threshold of the N positions. The
+// pairwise kernel is the alignment module's pairwise_similarity_tiled (see
+// cuda_kernels.cuh for how it works) with the threshold taken as an integer:
+// a match count is an integer, so ">= t" is ">= ceil(t)", which the caller
+// works out in double exactly as the CPU core compares.
+// ---------------------------------------------------------------------------
+
+constexpr int GD_RW_TILE  = 32;                 // rows per tile
+constexpr int GD_RW_CHUNKW = 32;                // uint32 words staged per pass
+constexpr int GD_RW_TY    = 8;                  // threadIdx.y extent
+constexpr int GD_RW_PT    = GD_RW_TILE / GD_RW_TY;
+
+// (N, B) residue-major -> (B, row) sequence-major, row >= N bytes; the caller
+// zeroes the buffer so the tail of each row is zero padding.
+__global__ void k_seq_major(const int8_t* __restrict__ MSA, int N, int B, long row,
+                            uint8_t* __restrict__ out) {
+    __shared__ uint8_t tile[32][33];
+    const int b0 = blockIdx.x * 32, i0 = blockIdx.y * 32;
+    for (int k = threadIdx.y; k < 32; k += blockDim.y) {
+        const int i = i0 + k, b = b0 + threadIdx.x;
+        if (i < N && b < B) tile[k][threadIdx.x] = (uint8_t)MSA[(long)i * B + b];
+    }
+    __syncthreads();
+    for (int k = threadIdx.y; k < 32; k += blockDim.y) {
+        const int b = b0 + k, i = i0 + threadIdx.x;
+        if (i < N && b < B) out[(long)b * row + i] = tile[threadIdx.x][k];
+    }
+}
+
+__global__ void k_fill_ones(int* __restrict__ m, int B) {
+    for (long t = blockIdx.x * (long)blockDim.x + threadIdx.x; t < B;
+         t += (long)gridDim.x * blockDim.x)
+        m[t] = 1;                               // every sequence matches itself
+}
+
+// Upper triangle of TILE x TILE blocks; m[] must start at 1.
+__global__ void k_similarity(const unsigned int* __restrict__ msa32, int* __restrict__ m,
+                             int B, int Nw, int pad, int threshold) {
+    const int tI = blockIdx.x, tJ = blockIdx.y;
+    if (tJ < tI) return;
+    const int i0 = tI * GD_RW_TILE, j0 = tJ * GD_RW_TILE;
+    if (i0 >= B || j0 >= B) return;
+
+    __shared__ unsigned int sA[GD_RW_CHUNKW][GD_RW_TILE + 1];
+    __shared__ unsigned int sB[GD_RW_CHUNKW][GD_RW_TILE + 1];
+    __shared__ int cntA[GD_RW_TILE], cntB[GD_RW_TILE];
+
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = tx + ty * GD_RW_TILE;
+    const int nthread = GD_RW_TILE * GD_RW_TY;
+    if (tid < GD_RW_TILE) { cntA[tid] = 0; cntB[tid] = 0; }
+
+    int acc[GD_RW_PT];
+#pragma unroll
+    for (int k = 0; k < GD_RW_PT; ++k) acc[k] = 0;
+
+    for (int c0 = 0; c0 < Nw; c0 += GD_RW_CHUNKW) {
+        __syncthreads();
+        for (int idx = tid; idx < GD_RW_TILE * GD_RW_CHUNKW; idx += nthread) {
+            const int r = idx / GD_RW_CHUNKW, w = idx % GD_RW_CHUNKW;
+            const int c = c0 + w;
+            const int ga = i0 + r, gb = j0 + r;
+            sA[w][r] = (ga < B && c < Nw) ? msa32[(size_t)ga * Nw + c] : 0u;
+            sB[w][r] = (gb < B && c < Nw) ? msa32[(size_t)gb * Nw + c] : 0u;
+        }
+        __syncthreads();
+        const int wmax = (Nw - c0) < GD_RW_CHUNKW ? (Nw - c0) : GD_RW_CHUNKW;
+        for (int w = 0; w < wmax; ++w) {
+            const unsigned int bw = sB[w][tx];
+#pragma unroll
+            for (int k = 0; k < GD_RW_PT; ++k) {
+                const unsigned int x = sA[w][ty + k * GD_RW_TY] ^ bw;
+                // Zero bytes of x are the residues that matched.
+                const unsigned int nz = ((x & 0x7F7F7F7Fu) + 0x7F7F7F7Fu) | x | 0x7F7F7F7Fu;
+                acc[k] += __popc(~nz);
+            }
+        }
+    }
+    __syncthreads();
+
+    const int j = j0 + tx;
+#pragma unroll
+    for (int k = 0; k < GD_RW_PT; ++k) {
+        const int i = i0 + ty + k * GD_RW_TY;
+        if (i < B && j < B && i < j && acc[k] - pad >= threshold) {
+            atomicAdd(&cntA[ty + k * GD_RW_TY], 1);
+            atomicAdd(&cntB[tx], 1);
+        }
+    }
+    __syncthreads();
+    if (tid < GD_RW_TILE) {
+        if (i0 + tid < B && cntA[tid]) atomicAdd(&m[i0 + tid], cntA[tid]);
+        if (j0 + tid < B && cntB[tid]) atomicAdd(&m[j0 + tid], cntB[tid]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,31 +1120,71 @@ inline void lauum_blocked_half(cublasHandle_t hb, cudaStream_t stream, const flo
 }
 
 // ---------------------------------------------------------------------------
-// Device buffer that grows on demand, so a batch of pairs reuses one allocation
+// Device memory for one pair
+//
+// Every buffer a pair needs comes from the device's stream-ordered pool and
+// goes back to it when the pair is done, so a Session holds no device memory
+// between pairs and the next pair, on whichever Session, reuses it. Buffers
+// kept at the largest pair each Session had seen would add up, over a long
+// run, to more than the device holds -- and the caller could not account for
+// them. Allocating and freeing through the pool does not synchronise the
+// device, so concurrent Sessions do not stall each other the way
+// cudaMalloc/cudaFree would.
 // ---------------------------------------------------------------------------
 
-class DevBuf {
+class PairArena {
 public:
-    DevBuf() = default;
-    ~DevBuf() { if (p_) cudaFree(p_); }
-    DevBuf(const DevBuf&) = delete;
-    DevBuf& operator=(const DevBuf&) = delete;
-    void* reserve(size_t bytes) {
-        if (bytes > cap_) {
-            if (p_) GD_CUDA(cudaFree(p_));
-            p_ = nullptr;
-            GD_CUDA(cudaMalloc(&p_, bytes));
-            cap_ = bytes;
+    PairArena(cudaStream_t stream, cudaMemPool_t pool) : stream_(stream), pool_(pool) {}
+    ~PairArena() { release(); }
+    PairArena(const PairArena&) = delete;
+    PairArena& operator=(const PairArena&) = delete;
+
+    template <class T> T* get(size_t bytes) {
+        void* p = nullptr;
+        cudaError_t e = alloc(&p, bytes);
+        if (e == cudaErrorMemoryAllocation && pool_) {
+            // What the pool keeps cached for later pairs may be what is missing.
+            cudaGetLastError();
+            cudaMemPoolTrimTo(pool_, 0);
+            e = alloc(&p, bytes);
         }
-        return p_;
+        if (e != cudaSuccess) {
+            const std::string msg = "gauss_dca_cuda: allocating " +
+                                    std::to_string(bytes >> 20) + " MiB on the device: " +
+                                    cudaGetErrorString(e);
+            if (e == cudaErrorMemoryAllocation) throw OutOfMemory(msg);
+            throw std::runtime_error(msg);
+        }
+        ptrs_.push_back(p);
+        bytes_ += bytes;
+        return static_cast<T*>(p);
     }
-    template <class T> T* as() { return static_cast<T*>(p_); }
-    size_t capacity() const { return cap_; }
+
+    // Free everything, ordered after the work queued on the stream. Errors are
+    // dropped: after a device fault there is nothing left to free.
+    void release() noexcept {
+        for (void* p : ptrs_) {
+            if (pool_) cudaFreeAsync(p, stream_);
+            else cudaFree(p);
+        }
+        ptrs_.clear();
+    }
+
+    size_t bytes() const { return bytes_; }
+
 private:
-    void* p_ = nullptr;
-    size_t cap_ = 0;
+    cudaError_t alloc(void** p, size_t bytes) {
+        return pool_ ? cudaMallocAsync(p, bytes, stream_) : cudaMalloc(p, bytes);
+    }
+
+    cudaStream_t stream_;
+    cudaMemPool_t pool_;           // null where the device has no memory pools
+    std::vector<void*> ptrs_;
+    size_t bytes_ = 0;
 };
 
+// Pinned host staging. It grows to the largest pair a Session has seen and is
+// kept: it is host memory, and bounded by that one pair.
 class HostBuf {
 public:
     HostBuf() = default;
@@ -1036,6 +1195,7 @@ public:
         if (bytes > cap_) {
             if (p_) GD_CUDA(cudaFreeHost(p_));
             p_ = nullptr;
+            cap_ = 0;              // a failed alloc below must not leave a stale size
             GD_CUDA(cudaHostAlloc(&p_, bytes, cudaHostAllocDefault));
             cap_ = bytes;
         }
@@ -1054,7 +1214,8 @@ struct Timings {
 };
 
 // ---------------------------------------------------------------------------
-// Session: holds the CUDA context, the handles and the scratch
+// Session: holds the CUDA context, the handles and the host staging. Device
+// memory is taken per pair from the device's pool (see PairArena).
 // ---------------------------------------------------------------------------
 
 class Session {
@@ -1073,6 +1234,19 @@ public:
         name_ = prop.name;
         sm_major_ = prop.major;
         sm_minor_ = prop.minor;
+
+        int pools = 0;
+        GD_CUDA(cudaDeviceGetAttribute(&pools, cudaDevAttrMemoryPoolsSupported, device));
+        if (pools) {
+            // Sessions on one device share its default pool. Keep what pairs
+            // hand back cached for the next ones instead of returning it to the
+            // driver at every synchronisation: the caller's admission control
+            // bounds what the pairs in flight hold, and a pair that finds the
+            // cache in its way trims it (PairArena::get).
+            GD_CUDA(cudaDeviceGetDefaultMemPool(&pool_, device));
+            uint64_t keep = UINT64_MAX;
+            GD_CUDA(cudaMemPoolSetAttribute(pool_, cudaMemPoolAttrReleaseThreshold, &keep));
+        }
     }
     ~Session() {
         if (hb_) cublasDestroy(hb_);
@@ -1097,20 +1271,46 @@ public:
         return tensor_path() ? "tf32 potrf/trtri + fp16 lauum" : "fp32";
     }
 
-    // Free memory needed for one (N, B) pair, in bytes. Used for admission
-    // control before the pair is dispatched.
+    // Device memory one (N, B) pair takes, in bytes: what the caller reserves
+    // for it before dispatch. Every buffer run() allocates is counted; the slack
+    // covers the Cholesky workspace, whose size only cuSOLVER knows, and the
+    // pool's rounding. last_pair_bytes() reports what a pair really took.
     template <class S>
     static size_t device_bytes(int N, int B, int q) {
         const long NQ = (long)N * (q - 1);
         const long np = pad(NQ);
         const long Bp = padB(B);
-        return 2 * (size_t)np * np * sizeof(S)
+        return 2 * (size_t)np * np * sizeof(S)          // C (then C^-1) and R
              + (size_t)np * np * sizeof(__half)         // fp16 lauum operand
              + (size_t)np * np * sizeof(S)              // TF32 merge scratch
-             + (size_t)N * B + (size_t)N * Bp
+             + (size_t)32 * np * sizeof(S)              // batched trtri tile
+             + (size_t)N * B + (size_t)N * Bp           // alignment, raw and recoded
+             + (size_t)B * sizeof(double)
              + (size_t)Bp * (sizeof(double) + sizeof(float))
-             + (size_t)N * N * (sizeof(double) + sizeof(float)) + (32u << 20);
+             + (size_t)NQ * sizeof(double)              // fi
+             + pair_groups(N) * sizeof(int2)
+             + (size_t)N * N * (sizeof(double) + sizeof(float))
+             + (size_t)(N + 1) * sizeof(double)
+             + (64u << 20);
     }
+
+    // Device memory neighbour_counts_into takes for an (N, B) alignment. It is
+    // never more than device_bytes -- the raw and recoded alignments and the
+    // weight vectors there already cover it -- so the counts can run inside
+    // the reservation the pair is admitted with, before its score.
+    static size_t reweight_bytes(int N, int B) {
+        const long row = 4L * ((N + 3) / 4);
+        return (size_t)N * B + (size_t)B * row + (size_t)B * sizeof(int);
+    }
+
+    // Device memory the last successful call took, in bytes.
+    size_t last_pair_bytes() const { return last_pair_bytes_; }
+
+    // Sequence reweighting neighbour counts, (N, B) alignment -> (B,) counts:
+    // what the CPU core's reweightNeighbourCounts returns for the same matrix
+    // and identical_threshold (x * N).
+    void neighbour_counts_into(const int8_t* MSA, int N, int B, double identical_threshold,
+                               int32_t* counts_out);
 
     // Full pipeline: covariance -> inverse -> Frobenius norm -> APC.
     void score_into(const int8_t* MSA, int N, int B, const double* W, double Beff,
@@ -1127,15 +1327,29 @@ public:
 
     static long pad(long n) { return ((n + GD_BOT - 1) / GD_BOT) * GD_BOT; }
     static long padB(int B) { return ((long)(B + 15) / 16) * 16; }
+    // Blocks of the pair-frequency kernel: one per GD_PAIR_WARPS columns j > i.
+    static size_t pair_groups(int N) {
+        size_t g = 0;
+        for (int i = 0; i < N; ++i) g += (size_t)(N - 1 - i + GD_PAIR_WARPS - 1) / GD_PAIR_WARPS;
+        return g;
+    }
 
 private:
     template <class S>
     void run(const int8_t* MSA, int N, int B, const double* W, double Beff, int q,
              double pseudocount, float* score_out, double* cpl_out);
+    template <class S>
+    void run_pair(PairArena& arena, const int8_t* MSA, int N, int B, const double* W,
+                  double Beff, int q, double pseudocount, float* score_out,
+                  double* cpl_out);
+    template <class F> void with_arena(F&& body);
+    bool settle() noexcept;
 
     cublasHandle_t hb_ = nullptr;
     cusolverDnHandle_t hs_ = nullptr;
     cudaStream_t stream_ = nullptr;
+    cudaMemPool_t pool_ = nullptr;
+    size_t last_pair_bytes_ = 0;
     std::unique_ptr<StreamFan> fan_;
     std::vector<MergeNode> merge_;
     int merge_levels_ = 0;
@@ -1147,8 +1361,6 @@ private:
     bool profile_ = false;
     Timings t_;
 
-    DevBuf dMSA_, dMSAc_, dW_, dWd_, dWf_, dFi_, dGroups_, dA_, dR_, dTmp_,
-           dFN_, dSi_, dScore_, dWork_, dInfo_, dHalf_, dNorm_, dMerge_;
     HostBuf hMSA_, hScore_;
     std::vector<int2> groups_;
     int cached_groups_N_ = -1;
@@ -1184,9 +1396,89 @@ private:
     cudaEvent_t a_ = nullptr, b_ = nullptr;
 };
 
+// After a failed pair: wait out whatever it left queued, put the cuBLAS handle
+// back on the main stream (run_levels moves it onto the fan) and drop a
+// non-sticky error, so it does not resurface at the next pair's launch check.
+// Returns false when the context itself is gone.
+inline bool Session::settle() noexcept {
+    cudaSetDevice(device_);
+    bool ok = cudaStreamSynchronize(stream_) == cudaSuccess;
+    for (int i = 0; i < fan_->size(); ++i)
+        ok = cudaStreamSynchronize(fan_->at(i)) == cudaSuccess && ok;
+    cublasSetStream(hb_, stream_);
+    cudaGetLastError();
+    return ok;
+}
+
 template <class S>
 void Session::run(const int8_t* MSA, int N, int B, const double* W, double Beff,
                   int q, double pseudocount, float* score_out, double* cpl_out) {
+    with_arena([&](PairArena& arena) {
+        run_pair<S>(arena, MSA, N, B, W, Beff, q, pseudocount, score_out, cpl_out);
+    });
+}
+
+// Run `body` with device memory for one call, all of it handed back after.
+template <class F>
+void Session::with_arena(F&& body) {
+    PairArena arena(stream_, pool_);
+    try {
+        body(arena);
+    } catch (const std::exception& ex) {
+        // Free only once every stream that may still use the buffers is idle;
+        // freeing on stream_ alone would let the pool hand them out while the
+        // fan is still writing them.
+        if (!settle())
+            throw DeviceLost(std::string(ex.what()) +
+                             " -- the CUDA context is lost; restart the process");
+        arena.release();
+        if (pool_ && dynamic_cast<const OutOfMemory*>(&ex)) {
+            cudaStreamSynchronize(stream_);
+            cudaMemPoolTrimTo(pool_, 0);        // a library allocation may need it
+        }
+        throw;
+    }
+    last_pair_bytes_ = arena.bytes();
+}
+
+inline void Session::neighbour_counts_into(const int8_t* MSA, int N, int B,
+                                           double identical_threshold, int32_t* counts_out) {
+    if (N < 1 || B < 1)
+        throw std::runtime_error("gauss_dca_cuda: need N >= 1 and B >= 1");
+    // An integer threshold the kernel can compare exactly; clamped to what a
+    // match count can reach, so it fits an int.
+    const double t = std::ceil(identical_threshold);
+    const int threshold = t <= 0.0 ? 0 : (t > N ? N + 1 : (int)t);
+    const int Nw = (N + 3) / 4;
+    const long row = 4L * Nw;
+
+    with_arena([&](PairArena& arena) {
+        GD_CUDA(cudaSetDevice(device_));        // see run_pair
+        int8_t*  dMSA = arena.get<int8_t>((size_t)N * B);
+        uint8_t* dSeq = arena.get<uint8_t>((size_t)B * row);
+        int*     dM   = arena.get<int>((size_t)B * sizeof(int));
+
+        int8_t* hMSA = (int8_t*)hMSA_.reserve((size_t)N * B);
+        std::memcpy(hMSA, MSA, (size_t)N * B);
+        GD_CUDA(cudaMemcpyAsync(dMSA, hMSA, (size_t)N * B, cudaMemcpyHostToDevice, stream_));
+        GD_CUDA(cudaMemsetAsync(dSeq, 0, (size_t)B * row, stream_));
+        k_seq_major<<<dim3((B + 31) / 32, (N + 31) / 32), dim3(32, 8), 0, stream_>>>(
+            dMSA, N, B, row, dSeq);
+        k_fill_ones<<<(B + 255) / 256, 256, 0, stream_>>>(dM, B);
+        const int ntile = (B + GD_RW_TILE - 1) / GD_RW_TILE;
+        k_similarity<<<dim3(ntile, ntile), dim3(GD_RW_TILE, GD_RW_TY), 0, stream_>>>(
+            (const unsigned int*)dSeq, dM, B, Nw, (int)(row - N), threshold);
+        GD_CUDA(cudaGetLastError());
+        GD_CUDA(cudaMemcpyAsync(counts_out, dM, (size_t)B * sizeof(int),
+                                cudaMemcpyDeviceToHost, stream_));
+        GD_CUDA(cudaStreamSynchronize(stream_));
+    });
+}
+
+template <class S>
+void Session::run_pair(PairArena& arena, const int8_t* MSA, int N, int B,
+                       const double* W, double Beff, int q, double pseudocount,
+                       float* score_out, double* cpl_out) {
     const int Q = q - 1;
     if (Q < 1 || Q > 32)
         throw std::runtime_error("gauss_dca_cuda: alphabet size q must satisfy 2 <= q <= 33");
@@ -1215,19 +1507,19 @@ void Session::run(const int8_t* MSA, int N, int B, const double* W, double Beff,
     StageTimer tm(profile_, stream_);
 
     // ---- buffers -----------------------------------------------------------
-    int8_t*  dMSA    = (int8_t*) dMSA_.reserve((size_t)N * B);
-    uint8_t* dMSAc   = (uint8_t*)dMSAc_.reserve((size_t)N * Bp);
-    double*  dW    = (double*) dW_.reserve((size_t)B * sizeof(double));
-    double*  dWd   = (double*) dWd_.reserve((size_t)Bp * sizeof(double));
-    float*   dWf   = (float*)  dWf_.reserve((size_t)Bp * sizeof(float));
-    double*  dFi   = (double*) dFi_.reserve((size_t)NQ * sizeof(double));
-    S*       dA    = (S*)      dA_.reserve((size_t)np * np * sizeof(S));
-    S*       dR    = (S*)      dR_.reserve((size_t)np * np * sizeof(S));
-    S*       dTmp  = (S*)      dTmp_.reserve((size_t)32 * np * sizeof(S));
-    double*  dFN   = (double*) dFN_.reserve((size_t)N * N * sizeof(double));
-    double*  dSi   = (double*) dSi_.reserve((size_t)(N + 1) * sizeof(double));
-    float*   dSc   = (float*)  dScore_.reserve((size_t)N * N * sizeof(float));
-    int*     dInfo = (int*)    dInfo_.reserve(sizeof(int));
+    int8_t*  dMSA  = arena.get<int8_t>((size_t)N * B);
+    uint8_t* dMSAc = arena.get<uint8_t>((size_t)N * Bp);
+    double*  dW    = arena.get<double>((size_t)B * sizeof(double));
+    double*  dWd   = arena.get<double>((size_t)Bp * sizeof(double));
+    float*   dWf   = arena.get<float>((size_t)Bp * sizeof(float));
+    double*  dFi   = arena.get<double>((size_t)NQ * sizeof(double));
+    S*       dA    = arena.get<S>((size_t)np * np * sizeof(S));
+    S*       dR    = arena.get<S>((size_t)np * np * sizeof(S));
+    S*       dTmp  = arena.get<S>((size_t)32 * np * sizeof(S));
+    double*  dFN   = arena.get<double>((size_t)N * N * sizeof(double));
+    double*  dSi   = arena.get<double>((size_t)(N + 1) * sizeof(double));
+    float*   dSc   = arena.get<float>((size_t)N * N * sizeof(float));
+    int*     dInfo = arena.get<int>(sizeof(int));
 
     // ---- upload ------------------------------------------------------------
     tm.start();
@@ -1237,17 +1529,17 @@ void Session::run(const int8_t* MSA, int N, int B, const double* W, double Beff,
     GD_CUDA(cudaMemcpyAsync(dW, W, (size_t)B * sizeof(double), cudaMemcpyHostToDevice,
                             stream_));
 
-    if ((int)groups_.size() == 0 || cached_groups_N_ != N) {
+    if (cached_groups_N_ != N) {
+        cached_groups_N_ = -1;              // stays unset if the rebuild throws
         groups_.clear();
         for (int i = 0; i < N; ++i)
             for (int j0 = i + 1; j0 < N; j0 += GD_PAIR_WARPS)
                 groups_.push_back(make_int2(i, j0));
         cached_groups_N_ = N;
-        int2* dG = (int2*)dGroups_.reserve(groups_.size() * sizeof(int2));
-        GD_CUDA(cudaMemcpyAsync(dG, groups_.data(), groups_.size() * sizeof(int2),
-                                cudaMemcpyHostToDevice, stream_));
     }
-    const int2* dGroups = (const int2*)dGroups_.as<int2>();
+    int2* dGroups = arena.get<int2>(groups_.size() * sizeof(int2));
+    GD_CUDA(cudaMemcpyAsync(dGroups, groups_.data(), groups_.size() * sizeof(int2),
+                            cudaMemcpyHostToDevice, stream_));
     tm.stop(&t_.upload);
 
     // ---- covariance --------------------------------------------------------
@@ -1281,7 +1573,7 @@ void Session::run(const int8_t* MSA, int N, int B, const double* W, double Beff,
     tm.start();
     int lwork = 0;
     GD_CUSOLVER(xpotrf_buffer(hs_, (int)np, dA, (int)np, &lwork));
-    S* dWork = (S*)dWork_.reserve((size_t)lwork * sizeof(S));
+    S* dWork = arena.get<S>((size_t)std::max(lwork, 1) * sizeof(S));
     if (tensor_path() && std::is_same<S, float>::value) {
         potrf_blocked_tf32(hb_, hs_, (float*)dA, np, np, (float*)dWork, lwork, dInfo);
     } else {
@@ -1301,7 +1593,7 @@ void Session::run(const int8_t* MSA, int N, int B, const double* W, double Beff,
     float* mscratch = nullptr;
     const bool tc = tensor_path() && std::is_same<S, float>::value;
     if (tc && merge_scratch_ > 0)
-        mscratch = (float*)dMerge_.reserve(merge_scratch_ * sizeof(float));
+        mscratch = arena.get<float>(merge_scratch_ * sizeof(float));
     trtri<S>(hb_, stream_, *fan_, dA, dR, np, dTmp, merge_, merge_levels_,
              tc, mscratch, merge_scratch_);
     tm.stop(&t_.trtri);
@@ -1310,8 +1602,8 @@ void Session::run(const int8_t* MSA, int N, int B, const double* W, double Beff,
     tm.start();
     if (tc) {
         // R in half plus the norm scratch; the result lands straight in A.
-        __half* hbuf = (__half*)dHalf_.reserve((size_t)np * np * sizeof(__half));
-        float* scratch = (float*)dNorm_.reserve(sizeof(float));
+        __half* hbuf = arena.get<__half>((size_t)np * np * sizeof(__half));
+        float* scratch = arena.get<float>(sizeof(float));
         lauum_blocked_half(hb_, stream_, (const float*)dR, (float*)dA, np, hbuf,
                            scratch);
     } else {
@@ -1324,9 +1616,9 @@ void Session::run(const int8_t* MSA, int N, int B, const double* W, double Beff,
         tm.start();
         // k_score fills the strictly lower and upper blocks and leaves the
         // diagonal alone, exactly as the CPU core does -- but there the vector
-        // is zero-initialised per call, while dFN is reused across pairs in a
-        // --serve run. Without this the APC row sums pick up the previous
-        // pair's values (and, when N changes, read them at shifted offsets).
+        // is zero-initialised per call, while dFN comes from the pool holding
+        // whatever an earlier pair left there. Without this the APC row sums
+        // pick up those values.
         GD_CUDA(cudaMemsetAsync(dFN, 0, (size_t)N * N * sizeof(double), stream_));
         k_score<S><<<N, 32 * GD_RED_WARPS, 0, stream_>>>(dA, N, Q, np, dFN);
         k_rowsums<<<N, 256, 0, stream_>>>(dFN, N, dSi);

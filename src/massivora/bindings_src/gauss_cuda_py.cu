@@ -76,6 +76,23 @@ public:
         return out;
     }
 
+    py::array_t<int32_t> neighbour_counts(
+            py::array_t<int8_t, py::array::c_style | py::array::forcecast> MSA,
+            double identical_threshold) {
+        if (MSA.ndim() != 2)
+            throw std::invalid_argument("MSA must be (N, M), residue-major");
+        const int N = (int)MSA.shape(0);
+        const int M = (int)MSA.shape(1);
+        py::array_t<int32_t> out((py::ssize_t)M);
+        const int8_t* zp = MSA.data();
+        int32_t* op = out.mutable_data();
+        {
+            py::gil_scoped_release unlock;
+            sess_->neighbour_counts_into(zp, N, M, identical_threshold, op);
+        }
+        return out;
+    }
+
     std::string device_name() const { return sess_->device_name(); }
     std::string arithmetic() const { return sess_->arithmetic(); }
     py::dict timings() const {
@@ -88,6 +105,7 @@ public:
         return d;
     }
     void set_profile(bool on) { sess_->set_profile(on); }
+    size_t last_pair_bytes() const { return sess_->last_pair_bytes(); }
 
 private:
     std::unique_ptr<gaussdca::cuda::Session> sess_;
@@ -143,18 +161,36 @@ PYBIND11_MODULE(gauss_cuda, m) {
              py::arg("Meff") = py::none(), py::arg("q") = 21,
              py::arg("pseudocount") = 0.8,
              "(N, M) int8 alignment and (M,) weights -> (N, N) float32 score.\n"
-             "Meff defaults to sum(W) computed exactly as the CLI does.")
+             "Meff defaults to sum(W) computed exactly as the CLI does.\n"
+             "Raises OutOfMemoryError when the device cannot hold the pair, and\n"
+             "DeviceLostError when the CUDA context is gone for the process.")
         .def("couplings", &PySession::couplings, py::arg("MSA"), py::arg("W"),
              py::arg("Meff") = py::none(), py::arg("q") = 21,
              py::arg("pseudocount") = 0.8,
              "Full (NQ, NQ) float64 inverse; for reference comparisons.")
+        .def("neighbour_counts", &PySession::neighbour_counts, py::arg("MSA"),
+             py::arg("identical_threshold"),
+             "(N, M) int8 alignment -> (M,) int32 reweighting neighbour counts: how\n"
+             "many sequences, each one itself included, match it at >=\n"
+             "identical_threshold (x * N) positions. The same counts as\n"
+             "cpp_bindings.reweightNeighbourCounts on the (M, N) matrix; the\n"
+             "weights are 1 / counts. Takes at most pair_bytes(N, M) of device memory.")
         .def_property_readonly("device_name", &PySession::device_name)
         .def_property_readonly("arithmetic", &PySession::arithmetic)
         .def_property_readonly("timings", &PySession::timings)
-        .def("set_profile", &PySession::set_profile, py::arg("on"));
+        .def("set_profile", &PySession::set_profile, py::arg("on"))
+        .def_property_readonly("last_pair_bytes", &PySession::last_pair_bytes,
+             "Device memory the last successful call took, in bytes.");
+    // The pair's memory is back in the pool and the next pair can run.
+    py::register_exception<gaussdca::cuda::OutOfMemory>(m, "OutOfMemoryError",
+                                                        PyExc_MemoryError);
+    // Sticky: every later CUDA call in this process fails too.
+    py::register_exception<gaussdca::cuda::DeviceLost>(m, "DeviceLostError",
+                                                       PyExc_RuntimeError);
     m.def("device_count", &device_count);
     m.def("device_info", &device_info, py::arg("device"));
     m.def("device_memory", &device_memory, py::arg("device"));
     m.def("pair_bytes", &pair_bytes, py::arg("N"), py::arg("M"), py::arg("q") = 21,
-          "Device memory one pair of this size needs, in bytes.");
+          "Device memory one pair of this size needs, in bytes; what admission\n"
+          "control reserves for it.");
 }
