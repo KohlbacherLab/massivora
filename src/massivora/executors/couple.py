@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import logging
 import multiprocessing as mp
 import os
@@ -8,6 +9,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import shared_memory
 
 import dask
@@ -24,8 +26,9 @@ from massivora.config import load_project_and_system_config
 from massivora.db import (STATUS, compute_file_hash, connect_db_rw,
                           ensure_columns, get_db_path, get_hashed_file_path,
                           get_table_names, quote_identifier)
-from massivora.utils import (SHM_PREFIX, compute_id_range, gpu_is_available,
-                             massivora_pkg_dir, setup_logging,
+from massivora.utils import (SHM_PREFIX, ShardWriter, compute_id_range,
+                             gpu_is_available, massivora_pkg_dir,
+                             saved_columns_to_bitmask, setup_logging,
                              visible_gpu_devices, worker_id)
 from massivora.analyzer import (BuiltinGaussCalibrator, BuiltinPLMCalibrator,
                                 ComplexAnalyzer)
@@ -80,6 +83,17 @@ class BaseCouplingExecutor(object):
         self.portion = float(coupling_cfg.get('portion', 1.0))
         self.portion_start = float(coupling_cfg.get('portion_start', 0.0))
 
+        # Every finished pair's CN score goes into msv shards named after the
+        # couplings table, in the couplings output directory. These two options
+        # are about the Jij tensor instead, which nothing stores yet.
+        self.keep_coupling_matrix = bool(coupling_cfg.get('keep_coupling_matrix', False))
+        self.coupling_matrix_keep_option = str(
+            coupling_cfg.get('coupling_matrix_keep_option', 'all')).lower()
+        if self.keep_coupling_matrix:
+            logging.warning("couple.keep_coupling_matrix is set, but keeping the Jij tensor is "
+                            "not implemented yet; only the CN score matrices are stored")
+        self._score_writer = None
+
         self.job_id = worker_id()
         self.plm_opt_exe = None
 
@@ -101,9 +115,10 @@ class BaseCouplingExecutor(object):
                 logging.error(f"Failed to close DB connection for worker {self.job_id}: {e}")
 
     def __getstate__(self):
-        """Exclude db_conn from pickling (workers don't need DB connection)."""
+        """Exclude db_conn and the shard writer from pickling (workers use neither)."""
         state = self.__dict__.copy()
         state['db_conn'] = None
+        state['_score_writer'] = None
         return state
 
     def __setstate__(self, state):
@@ -217,6 +232,9 @@ class BaseCouplingExecutor(object):
                         confidence_flag = ?,
                         high_precision_hit = ?,
                         file_hash = ?,
+                        score_file_id = ?,
+                        score_offset = ?,
+                        score_len = ?,
                         claimed_at = NULL,
                         job_id = NULL
                     WHERE id = ?
@@ -233,6 +251,9 @@ class BaseCouplingExecutor(object):
                             x.get('confidence_flag', False),
                             x.get('high_precision_hit', False),
                             x.get('file_hash'),
+                            x.get('score_file_id'),
+                            x.get('score_offset'),
+                            x.get('score_len'),
                             x.get('id'),
                         )
                         for x in done_updates
@@ -260,6 +281,34 @@ class BaseCouplingExecutor(object):
             self.db_conn.rollback()
             raise
 
+    def _db_unclaim(self, ids):
+        """Hand claimed pairs back unrun, undoing the claim without spending an
+        attempt -- the rule massiveilance.fix_zombie_tasks applies to a dead job."""
+        if not ids:
+            return 0
+        table = quote_identifier(self.couple_table)
+        try:
+            self.db_conn.executemany(
+                f"""
+                UPDATE {table}
+                SET status = CASE status WHEN :running THEN :noopt
+                                         WHEN :retrying THEN :pending
+                                         ELSE status END,
+                    claimed_at = NULL,
+                    job_id = NULL
+                WHERE id = :id AND job_id = :job_id
+                """,
+                [{'running': STATUS['RUNNING'], 'noopt': STATUS['NOOPT'],
+                  'retrying': STATUS['RETRYING'], 'pending': STATUS['PENDING'],
+                  'id': i, 'job_id': str(self.job_id)} for i in ids],
+            )
+            self.db_conn.commit()
+            return len(ids)
+        except Exception as e:
+            logging.error(f"Failed to hand back claimed pairs for job_id={self.job_id}: {e}")
+            self.db_conn.rollback()
+            raise
+
     def _checkpoint_wal(self):
         """Merge the SQLite WAL into the main database file.
 
@@ -280,6 +329,79 @@ class BaseCouplingExecutor(object):
                 )
         except sqlite3.Error as e:
             logging.warning(f"WAL checkpoint failed for job_id={self.job_id}: {e}")
+
+    # -- Score storage --
+
+    def _score_fields(self, score, params):
+        """
+        What a result carries so the coordinator can store the pair's score.
+
+        Runs where the score is computed. Nothing is written here: only the
+        coordinator writes shards, so the shard it fsyncs and the rows it commits
+        always agree.
+
+        Parameters
+        ----------
+        `score` — np.ndarray
+            The pair's full-width CN score matrix
+        `params` — dict
+            The pair's parameters, holding `name`, `saved_columns` and `lengthes`
+
+        Returns
+        -------
+        `dict`
+            `name`, `score` and `bitmask`
+        """
+        return {
+            'name': params['name'],
+            'score': np.asarray(score, dtype=np.float16),
+            'bitmask': saved_columns_to_bitmask(params['saved_columns'], params['lengthes']),
+        }
+
+    def _store_score(self, result):
+        """
+        Append the score a result carries to this job's shards and record where it went.
+
+        Parameters
+        ----------
+        `result` — dict
+            A finished task's result, as built with `_score_fields()`
+
+        Returns
+        -------
+        `dict`
+            The result with `score` and `bitmask` replaced by `score_file_id`,
+            `score_offset` and `score_len`; unchanged when it carries no score
+        """
+        score = result.pop('score', None)
+        bitmask = result.pop('bitmask', b'')
+        if score is None:
+            return result
+        if not np.array_equal(score, score.T, equal_nan=True):
+            upper = np.triu_indices(score.shape[0], 1)
+            change = np.abs(score[upper].astype(np.float32) - score.T[upper].astype(np.float32))
+            logging.warning(
+                f"CN score matrix for pair {result.get('id')} '{result['name']}' is not exactly "
+                f"symmetric; its shard record keeps the upper triangle (the lower one differs "
+                f"by up to {float(np.nan_to_num(change, nan=np.inf).max()):.3g})")
+        if self._score_writer is None:
+            self._score_writer = ShardWriter(self.output_dir, self.couple_table)
+        file_id, offset, length = self._score_writer.append(result['name'], score, bitmask)
+        result.update(score_file_id=file_id, score_offset=offset, score_len=length)
+        logging.info(f"Stored coupling score for pair {result.get('id')} '{result['name']}' in "
+                     f"{self.couple_table} shard {file_id} at offset {offset}")
+        return result
+
+    def _flush_scores(self):
+        """Make appended scores durable. Call before committing rows that point at them."""
+        if self._score_writer is not None:
+            self._score_writer.flush()
+
+    def _close_scores(self):
+        """Flush and release this job's shard."""
+        if self._score_writer is not None:
+            self._score_writer.close()
+            self._score_writer = None
 
     def _check_shared_memory(self, inflight):
         """Unlink shared-memory segments this coordinator has leaked.
@@ -438,7 +560,7 @@ class BaseCouplingExecutor(object):
         Returns
         -------
         `np.ndarray`
-            The pairwise coupling matrix
+            The pairwise coupling matrix, exactly symmetric
         """
         # Average the J matrix out at main diagonal
         N = J.shape[1]
@@ -451,12 +573,12 @@ class BaseCouplingExecutor(object):
         mask[:, gap_idx] = False
         J_filtered = J[:, :, mask].reshape(N, N, -1)
         FN = np.sqrt(np.sum(J_filtered ** 2, axis=-1))
+        FN = (FN + FN.T) / 2
 
         # Average Product Correction of Frobenius norm
-        row_mean = np.sum(FN, axis=1, keepdims=True) / (N - 1)
-        col_mean = np.sum(FN, axis=0, keepdims=True) / (N - 1)
+        mean = np.sum(FN, axis=1, keepdims=True) / (N - 1)
         total_mean = np.sum(FN) / (N * (N - 1))
-        FN_APC = FN - (row_mean @ col_mean) / total_mean
+        FN_APC = FN - (mean @ mean.T) / total_mean
 
         return FN_APC
 
@@ -498,6 +620,7 @@ class BaseCouplingExecutor(object):
                 client.close()
                 if cluster is not None:
                     cluster.close()
+            self._close_scores()
             self.close_db_connection()
 
     # -- Coordinator loop --
@@ -539,6 +662,7 @@ class BaseCouplingExecutor(object):
                 if (len(done_updates) + len(fail_ids)) < int(commit_every_tasks) and (time.time() - last_commit) < float(commit_every_seconds):
                     return 0
 
+            self._flush_scores()
             n = self._db_apply_results(done_updates, fail_ids)
             self._checkpoint_wal()
             self._check_shared_memory(inflight)
@@ -594,6 +718,11 @@ class BaseCouplingExecutor(object):
             if not terminating and not no_more_to_claim:
                 while len(inflight) < (self.claim_batch_size/2):
                     rows = self._claim_batch(self.job_id, self.claim_batch_size, id_range=id_range)
+                    if not rows and fail_ids:
+                        # Buffered failures aren't claimable until committed;
+                        # commit them and look again before giving up.
+                        flush(force=True)
+                        continue
                     if not rows:
                         no_more_to_claim = True
                         logging.info(f"No more coupling jobs to claim for job_id={self.job_id} at this time.")
@@ -617,7 +746,7 @@ class BaseCouplingExecutor(object):
                     if task_id is None:
                         continue
                     try:
-                        res = future.result()
+                        res = self._store_score(future.result())
                     except Exception:
                         logging.exception(f"Task {task_id} failed")
                         fail_ids.append(task_id)
@@ -625,11 +754,19 @@ class BaseCouplingExecutor(object):
                         done_updates.append(res)
                         future.release()
 
+            # Failed pairs only become claimable (PENDING) once committed. If the
+            # queue has already run dry, commit them now and resume claiming so
+            # this job retries them instead of leaving them stranded at PENDING.
+            if fail_ids and no_more_to_claim and not terminating:
+                flush(force=True)
+                no_more_to_claim = False
+
             # periodic flush
             flush(force=False)
 
         # final flush
         flush(force=True)
+        self._close_scores()
 
         if terminating:
             self.close_db_connection()
@@ -735,6 +872,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor, BuiltinPLMCalibrator):
         # Optimize only the columns the gap mask keeps
         if self.fast_approximation:
             align.Mask_Gap_Columns(self._config.get('align').get('col_gap_threshold',0.5))
+            align.To_Zarr(filename, overwrite=True)
             align.Drop_Masked_Gap_Columns()
 
         MSA = np.ascontiguousarray(align.matrix, dtype=np.int8)
@@ -814,8 +952,6 @@ class PLMCouplingExecutor(BaseCouplingExecutor, BuiltinPLMCalibrator):
             )
         output_dir = params["output_dir"]
         msa_name = params["name"]
-        file_hash = params.get("file_hash")
-        filename, _ = get_hashed_file_path(msa_name, file_hash, output_dir)
         N = params["N"]
         q = params["q"]
 
@@ -823,27 +959,20 @@ class PLMCouplingExecutor(BaseCouplingExecutor, BuiltinPLMCalibrator):
         J = np.ndarray((N*q*q, N), dtype=np.float64, buffer=J_shm.buf)
 
         score = self.compute_score(J, q=q).astype(np.float16)
-        logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
-        # grp = zarr.open_group(store=filename)
-        # if self.fast_approximation:
-        #     # Expand the shrinked score matrix to its original size
-        #     align_attrs = grp['align'].attrs
-        #     analyzer = ComplexAnalyzer(score, saved_columns=[list(range(len(params['saved_columns'][0]))),
-        #                                                      list(range(len(params['saved_columns'][1])))],
-        #                                 chainA_length=len(params['saved_columns'][0]),
-        #                                 EC_threshold=0)
-        #     score = self._expand_score(score, align_attrs.get('saved_columns'),
-        #                               align_attrs.get('lengthes'))
-        # n_full = int(score.shape[0])
-        # z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
-        # z[:] = score
+        if self.fast_approximation:
+            # Expand the shrinked score matrix to its original size
+            analyzer = ComplexAnalyzer(score, saved_columns=[list(range(len(params['saved_columns'][0]))),
+                                                             list(range(len(params['saved_columns'][1])))],
+                                        chainA_length=len(params['saved_columns'][0]),
+                                        EC_threshold=0)
+            score = self._expand_score(score, params['saved_columns'],
+                                      params['lengthes'])
+        n_full = int(score.shape[0])
 
         analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
                                        chainA_length=params['lengthes'][0],
                                        EC_threshold=0)
         calibrated = self.Calibrate(analyzer, params["Beff"])
-
-        # TODO: Put the score matrix and Beff and w to parquet
 
         result = {
             'id': params["pair_id"],
@@ -852,6 +981,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor, BuiltinPLMCalibrator):
             'number': int(params["B"]),
             'file_hash': params.get("file_hash"),
             **calibrated,
+            **self._score_fields(score, params),
         }
         try:
             del J
@@ -970,6 +1100,7 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor, BuiltinPLMCalibrator):
         # Optimize only the columns the gap mask keeps
         if self.fast_approximation:
             align.Mask_Gap_Columns(self._config.get('align').get('col_gap_threshold',0.5))
+            align.To_Zarr(filename, overwrite=True)
             align.Drop_Masked_Gap_Columns()
 
         MSA = np.ascontiguousarray(align.matrix, dtype=np.int8)
@@ -1037,8 +1168,6 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor, BuiltinPLMCalibrator):
         N = params["N"]
         output_dir = params["output_dir"]
         msa_name = params["name"]
-        file_hash = params.get("file_hash")
-        filename, _ = get_hashed_file_path(msa_name, file_hash, output_dir)
         q = params["q"]
 
         if results != 0:
@@ -1063,26 +1192,20 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor, BuiltinPLMCalibrator):
         cpp_bindings.applyIsingGauge(J, q)
         score = self.compute_score(J.T, q=q).astype(np.float16)
 
-        logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
-        # grp = zarr.open_group(store=filename)
-        # if self.fast_approximation:
-        #     # Expand the shrinked score matrix to its original size
-        #     align_attrs = grp['align'].attrs
-        #     score = self._expand_score(score, align_attrs.get('saved_columns'),
-        #                               align_attrs.get('lengthes'))
-        # n_full = int(score.shape[0])
-        # z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
-        # z[:] = score
+        if self.fast_approximation:
+            # Expand the shrinked score matrix to its original size
+            analyzer = ComplexAnalyzer(score, saved_columns=[list(range(len(params['saved_columns'][0]))),
+                                                             list(range(len(params['saved_columns'][1])))],
+                                        chainA_length=len(params['saved_columns'][0]),
+                                        EC_threshold=0)
+            score = self._expand_score(score, params['saved_columns'],
+                                      params['lengthes'])
+        n_full = int(score.shape[0])
 
         analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
                                        chainA_length=params['lengthes'][0],
                                        EC_threshold=0)
         calibrated = self.Calibrate(analyzer, params["Beff"])
-
-        # TODO: Put the score matrix and Beff and w to parquet
-
-        # Release GPU buffers and free CuPy pools to return memory to the driver.
-        del z, grp, score
 
         result = {
             'id': params["pair_id"],
@@ -1091,6 +1214,7 @@ class PLMCouplingExecutorGPU(BaseCouplingExecutor, BuiltinPLMCalibrator):
             'number': int(params["B"]),
             'file_hash': params.get("file_hash"),
             **calibrated,
+            **self._score_fields(score, params),
         }
         try:
             del J
@@ -1327,8 +1451,6 @@ class GaussCouplingExecutor(BaseCouplingExecutor, BuiltinGaussCalibrator):
         NQ = N * (q - 1)
         output_dir = params["output_dir"]
         msa_name = params["name"]
-        file_hash = params.get("file_hash")
-        filename, _ = get_hashed_file_path(msa_name, file_hash, output_dir)
 
         if returncode != 0:
             try:
@@ -1348,25 +1470,20 @@ class GaussCouplingExecutor(BaseCouplingExecutor, BuiltinGaussCalibrator):
         # Frobenius norm and the APC, so this is the finished score matrix.
         J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX + msa_name + '_J', size=N * N * 4)
         score = np.ndarray((N, N), dtype=np.float32, buffer=J_shm.buf).astype(np.float16)
-        logging.info(f"Writing coupling score for pair {params['pair_id']} '{msa_name}' to alignment zarr")
-        # grp = zarr.open_group(store=filename)
-        # z = grp.require_array(name=self.couple_table, shape=score.shape, dtype='float16', overwrite=True)
-        # z[:] = score
 
         analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
                                        chainA_length=params['lengthes'][0],
                                        EC_threshold=0)
         calibrated = self.Calibrate(analyzer, params["Beff"])
-        
-        # TODO: Put the score matrix and Beff and w to parquet
 
         result = {
             'id': params["pair_id"],
             'effnumber': params["Beff"],
             'length': int(params["N"]),
             'number': int(params["B"]),
-            'file_hash': file_hash,
+            'file_hash': params.get("file_hash"),
             **calibrated,
+            **self._score_fields(score, params),
         }
         try:
             J_shm.close()
@@ -1416,6 +1533,166 @@ class GaussCouplingExecutor(BaseCouplingExecutor, BuiltinGaussCalibrator):
 # GaussDCA executor GPU
 # ---------------------------------------------------------------------------
 
+class GpuAdmission(object):
+    """
+    Lets pairs onto the GPUs. A pair starts on a GPU only when that GPU has both
+    an idle session and room for the pair's device memory, and takes the two at
+    once: holding memory while queueing for a session, or a session while
+    queueing for memory, would leave the GPU idle with work ready.
+
+    Pairs go in arrival order, except that a later pair which fits may start
+    while the oldest one waits for memory to drain -- the GPU keeps working
+    meanwhile. Once the oldest has waited `patience` seconds nothing overtakes
+    it any more, so a large pair cannot be starved by a stream of small ones.
+    """
+
+    def __init__(self, budgets, sessions, patience=30.0):
+        self.budgets = [int(b) for b in budgets]
+        self._free = list(self.budgets)
+        self._idle = [int(sessions)] * len(self.budgets)
+        self.patience = float(patience)
+        self._cond = threading.Condition()
+        self._waiting = []                 # (ticket, since), oldest first
+
+    def acquire(self, nbytes):
+        """Wait for a GPU with an idle session and `nbytes` to spare; take both and return its ordinal."""
+        if nbytes > max(self.budgets):
+            raise ValueError(f"{nbytes} bytes exceed every GPU's budget {self.budgets}")
+        me = (object(), time.monotonic())
+        with self._cond:
+            self._waiting.append(me)
+            try:
+                while True:
+                    ordinal = self._fit(nbytes, me)
+                    if ordinal is not None:
+                        self._free[ordinal] -= nbytes
+                        self._idle[ordinal] -= 1
+                        return ordinal
+                    self._cond.wait()
+            finally:
+                self._waiting.remove(me)
+                self._cond.notify_all()
+
+    def _fit(self, nbytes, me):
+        oldest = self._waiting[0]
+        if oldest is not me and time.monotonic() - oldest[1] > self.patience:
+            return None
+        fits = [o for o in range(len(self._free))
+                if self._idle[o] and self._free[o] >= nbytes]
+        return max(fits, key=self._free.__getitem__) if fits else None
+
+    def release(self, ordinal, nbytes):
+        with self._cond:
+            self._free[ordinal] += nbytes
+            self._idle[ordinal] += 1
+            self._cond.notify_all()
+
+
+class StageClock(object):
+    """Where the GPU executor's pairs spend their time, logged every `every` seconds."""
+
+    STAGES = (('load', 'load'), ('wait', 'waiting for a GPU'), ('gpu', 'on the GPU'),
+              ('analysis', 'analysis'))
+
+    def __init__(self, sessions, every=60.0):
+        self.sessions = int(sessions)
+        self.every = float(every)
+        self._lock = threading.Lock()
+        self._reset(time.monotonic())
+
+    def _reset(self, now):
+        self._since = now
+        self._pairs = 0
+        self._sum = dict.fromkeys((name for name, _ in self.STAGES), 0.0)
+
+    def add(self, **seconds):
+        """Count one finished pair and the seconds it spent in each stage."""
+        with self._lock:
+            self._pairs += 1
+            for name, value in seconds.items():
+                self._sum[name] += value
+            now = time.monotonic()
+            if now - self._since < self.every:
+                return
+            elapsed, pairs, total = now - self._since, self._pairs, dict(self._sum)
+            self._reset(now)
+        logging.info(
+            "GaussDCA GPU: %d pairs in %.0f s (%.1f/s); per pair %s; sessions busy %.0f%%",
+            pairs, elapsed, pairs / elapsed,
+            ", ".join(f"{label} {total[name] / pairs:.3f} s" for name, label in self.STAGES),
+            100.0 * total['gpu'] / (elapsed * self.sessions))
+
+
+# Loading an alignment and analysing its score are mostly Python, and in the
+# coordinator's threads they all queue on one GIL with the GPU dispatch, which
+# then waits on them. The GPU executor runs them in worker processes instead.
+_HOST = None
+
+
+def _host_init(cls, state):
+    """Rebuild the executor in a host process without __init__, which opens the job database."""
+    global _HOST
+    _HOST = cls.__new__(cls)
+    _HOST.__setstate__(state)
+    setup_logging(state['_config'])
+
+
+class PairArrays(object):
+    """A pair's alignment and weights, held until the GPU has its own copy."""
+
+    def __init__(self, MSA, W, shm=None):
+        self.MSA, self.W, self._shm = MSA, W, shm
+
+    @classmethod
+    def attach(cls, name, w_shape, msa_shape):
+        """The arrays a host process left in the shared memory block `name`."""
+        shm = shared_memory.SharedMemory(name=name)
+        W = np.ndarray(w_shape, dtype=np.float64, buffer=shm.buf)
+        return cls(np.ndarray(msa_shape, dtype=np.int8, buffer=shm.buf, offset=W.nbytes),
+                   W, shm)
+
+    def release(self):
+        self.MSA = self.W = None
+        shm, self._shm = self._shm, None
+        if shm is None:
+            return
+        shm.unlink()                    # the name goes now, the memory once unmapped
+        try:
+            shm.close()
+        except BufferError:
+            # The traceback of a failed score still holds views of it; the block
+            # closes itself when collected, after that traceback is gone.
+            self._dangling = shm
+
+
+def _host_load(pair, kwargs):
+    """Load a pair and leave its arrays in shared memory: sent back through the
+    pool's pipe they would be pickled, copied and unpickled by one thread of the
+    coordinator, which caps how many pairs a second reach the GPUs."""
+    MSA, W, params = _HOST.load_pair_arrays(pair, **kwargs)
+    name = f"{SHM_PREFIX}g{os.getpid()}_{pair['id']}"
+    try:
+        shm = shared_memory.SharedMemory(name=name, create=True, size=W.nbytes + MSA.nbytes)
+    except FileExistsError:                 # left by a run that died holding this pair
+        stale = shared_memory.SharedMemory(name=name)
+        stale.close()
+        stale.unlink()
+        shm = shared_memory.SharedMemory(name=name, create=True, size=W.nbytes + MSA.nbytes)
+    try:
+        np.ndarray(W.shape, dtype=np.float64, buffer=shm.buf)[:] = W
+        np.ndarray(MSA.shape, dtype=np.int8, buffer=shm.buf, offset=W.nbytes)[:] = MSA
+    except BaseException:
+        shm.close()
+        shm.unlink()
+        raise
+    shm.close()
+    return name, W.shape, MSA.shape, params
+
+
+def _host_collect(score, params):
+    return _HOST.collect_score(score, params)
+
+
 class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
     def __init__(self, config):
         super().__init__(config)
@@ -1424,6 +1701,16 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
 
         self.gpu_sessions = int(coupling_cfg.get('gpu_sessions', 4))
         self.gpu_workers = int(coupling_cfg.get('gpu_workers', 16))
+        # Share of each GPU's free memory the pairs in flight may hold between them;
+        # the rest is for the CUDA libraries' own workspaces.
+        self.gpu_memory_limit = float(coupling_cfg.get('gpu_memory_limit', 0.9))
+        # Processes that load alignments and analyse scores; 0 keeps that in
+        # the coordinator's threads.
+        host = coupling_cfg.get('gpu_host_processes', 'auto')
+        if isinstance(host, str) and host.strip().lower() == 'auto':
+            self.gpu_host_processes = min(8, os.cpu_count() or 1)
+        else:
+            self.gpu_host_processes = max(0, int(host))
 
     def load_pair_arrays(self, pair, **kwargs):
         pair_name = pair.get('name')
@@ -1458,8 +1745,6 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
                                        chainA_length=params['lengthes'][0],
                                        EC_threshold=0)
         calibrated = self.Calibrate(analyzer, params["Beff"])
-        logging.info(f"Writing coupling score for pair {params['pair_id']} '{params['name']}' to alignment zarr")
-        # TODO: Put the score matrix and Beff and w to parquet
         return {
             'id': params['pair_id'],
             'effnumber': params['Beff'],
@@ -1467,13 +1752,16 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
             'number': int(params['B']),
             'file_hash': params['file_hash'],
             **calibrated,
+            **self._score_fields(s16, params),
         }
 
     # -- dispatch -------------------------------------------------------------
 
-    def _claimed_pairs(self, id_range=None):
-        """Stream claimed rows; the work queue bounds how far ahead we run."""
-        while True:
+    def _claimed_pairs(self, id_range=None, stop=None):
+        """Stream claimed rows; the work queue bounds how far ahead we run.
+        Once `stop` is set no new batch is claimed, but the rows of the current
+        one are still yielded, so whoever claimed them can hand them back."""
+        while stop is None or not stop.is_set():
             rows = self._claim_batch(self.job_id, self.claim_batch_size,
                                      id_range=id_range)
             if not rows:
@@ -1491,19 +1779,116 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
                       reweighting_threshold=self.reweighting_threshold)
 
         devices = visible_gpu_devices()
-        sessions = queue.Queue()
+        sessions = []
         for ordinal, device_id in enumerate(devices):
             logging.debug("GaussDCA GPU: %d session(s) on ordinal %d (GPU %s)",
                           self.gpu_sessions, ordinal, device_id)
+            sessions.append(queue.Queue())
             for _ in range(self.gpu_sessions):
-                sessions.put(gauss_cuda.Session(ordinal))
+                sessions[ordinal].put(gauss_cuda.Session(ordinal))
         logging.info("GaussDCA GPU: %d session(s) over %d GPU(s) (CUDA_VISIBLE_"
-                     "DEVICES=%s), %d workers", sessions.qsize(), len(devices),
-                     ",".join(devices), self.gpu_workers)
+                     "DEVICES=%s), %d workers", self.gpu_sessions * len(devices),
+                     len(devices), ",".join(devices), self.gpu_workers)
+
+        n_sessions = self.gpu_sessions * len(devices)
+        if self.gpu_workers < n_sessions + self.gpu_host_processes:
+            logging.warning("GaussDCA GPU: %d workers cannot keep %d sessions busy while "
+                            "%d host processes load and analyse; raise couple.gpu_workers",
+                            self.gpu_workers, n_sessions, self.gpu_host_processes)
+
+        # Sessions take device memory per pair and hand it back after, so what
+        # the pairs in flight hold is what they reserved here. Measured once the
+        # sessions exist, so their contexts and handles are already off it.
+        admission = GpuAdmission(
+            (int(self.gpu_memory_limit * gauss_cuda.device_memory(o)['free_mb'] * 2**20)
+             for o in range(len(devices))), self.gpu_sessions)
+        logging.info("GaussDCA GPU: device memory budget %s GiB",
+                     ", ".join(f"{b / 2**30:.1f}" for b in admission.budgets))
+        clock = StageClock(n_sessions)
+
+        # This file may be running as __main__ (massiworker runs it with
+        # runpy), which a spawned process cannot import; hand it the module.
+        from massivora.executors import couple as importable
+        pool_lock = threading.Lock()
+        pool = [None]
+
+        def new_pool():
+            return concurrent.futures.ProcessPoolExecutor(
+                self.gpu_host_processes, mp_context=mp.get_context('spawn'),
+                initializer=importable._host_init,
+                initargs=(getattr(importable, type(self).__name__), self.__getstate__()))
+
+        def on_host(fn, *args):
+            current = pool[0]
+            try:
+                return current.submit(fn, *args).result()
+            except BrokenProcessPool:
+                # A host process died, which breaks the pool for every pair;
+                # start a new one so only the pairs it was holding fail.
+                with pool_lock:
+                    if pool[0] is current:
+                        logging.error("GaussDCA GPU: a host process died; restarting them")
+                        current.shutdown(wait=False, cancel_futures=True)
+                        pool[0] = new_pool()
+                raise
+
+        if self.gpu_host_processes:
+            pool[0] = new_pool()
+
+            def load(pair):
+                name, w_shape, msa_shape, params = on_host(importable._host_load, pair, kwargs)
+                return PairArrays.attach(name, w_shape, msa_shape), params
+
+            collect = lambda score, params: on_host(importable._host_collect, score, params)
+        else:
+            def load(pair):
+                MSA, W, params = self.load_pair_arrays(pair, **kwargs)
+                return PairArrays(MSA, W), params
+
+            collect = self.collect_score
 
         work = queue.Queue(maxsize=self.gpu_workers * 2)
-        done_updates, fail_updates = [], []
+        done_updates, fail_updates, released = [], [], []
         lock = threading.Lock()
+        # An illegal address and its like corrupt the context every session in
+        # this process shares; from then on every pair would fail and spend its
+        # attempts. So stop instead, and hand back the pairs not yet run.
+        lost = threading.Event()
+        underestimated = threading.Event()
+
+        def score_pair(MSA, W, params, spent):
+            """Score on the first GPU with room for the pair; None if the device was lost meanwhile."""
+            need = gauss_cuda.pair_bytes(params['N'], params['B'], params['q'])
+            if need > max(admission.budgets):
+                raise RuntimeError(
+                    f"Pair {params['pair_id']} '{params['name']}' ({params['B']} x "
+                    f"{params['N']}) needs {need / 2**30:.1f} GiB of device memory, more "
+                    f"than the {max(admission.budgets) / 2**30:.1f} GiB "
+                    f"couple.gpu_memory_limit allows on any GPU")
+            t0 = time.monotonic()
+            ordinal = admission.acquire(need)
+            sess = sessions[ordinal].get()          # admission left one idle
+            t1 = time.monotonic()
+            try:
+                if lost.is_set():
+                    return None
+                score = sess.score(MSA, W, q=params['q'], pseudocount=self.pseudocount)
+                used = sess.last_pair_bytes
+            except gauss_cuda.DeviceLostError:
+                lost.set()
+                raise
+            finally:
+                sessions[ordinal].put(sess)
+                admission.release(ordinal, need)
+            spent.update(wait=t1 - t0, gpu=time.monotonic() - t1)
+            if used > need and not underestimated.is_set():
+                underestimated.set()
+                logging.warning(
+                    "GaussDCA GPU: pair %s (%d x %d) took %d MiB of device memory, more "
+                    "than the %d MiB reserved for it; lower couple.gpu_memory_limit if "
+                    "pairs run out of memory", params['pair_id'], params['B'],
+                    params['N'], used >> 20, need >> 20)
+            return score
 
         def worker():
             while True:
@@ -1511,16 +1896,25 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
                 try:
                     if pair is None:
                         return
-                    MSA, W, params = self.load_pair_arrays(pair, **kwargs)
-                    sess = sessions.get()          # bounds concurrent device use
-                    try:
-                        score = sess.score(MSA, W, q=params['q'],
-                                           pseudocount=self.pseudocount)
-                    finally:
-                        sessions.put(sess)
-                    row = self.collect_score(score, params)
+                    score, spent = None, {}
+                    if not lost.is_set():
+                        t0 = time.monotonic()
+                        arrays, params = load(pair)
+                        spent['load'] = time.monotonic() - t0
+                        try:
+                            score = score_pair(arrays.MSA, arrays.W, params, spent)
+                        finally:
+                            arrays.release()
+                    if score is None:
+                        with lock:
+                            released.append(pair['id'])
+                        continue
+                    t0 = time.monotonic()
+                    row = collect(score, params)
+                    spent['analysis'] = time.monotonic() - t0
                     with lock:
-                        done_updates.append(row)
+                        done_updates.append(self._store_score(row))
+                    clock.add(**spent)
                 except Exception:
                     logging.exception("Pair %s failed", (pair or {}).get('id'))
                     with lock:
@@ -1537,23 +1931,44 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
             with lock:
                 if not force and len(done_updates) + len(fail_updates) < 64:
                     return
-                d, f = list(done_updates), list(fail_updates)
-                done_updates.clear(); fail_updates.clear()
+                # Scores behind these rows must be on disk before the rows are committed.
+                self._flush_scores()
+                d, f, r = list(done_updates), list(fail_updates), list(released)
+                done_updates.clear(); fail_updates.clear(); released.clear()
             if d or f:
                 self._db_apply_results(d, f)
+            if r:
+                self._db_unclaim(r)
 
         try:
-            for pair in self._claimed_pairs(id_range):
-                work.put(pair)
-                flush(force=False)
+            while True:
+                for pair in self._claimed_pairs(id_range, stop=lost):
+                    work.put(pair)
+                    flush(force=False)
+                # Let everything dispatched finish, then commit its failures:
+                # they only become claimable (PENDING) once committed, so go
+                # round again to retry them rather than strand them.
+                work.join()
+                with lock:
+                    had_failures = bool(fail_updates)
+                flush(force=True)
+                if lost.is_set() or not had_failures:
+                    break
             for _ in threads:
                 work.put(None)
             work.join()
         finally:
             for t in threads:
                 t.join(timeout=30)
+            if pool[0] is not None:
+                pool[0].shutdown(wait=True, cancel_futures=True)
             flush(force=True)
+            self._close_scores()
             self.close_db_connection()
+        if lost.is_set():
+            raise RuntimeError("GaussDCA GPU: the CUDA context was lost (see the first "
+                               "DeviceLostError above); the pairs not yet run were handed "
+                               "back unspent. Restart the job to go on.")
 
 
 EXECUTORS = {

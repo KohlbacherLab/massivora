@@ -34,6 +34,14 @@ def test_compute_score():
     calcd = ComplexAnalyzer(score, chainA_length=201)
     assert real.SpearmanCorrelation(calcd)[0] > 0.99, "Spearman correlation should be > 0.99"
 
+def test_compute_score_is_exactly_symmetric():
+    # A float32 J, as the GPU executor produces, is where rounding used to split (i, j) from (j, i)
+    J = np.random.default_rng(0).standard_normal((40 * 21 * 21, 40)).astype(np.float32)
+    score = BaseCouplingExecutor.compute_score(J, q=21, gap_idx=0)
+    assert np.array_equal(score, score.T), "score should be exactly symmetric"
+    stored = score.astype(np.float16)
+    assert np.array_equal(stored, stored.T), "score should stay symmetric once stored as float16"
+
 def test_coupling_CPU():
     align = BinaryAlignment(TEST_ZARR)
     MSA = np.ascontiguousarray(align.matrix, dtype=np.int8)
