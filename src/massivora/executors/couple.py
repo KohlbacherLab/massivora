@@ -1013,232 +1013,6 @@ class PLMCouplingExecutor(BaseCouplingExecutor, BuiltinPLMCalibrator):
 
 
 # ---------------------------------------------------------------------------
-# GPU PLM executor
-# ---------------------------------------------------------------------------
-
-class PLMCouplingExecutorGPU(BaseCouplingExecutor, BuiltinPLMCalibrator):
-    def __init__(self, config):
-        super().__init__(config)
-        # Same executable as the CPU path; invoked with --use-gpu so it runs the
-        # CUDA code (requires the binary to be built with -DENABLE_CUDA=ON).
-        self.plm_opt_exe = os.path.join(massivora_pkg_dir(), 'bin', 'plm_opt_site')
-        self.fast_approximation = bool(config.get('couple').get('fast_approximation', False))
-
-    def _create_cluster(self):
-        """Create a Dask cluster with one worker per GPU."""
-        devices = visible_gpu_devices()
-        n_gpus = len(devices)
-        compute_threads = max(1, n_gpus * 2)
-        logging.info(f"Creating GPU cluster with {n_gpus} workers (one per GPU)")
-
-        worker_spec = {
-            'cpu': {
-                'cls': Nanny,
-                'options': {
-                    'nthreads': compute_threads,
-                    'resources': {'cpu': compute_threads},
-                    'memory_limit': 0,
-                    'host': '127.0.0.1',
-                    'death_timeout': 120,
-                },
-            }
-        }
-        for i, device_id in enumerate(devices):
-            worker_spec[f'gpu-{i}'] = {
-                'cls': Nanny,
-                'options': {
-                    'nthreads': 1,
-                    'resources': {'gpu': 1},
-                    'memory_limit': 0,
-                    'host': '127.0.0.1',
-                    'death_timeout': 120,
-                    'env': {'CUDA_VISIBLE_DEVICES': str(device_id)},
-                },
-            }
-
-        cluster = SpecCluster(
-            workers=worker_spec,
-            scheduler={
-                'cls': Scheduler,
-                'options': {
-                    'host': '127.0.0.1',
-                    'dashboard_address': None,
-                }
-            }
-        )
-        client = Client(cluster)
-        client.wait_for_workers(n_gpus, timeout=120)
-        return cluster, client
-
-    def load_pair(self, pair, **kwargs):
-        pair_name = pair.get('name')
-        pair_id = pair.get('id')
-        alignment_dir = kwargs.get('alignment_dir')
-        output_dir = kwargs.get('output_dir')
-        downsample = kwargs.get('downsample', False)
-        downsample_to = kwargs.get('downsample_to', None)
-        reweighting_threshold = kwargs.get('reweighting_threshold', 0.8)
-
-        # Compute file hash for this coupling
-        file_hash = pair.get('file_hash') or compute_file_hash(pair_name)
-        filename, _ = get_hashed_file_path(pair_name, file_hash, output_dir)
-
-        logging.debug(f"Loading pair id {pair_id}: {pair.get('pid1')}-{pair.get('pid2')}")
-
-        # Try to load pre-concatenated alignment; if it fails, concatenate on-the-fly and save for future reuse.
-        try:
-            align = BinaryAlignment(filename)
-        except Exception as e:
-            logging.warning(f"Failed to load pair {pair_id} '{pair_name}', trying to concatenate.")
-            align = self.concatenate(pair, alignment_dir, downsample=downsample,
-                                    downsample_to=downsample_to)
-            align.Reweight_Sequence(reweighting_threshold, use_GPU=True)
-            align.To_Zarr(filename, overwrite=True)
-
-        q = int(align.matrix.max()) + 1
-
-        # Optimize only the columns the gap mask keeps
-        if self.fast_approximation:
-            align.Mask_Gap_Columns(self._config.get('align').get('col_gap_threshold',0.5))
-            align.To_Zarr(filename, overwrite=True)
-            align.Drop_Masked_Gap_Columns()
-
-        MSA = np.ascontiguousarray(align.matrix, dtype=np.int8)
-        B, N = MSA.shape
-        W = np.asarray(align.weights, dtype=np.float64)
-        Beff = float(align.Beff)
-        W /= Beff
-
-        # Create MSA shared memory
-        msa_size = MSA.nbytes
-        w_offset = (msa_size + 7) & ~7
-        w_size = W.nbytes
-        logging.debug(f"Pair {pair_id} '{pair_name}': MSA size (bytes): {msa_size}, Weights size (bytes): {w_size}")
-        logging.debug(f"Pair {pair_id} '{pair_name}': MSA dimensions: {MSA.shape}, Weights length: {W.shape}")
-        try:
-            msa_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +pair_name, create=True, size=w_offset+w_size)
-        except FileExistsError:
-            logging.warning(f"Shared memory for pair {pair_id} '{pair_name}' already exists; reusing it.")
-            msa_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +pair_name)
-        msa_arr = np.ndarray(MSA.shape, dtype=np.int8, buffer=msa_shm.buf)
-        w_arr = np.ndarray(W.shape, dtype=np.float64, buffer=msa_shm.buf[w_offset:])
-        np.copyto(msa_arr, MSA)
-        np.copyto(w_arr, W)
-
-        # Update kwargs with computed values and ensure all needed fields are present
-        kwargs.update({
-            "name": pair_name,
-            "pair_id": pair_id,
-            "B": B,
-            "N": N,
-            "q": q,
-            "Beff": Beff,
-            "file_hash": file_hash,
-            "saved_columns": list(align.saved_columns),
-            "lengthes": list(align.lengthes),
-        })
-        del MSA, W, align
-
-        return kwargs
-
-    def optimize_pair(self, pair, params):
-        msa_name = params["name"]
-        q = params["q"]
-        N = params["N"]
-        B = params["B"]
-        lambdaH, lambdaJ = params["lambdaH"], params["lambdaJ"]
-        eps_conv = params["eps_conv"]
-        maxit = params["maxit"]
-        n_streams = int(params.get("n_streams", 4))
-        plm_opt_exe = params["plm_opt_exe"]
-
-        try:
-            shared_memory.SharedMemory(name=self.SHM_PREFIX +msa_name+'_J', create=True, size=N*N*q*q*4)
-        except FileExistsError:
-            pass  # Ensure the shared memory has been created, do nothing here
-
-        cmd = [plm_opt_exe, "--use-gpu", msa_name, str(B), str(N), str(q),
-               str(lambdaH), str(lambdaJ), str(eps_conv), str(maxit), str(n_streams)]
-        logging.debug(f"Running GPU PLM optimization with cmd {' '.join(cmd)}")
-        rv = subprocess.run(cmd)
-
-        return rv.returncode
-
-    def collect_results(self, results, params):
-        N = params["N"]
-        output_dir = params["output_dir"]
-        msa_name = params["name"]
-        q = params["q"]
-
-        if results != 0:
-            try:
-                J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +params["name"]+'_J', size=N*N*q*q*4)
-                J_shm.close()
-                J_shm.unlink()
-                shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +params["name"])
-                shm.close()
-                shm.unlink()
-            except FileNotFoundError:
-                pass
-            raise RuntimeError(
-                f"GPU optimization failed for pair {params['pair_id']} (rc={results})"
-            )
-
-        # The CUDA executable stores J as float32 with one row per site:
-        # row r holds site r's (N, q, q) coupling blocks flattened to (N*q*q,).
-        J_shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +params["name"]+'_J', size=N*N*q*q*4)
-        J = np.ndarray((N, N*q*q), dtype=np.float32, buffer=J_shm.buf)
-
-        cpp_bindings.applyIsingGauge(J, q)
-        score = self.compute_score(J.T, q=q).astype(np.float16)
-
-        if self.fast_approximation:
-            # Expand the shrinked score matrix to its original size
-            analyzer = ComplexAnalyzer(score, saved_columns=[list(range(len(params['saved_columns'][0]))),
-                                                             list(range(len(params['saved_columns'][1])))],
-                                        chainA_length=len(params['saved_columns'][0]),
-                                        EC_threshold=0)
-            score = self._expand_score(score, params['saved_columns'],
-                                      params['lengthes'])
-        n_full = int(score.shape[0])
-
-        analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
-                                       chainA_length=params['lengthes'][0],
-                                       EC_threshold=0)
-        calibrated = self.Calibrate(analyzer, params["Beff"])
-
-        result = {
-            'id': params["pair_id"],
-            'effnumber': params["Beff"],
-            'length': n_full,
-            'number': int(params["B"]),
-            'file_hash': params.get("file_hash"),
-            **calibrated,
-            **self._score_fields(score, params),
-        }
-        try:
-            del J
-            J_shm.close()
-            J_shm.unlink()
-            shm = shared_memory.SharedMemory(name=self.SHM_PREFIX +params["name"])
-            shm.close()
-            shm.unlink()
-        except FileNotFoundError:
-            pass
-
-        return result
-
-    def calc_graph(self, pair, priority, **kwargs):
-        with annotate(resources={'cpu': 1}, priority=0):
-            params = delayed(self.load_pair)(pair, **kwargs)
-        with annotate(resources={'gpu': 1}, priority=priority):
-            results = delayed(self.optimize_pair)(pair, params)
-        with annotate(resources={'cpu': 1}, priority=priority):
-            out_d = delayed(self.collect_results)(results, params)
-        return out_d
-
-
-# ---------------------------------------------------------------------------
 # GaussDCA executor
 # ---------------------------------------------------------------------------
 
@@ -1594,9 +1368,10 @@ class StageClock(object):
     STAGES = (('load', 'load'), ('wait', 'waiting for a GPU'), ('gpu', 'on the GPU'),
               ('analysis', 'analysis'))
 
-    def __init__(self, sessions, every=60.0):
+    def __init__(self, sessions, every=60.0, label='GPU'):
         self.sessions = int(sessions)
         self.every = float(every)
+        self.label = label
         self._lock = threading.Lock()
         self._reset(time.monotonic())
 
@@ -1617,8 +1392,8 @@ class StageClock(object):
             elapsed, pairs, total = now - self._since, self._pairs, dict(self._sum)
             self._reset(now)
         logging.info(
-            "GaussDCA GPU: %d pairs in %.0f s (%.1f/s); per pair %s; sessions busy %.0f%%",
-            pairs, elapsed, pairs / elapsed,
+            "%s: %d pairs in %.0f s (%.1f/s); per pair %s; sessions busy %.0f%%",
+            self.label, pairs, elapsed, pairs / elapsed,
             ", ".join(f"{label} {total[name] / pairs:.3f} s" for name, label in self.STAGES),
             100.0 * total['gpu'] / (elapsed * self.sessions))
 
@@ -1636,6 +1411,17 @@ def _host_init(cls, state):
     _HOST.__setstate__(state)
     setup_logging(state['_config'])
 
+    # A coordinator killed outright (SIGKILL) never shuts this process down, and
+    # it would wait on the call queue forever. Leave once it is gone.
+    coordinator = os.getppid()
+
+    def leave_with_coordinator():
+        while os.getppid() == coordinator:
+            time.sleep(5)
+        os._exit(0)
+
+    threading.Thread(target=leave_with_coordinator, daemon=True).start()
+
 
 class PairArrays(object):
     """A pair's alignment and weights, held until the GPU has its own copy."""
@@ -1645,10 +1431,12 @@ class PairArrays(object):
 
     @classmethod
     def attach(cls, name, w_shape, msa_shape):
-        """The arrays a host process left in the shared memory block `name`."""
+        """The arrays a host process left in the shared memory block `name`;
+        `w_shape` is None for a pair whose weights the GPU is to compute."""
         shm = shared_memory.SharedMemory(name=name)
-        W = np.ndarray(w_shape, dtype=np.float64, buffer=shm.buf)
-        return cls(np.ndarray(msa_shape, dtype=np.int8, buffer=shm.buf, offset=W.nbytes),
+        W = None if w_shape is None else np.ndarray(w_shape, dtype=np.float64, buffer=shm.buf)
+        offset = 0 if W is None else W.nbytes
+        return cls(np.ndarray(msa_shape, dtype=np.int8, buffer=shm.buf, offset=offset),
                    W, shm)
 
     def release(self):
@@ -1671,33 +1459,49 @@ def _host_load(pair, kwargs):
     coordinator, which caps how many pairs a second reach the GPUs."""
     MSA, W, params = _HOST.load_pair_arrays(pair, **kwargs)
     name = f"{SHM_PREFIX}g{os.getpid()}_{pair['id']}"
+    w_bytes = 0 if W is None else W.nbytes
     try:
-        shm = shared_memory.SharedMemory(name=name, create=True, size=W.nbytes + MSA.nbytes)
+        shm = shared_memory.SharedMemory(name=name, create=True, size=w_bytes + MSA.nbytes)
     except FileExistsError:                 # left by a run that died holding this pair
         stale = shared_memory.SharedMemory(name=name)
         stale.close()
         stale.unlink()
-        shm = shared_memory.SharedMemory(name=name, create=True, size=W.nbytes + MSA.nbytes)
+        shm = shared_memory.SharedMemory(name=name, create=True, size=w_bytes + MSA.nbytes)
     try:
-        np.ndarray(W.shape, dtype=np.float64, buffer=shm.buf)[:] = W
-        np.ndarray(MSA.shape, dtype=np.int8, buffer=shm.buf, offset=W.nbytes)[:] = MSA
+        if W is not None:
+            np.ndarray(W.shape, dtype=np.float64, buffer=shm.buf)[:] = W
+        np.ndarray(MSA.shape, dtype=np.int8, buffer=shm.buf, offset=w_bytes)[:] = MSA
     except BaseException:
         shm.close()
         shm.unlink()
         raise
     shm.close()
-    return name, W.shape, MSA.shape, params
+    return name, None if W is None else W.shape, MSA.shape, params
 
 
 def _host_collect(score, params):
     return _HOST.collect_score(score, params)
 
 
-class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
+class SessionGPUExecutor(BaseCouplingExecutor):
+    """
+    Runs pairs on device sessions in threads of this process instead of Dask
+    workers: each GPU gets `couple.gpu_sessions` sessions of the subclass's
+    CUDA module, a pair starts once GpuAdmission finds a GPU with an idle
+    session and room for its device memory, and loading and analysis run in
+    host processes. A session keeps its CUDA context, handles and staging
+    between pairs and takes each pair's device memory from the device's pool,
+    so what the pairs in flight hold is what admission reserved for them.
+
+    Subclasses provide the CUDA module and how a pair is sized, loaded, run on
+    a session and analysed.
+    """
+
+    GPU_LABEL = 'GPU'
+
     def __init__(self, config):
         super().__init__(config)
         coupling_cfg = config.get('couple')
-        self.pseudocount = float(coupling_cfg.get('pseudocount', 0.8))
 
         self.gpu_sessions = int(coupling_cfg.get('gpu_sessions', 4))
         self.gpu_workers = int(coupling_cfg.get('gpu_workers', 16))
@@ -1712,48 +1516,42 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
         else:
             self.gpu_host_processes = max(0, int(host))
 
-    def load_pair_arrays(self, pair, **kwargs):
-        pair_name = pair.get('name')
-        file_hash = pair.get('file_hash') or compute_file_hash(pair_name)
-        filename, _ = get_hashed_file_path(pair_name, file_hash,
-                                           kwargs.get('output_dir'))
-        try:
-            align = BinaryAlignment(filename)
-        except Exception:
-            align = self.concatenate(pair, kwargs.get('alignment_dir'),
-                                     downsample=kwargs.get('downsample', False),
-                                     downsample_to=kwargs.get('downsample_to'))
-            align.Reweight_Sequence(kwargs.get('reweighting_threshold', 0.8),
-                                    n_threads=getattr(self, 'reweight_threads', 0))
-            align.To_Zarr(filename, overwrite=True)
-        if getattr(align, 'weights', None) is None or align.Beff is None:
-            align.Reweight_Sequence(kwargs.get('reweighting_threshold', 0.8),
-                                    n_threads=getattr(self, 'reweight_threads', 0))
+    # -- what a subclass provides ----------------------------------------------
 
-        B, N = align.matrix.shape
-        MSA = np.ascontiguousarray(align.matrix.T, dtype=np.int8)      # (N, B)
-        W = np.asarray(align.weights, dtype=np.float64)
-        params = {'name': pair_name, 'pair_id': pair.get('id'), 'B': B, 'N': N,
-                'q': 21, 'Beff': float(align.Beff), 'file_hash': file_hash,
-                'saved_columns': list(align.saved_columns),
-                'lengthes': list(align.lengthes)}
-        return MSA, W, params
+    def _gpu_module(self):
+        """The CUDA module: Session, DeviceLostError and device_memory."""
+        raise NotImplementedError
+
+    def _new_session(self, gpu, ordinal):
+        return gpu.Session(ordinal)
+
+    def _pair_bytes(self, gpu, params, budget):
+        """Device memory the pair reserves. It may adapt how the pair runs
+        (recording that in params) to fit the largest GPU budget, `budget`."""
+        raise NotImplementedError
+
+    def _run_on_session(self, sess, MSA, W, params, kwargs):
+        """The pair's (N, N) score, computed on `sess`; W is None for a pair whose
+        weights are to be computed on the GPU (record them in params)."""
+        raise NotImplementedError
+
+    def load_pair_arrays(self, pair, **kwargs):
+        raise NotImplementedError
 
     def collect_score(self, score, params):
-        s16 = score.astype(np.float16)
-        analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
-                                       chainA_length=params['lengthes'][0],
-                                       EC_threshold=0)
-        calibrated = self.Calibrate(analyzer, params["Beff"])
-        return {
-            'id': params['pair_id'],
-            'effnumber': params['Beff'],
-            'length': int(params['N']),
-            'number': int(params['B']),
-            'file_hash': params['file_hash'],
-            **calibrated,
-            **self._score_fields(s16, params),
-        }
+        raise NotImplementedError
+
+    def _keep_gpu_weights(self, params):
+        """A pair reweighted on the GPU: keep the weights with the stored
+        alignment, where the CPU path's To_Zarr puts them, so a later run
+        reuses them and massiveilance recovers this pair's Beff from them."""
+        weights = params.pop('weights', None)
+        if weights is None:
+            return
+        filename, _ = get_hashed_file_path(params['name'], params['file_hash'],
+                                           self.output_dir)
+        zarr.open_group(store=filename)['align'].attrs.update(
+            {'weights': np.asarray(weights).tolist(), 'Beff': params['Beff']})
 
     # -- dispatch -------------------------------------------------------------
 
@@ -1770,7 +1568,7 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
                 yield {k: r[k] for k in r.keys()}
 
     def run(self, client=None, id_range=None):
-        from massivora.cpp_bindings import gauss_cuda
+        gpu = self._gpu_module()
 
         kwargs = dict(alignment_dir=self.alignment_dir,
                       output_dir=self.output_dir,
@@ -1781,18 +1579,18 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
         devices = visible_gpu_devices()
         sessions = []
         for ordinal, device_id in enumerate(devices):
-            logging.debug("GaussDCA GPU: %d session(s) on ordinal %d (GPU %s)",
+            logging.debug(f"{self.GPU_LABEL}: %d session(s) on ordinal %d (GPU %s)",
                           self.gpu_sessions, ordinal, device_id)
             sessions.append(queue.Queue())
             for _ in range(self.gpu_sessions):
-                sessions[ordinal].put(gauss_cuda.Session(ordinal))
-        logging.info("GaussDCA GPU: %d session(s) over %d GPU(s) (CUDA_VISIBLE_"
+                sessions[ordinal].put(self._new_session(gpu, ordinal))
+        logging.info(f"{self.GPU_LABEL}: %d session(s) over %d GPU(s) (CUDA_VISIBLE_"
                      "DEVICES=%s), %d workers", self.gpu_sessions * len(devices),
                      len(devices), ",".join(devices), self.gpu_workers)
 
         n_sessions = self.gpu_sessions * len(devices)
         if self.gpu_workers < n_sessions + self.gpu_host_processes:
-            logging.warning("GaussDCA GPU: %d workers cannot keep %d sessions busy while "
+            logging.warning(f"{self.GPU_LABEL}: %d workers cannot keep %d sessions busy while "
                             "%d host processes load and analyse; raise couple.gpu_workers",
                             self.gpu_workers, n_sessions, self.gpu_host_processes)
 
@@ -1800,11 +1598,11 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
         # the pairs in flight hold is what they reserved here. Measured once the
         # sessions exist, so their contexts and handles are already off it.
         admission = GpuAdmission(
-            (int(self.gpu_memory_limit * gauss_cuda.device_memory(o)['free_mb'] * 2**20)
+            (int(self.gpu_memory_limit * gpu.device_memory(o)['free_mb'] * 2**20)
              for o in range(len(devices))), self.gpu_sessions)
-        logging.info("GaussDCA GPU: device memory budget %s GiB",
+        logging.info(f"{self.GPU_LABEL}: device memory budget %s GiB",
                      ", ".join(f"{b / 2**30:.1f}" for b in admission.budgets))
-        clock = StageClock(n_sessions)
+        clock = StageClock(n_sessions, label=self.GPU_LABEL)
 
         # This file may be running as __main__ (massiworker runs it with
         # runpy), which a spawned process cannot import; hand it the module.
@@ -1827,7 +1625,7 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
                 # start a new one so only the pairs it was holding fail.
                 with pool_lock:
                     if pool[0] is current:
-                        logging.error("GaussDCA GPU: a host process died; restarting them")
+                        logging.error(f"{self.GPU_LABEL}: a host process died; restarting them")
                         current.shutdown(wait=False, cancel_futures=True)
                         pool[0] = new_pool()
                 raise
@@ -1854,28 +1652,47 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
         # this process shares; from then on every pair would fail and spend its
         # attempts. So stop instead, and hand back the pairs not yet run.
         lost = threading.Event()
+        # Set when the device is lost or the job is told to stop: claim nothing
+        # more, hand back the pairs not yet on a GPU and let those on one finish.
+        halt = threading.Event()
         underestimated = threading.Event()
 
+        def on_signal(signum, frame):
+            halt.set()
+            # A second signal gets the handler that was there before: it stops
+            # the job at once.
+            signal.signal(signum, previous_handlers.get(signum, signal.SIG_DFL))
+            logging.warning(f"{self.GPU_LABEL}: received signal %d; finishing the pairs on the "
+                            "GPUs and handing the rest back", signum)
+
+        previous_handlers = {}
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous_handlers[signum] = signal.signal(signum, on_signal)
+
         def score_pair(MSA, W, params, spent):
-            """Score on the first GPU with room for the pair; None if the device was lost meanwhile."""
-            need = gauss_cuda.pair_bytes(params['N'], params['B'], params['q'])
+            """Score on the first GPU with room for the pair; None if the run halted meanwhile."""
+            need = self._pair_bytes(gpu, params, max(admission.budgets))
             if need > max(admission.budgets):
                 raise RuntimeError(
                     f"Pair {params['pair_id']} '{params['name']}' ({params['B']} x "
                     f"{params['N']}) needs {need / 2**30:.1f} GiB of device memory, more "
                     f"than the {max(admission.budgets) / 2**30:.1f} GiB "
                     f"couple.gpu_memory_limit allows on any GPU")
+            if halt.is_set():
+                return None
             t0 = time.monotonic()
             ordinal = admission.acquire(need)
             sess = sessions[ordinal].get()          # admission left one idle
             t1 = time.monotonic()
             try:
-                if lost.is_set():
+                if halt.is_set():
                     return None
-                score = sess.score(MSA, W, q=params['q'], pseudocount=self.pseudocount)
+                score = self._run_on_session(sess, MSA, W, params, kwargs)
                 used = sess.last_pair_bytes
-            except gauss_cuda.DeviceLostError:
+            except gpu.DeviceLostError:
                 lost.set()
+                halt.set()
                 raise
             finally:
                 sessions[ordinal].put(sess)
@@ -1884,7 +1701,7 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
             if used > need and not underestimated.is_set():
                 underestimated.set()
                 logging.warning(
-                    "GaussDCA GPU: pair %s (%d x %d) took %d MiB of device memory, more "
+                    f"{self.GPU_LABEL}: pair %s (%d x %d) took %d MiB of device memory, more "
                     "than the %d MiB reserved for it; lower couple.gpu_memory_limit if "
                     "pairs run out of memory", params['pair_id'], params['B'],
                     params['N'], used >> 20, need >> 20)
@@ -1897,7 +1714,7 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
                     if pair is None:
                         return
                     score, spent = None, {}
-                    if not lost.is_set():
+                    if not halt.is_set():
                         t0 = time.monotonic()
                         arrays, params = load(pair)
                         spent['load'] = time.monotonic() - t0
@@ -1942,7 +1759,7 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
 
         try:
             while True:
-                for pair in self._claimed_pairs(id_range, stop=lost):
+                for pair in self._claimed_pairs(id_range, stop=halt):
                     work.put(pair)
                     flush(force=False)
                 # Let everything dispatched finish, then commit its failures:
@@ -1952,7 +1769,7 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
                 with lock:
                     had_failures = bool(fail_updates)
                 flush(force=True)
-                if lost.is_set() or not had_failures:
+                if halt.is_set() or not had_failures:
                     break
             for _ in threads:
                 work.put(None)
@@ -1965,10 +1782,215 @@ class GaussCouplingExecutorGPU(BaseCouplingExecutor, BuiltinGaussCalibrator):
             flush(force=True)
             self._close_scores()
             self.close_db_connection()
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
         if lost.is_set():
-            raise RuntimeError("GaussDCA GPU: the CUDA context was lost (see the first "
+            raise RuntimeError(f"{self.GPU_LABEL}: the CUDA context was lost (see the first "
                                "DeviceLostError above); the pairs not yet run were handed "
                                "back unspent. Restart the job to go on.")
+        if halt.is_set():
+            logging.warning(f"{self.GPU_LABEL}: stopped on a signal; the pairs not yet run were "
+                            "handed back unspent")
+
+
+class GaussCouplingExecutorGPU(SessionGPUExecutor, BuiltinGaussCalibrator):
+    GPU_LABEL = 'GaussDCA GPU'
+
+    def __init__(self, config):
+        super().__init__(config)
+        coupling_cfg = config.get('couple')
+        self.pseudocount = float(coupling_cfg.get('pseudocount', 0.8))
+
+    def _gpu_module(self):
+        from massivora.cpp_bindings import gauss_cuda
+        return gauss_cuda
+
+    def _pair_bytes(self, gpu, params, budget):
+        return gpu.pair_bytes(params['N'], params['B'], params['q'])
+
+    def _run_on_session(self, sess, MSA, W, params, kwargs):
+        if W is None:
+            # Reweight on the GPU the pair was admitted to. The counts
+            # take less device memory than the score and are done
+            # before it starts, so the reservation covers both.
+            m = sess.neighbour_counts(MSA, kwargs['reweighting_threshold'] * params['N'])
+            W = 1.0 / m.astype(np.int64)        # exactly as Reweight_Sequence
+            params['Beff'] = float(W.sum())
+            params['weights'] = W
+        return sess.score(MSA, W, q=params['q'], pseudocount=self.pseudocount)
+
+    def load_pair_arrays(self, pair, **kwargs):
+        pair_name = pair.get('name')
+        file_hash = pair.get('file_hash') or compute_file_hash(pair_name)
+        filename, _ = get_hashed_file_path(pair_name, file_hash,
+                                           kwargs.get('output_dir'))
+        try:
+            align = BinaryAlignment(filename)
+        except Exception:
+            align = self.concatenate(pair, kwargs.get('alignment_dir'),
+                                     downsample=kwargs.get('downsample', False),
+                                     downsample_to=kwargs.get('downsample_to'))
+            align.To_Zarr(filename, overwrite=True)
+
+        B, N = align.matrix.shape
+        MSA = np.ascontiguousarray(align.matrix.T, dtype=np.int8)      # (N, B)
+        # Weights the store already has are used as they are. Otherwise W is
+        # None and the pair is reweighted on the GPU it is scored on (run()),
+        # which also takes them off these host processes' cores.
+        W, Beff = None, None
+        if getattr(align, 'weights', None) is not None and align.Beff is not None:
+            W, Beff = np.asarray(align.weights, dtype=np.float64), float(align.Beff)
+        params = {'name': pair_name, 'pair_id': pair.get('id'), 'B': B, 'N': N,
+                'q': 21, 'Beff': Beff, 'file_hash': file_hash,
+                'saved_columns': list(align.saved_columns),
+                'lengthes': list(align.lengthes)}
+        return MSA, W, params
+
+    def collect_score(self, score, params):
+        self._keep_gpu_weights(params)
+        s16 = score.astype(np.float16)
+        analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
+                                       chainA_length=params['lengthes'][0],
+                                       EC_threshold=0)
+        calibrated = self.Calibrate(analyzer, params["Beff"])
+        return {
+            'id': params['pair_id'],
+            'effnumber': params['Beff'],
+            'length': int(params['N']),
+            'number': int(params['B']),
+            'file_hash': params['file_hash'],
+            **calibrated,
+            **self._score_fields(s16, params),
+        }
+
+
+
+# ---------------------------------------------------------------------------
+# GPU PLM executor
+# ---------------------------------------------------------------------------
+class PLMCouplingExecutorGPU(SessionGPUExecutor, BuiltinPLMCalibrator):
+
+    GPU_LABEL = 'plmDCA GPU'
+
+    def __init__(self, config):
+        super().__init__(config)
+        coupling_cfg = config.get('couple')
+        self.fast_approximation = bool(coupling_cfg.get('fast_approximation', False))
+        self.col_gap_threshold = float(
+            (config.get('align') or {}).get('col_gap_threshold', 0.5))
+        # Upper bound on the sites a pair optimises in lockstep (plm_cuda.slots).
+        self.site_batch = int(coupling_cfg.get('site_batch', 24))
+        # One Session per GPU, whatever couple.gpu_sessions (GaussDCA's) says:
+        # one pair already saturates the GPU, so more Sessions only split its
+        # L2 and bandwidth between them. Measured on an H100 over a
+        # representative helpy mix: 4% slower with 2, 16% with 4.
+        self.gpu_sessions = 1
+
+    def _gpu_module(self):
+        from massivora.cpp_bindings import plm_cuda
+        return plm_cuda
+
+    def _pair_bytes(self, gpu, params, budget):
+        # Fewer sites in lockstep take less memory: halve the batch until the
+        # pair fits the largest GPU budget, if it can.
+        B, N, q = params['B'], params['N'], params['q']
+        batch = self.site_batch
+        need = gpu.pair_bytes(B, N, q, batch)
+        while need > budget and batch > 1:
+            batch //= 2
+            need = gpu.pair_bytes(B, N, q, batch)
+        params['site_batch'] = batch
+        return need
+
+    def _run_on_session(self, sess, MSA, W, params, kwargs):
+        if W is None:
+            # Reweight on the GPU the pair was admitted to, over every column as
+            # Reweight_Sequence does. The counts take less device memory than
+            # the pair and are done before it starts, so the reservation covers
+            # both.
+            m = sess.neighbour_counts(MSA, kwargs['reweighting_threshold'] * MSA.shape[1])
+            weights = 1.0 / m.astype(np.int64)      # exactly as Reweight_Sequence
+            params['Beff'] = float(weights.sum())
+            params['weights'] = weights
+            W = weights / params['Beff']
+        columns = params.get('columns')
+        if columns is not None:
+            MSA = np.ascontiguousarray(MSA[:, columns])
+        return sess.score(MSA, W, params['q'], lambdaH=self.lambda_h, lambdaJ=self.lambda_J,
+                          maxeval=self.maxit, site_batch=params['site_batch'])
+
+    @staticmethod
+    def _kept_columns(align):
+        """The columns Drop_Masked_Gap_Columns keeps, without dropping them."""
+        probe = BinaryAlignment()
+        probe.matrix = np.arange(align.matrix.shape[1], dtype=np.int32)[None, :]
+        probe.saved_columns, probe.lengthes = align.saved_columns, align.lengthes
+        probe.Drop_Masked_Gap_Columns()
+        return probe.matrix[0].tolist()
+
+    def load_pair_arrays(self, pair, **kwargs):
+        pair_name = pair.get('name')
+        file_hash = pair.get('file_hash') or compute_file_hash(pair_name)
+        filename, _ = get_hashed_file_path(pair_name, file_hash, kwargs.get('output_dir'))
+        try:
+            align = BinaryAlignment(filename)
+        except Exception:
+            logging.warning(f"Failed to load pair {pair.get('id')} '{pair_name}', "
+                            "trying to concatenate.")
+            align = self.concatenate(pair, kwargs.get('alignment_dir'),
+                                     downsample=kwargs.get('downsample', False),
+                                     downsample_to=kwargs.get('downsample_to'))
+            align.To_Zarr(filename, overwrite=True)
+        q = int(align.matrix.max()) + 1
+
+        # Weights the store already has are used as they are. Otherwise W is
+        # None and the pair is reweighted on the GPU it runs on, which also
+        # keeps these host processes off the GPU.
+        W, Beff = None, None
+        if getattr(align, 'weights', None) is not None and align.Beff is not None:
+            Beff = float(align.Beff)
+            W = np.asarray(align.weights, dtype=np.float64) / Beff
+
+        # Optimise only the columns the gap mask keeps; the weights stay those
+        # of the whole alignment. Without weights yet the whole alignment goes
+        # to the GPU, which reweights it and then drops the columns.
+        columns = None
+        if self.fast_approximation:
+            align.Mask_Gap_Columns(self.col_gap_threshold)
+            align.To_Zarr(filename, overwrite=True)
+            if W is not None:
+                align.Drop_Masked_Gap_Columns()
+            else:
+                columns = self._kept_columns(align)
+
+        MSA = np.ascontiguousarray(align.matrix, dtype=np.int8)        # (B, N)
+        B = MSA.shape[0]
+        N = MSA.shape[1] if columns is None else len(columns)
+        params = {'name': pair_name, 'pair_id': pair.get('id'), 'B': B, 'N': N, 'q': q,
+                  'Beff': Beff, 'file_hash': file_hash, 'columns': columns,
+                  'saved_columns': list(align.saved_columns),
+                  'lengthes': list(align.lengthes)}
+        return MSA, W, params
+
+    def collect_score(self, score, params):
+        self._keep_gpu_weights(params)
+        score = np.asarray(score).astype(np.float16)
+        if self.fast_approximation:
+            # Expand the score of the kept columns to the whole alignment
+            score = self._expand_score(score, params['saved_columns'], params['lengthes'])
+        analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
+                                   chainA_length=params['lengthes'][0],
+                                   EC_threshold=0)
+        calibrated = self.Calibrate(analyzer, params["Beff"])
+        return {
+            'id': params['pair_id'],
+            'effnumber': params['Beff'],
+            'length': int(score.shape[0]),
+            'number': int(params['B']),
+            'file_hash': params['file_hash'],
+            **calibrated,
+            **self._score_fields(score, params),
+        }
 
 
 EXECUTORS = {

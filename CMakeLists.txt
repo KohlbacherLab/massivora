@@ -350,9 +350,18 @@ if(ENABLE_CUDA)
     set_property(TARGET gauss_cuda PROPERTY POSITION_INDEPENDENT_CODE ON)
 endif()
 
+# --- Batched plmDCA CUDA core as an importable module -----------------------
+if(ENABLE_CUDA)
+    pybind11_add_module(plm_cuda ${BINDINGS_SRC}/plm_cuda_py.cu)
+    target_include_directories(plm_cuda PRIVATE ${BINDINGS_SRC})
+    massivora_cuda(plm_cuda)
+    target_link_libraries(plm_cuda PRIVATE ${MASSIVORA_CUBLAS_TARGET})
+    set_property(TARGET plm_cuda PROPERTY POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # --- CUDA backend library (only if CUDA is enabled) ---
 if(ENABLE_CUDA)
-    add_library(cuda_bindings SHARED ${BINDINGS_SRC}/bindings.cu)
+    add_library(cuda_bindings SHARED ${BINDINGS_SRC}/bindings.cu ${BINDINGS_SRC}/plm_batched.cu)
     target_include_directories(cuda_bindings PRIVATE ${BINDINGS_SRC})
     massivora_cuda(cuda_bindings)
     target_link_libraries(cuda_bindings PRIVATE ${MASSIVORA_CUBLAS_TARGET})
@@ -380,6 +389,7 @@ endif()
 if(ENABLE_CUDA AND NOT APPLE)
   set_target_properties(cpp_bindings PROPERTIES INSTALL_RPATH "$ORIGIN")
   set_target_properties(gauss_cuda PROPERTIES INSTALL_RPATH "$ORIGIN")
+  set_target_properties(plm_cuda PROPERTIES INSTALL_RPATH "$ORIGIN")
   set_target_properties(plm_opt_site PROPERTIES INSTALL_RPATH "$ORIGIN/../cpp_bindings")
 endif()
 
@@ -404,5 +414,7 @@ if(ENABLE_CUDA)
     install(TARGETS cuda_bindings
         LIBRARY DESTINATION ${MASSIVORA_BINDINGS_INSTALL_DIR})
     install(TARGETS gauss_cuda
+        LIBRARY DESTINATION ${MASSIVORA_BINDINGS_INSTALL_DIR})
+    install(TARGETS plm_cuda
         LIBRARY DESTINATION ${MASSIVORA_BINDINGS_INSTALL_DIR})
 endif()

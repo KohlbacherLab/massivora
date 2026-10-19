@@ -315,9 +315,13 @@ MSAData loadData(const std::string& pairName, int B, int N) {
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include <atomic>
+#include <chrono>
 #include <map>
+#include <sstream>
 #include <thread>
 #include "bindings.cuh"
+#include "plm_batched.h"
 
 #define CUDA_CHECK(call)                                                       \
     do {                                                                       \
@@ -340,50 +344,21 @@ static size_t gpuFreeBytes() {
     return freeB;
 }
 
-int runGpu(const std::string& pairName, int B, int N, int q,
-           float lambdaH, float lambdaJ, float eps_conv, int maxeval,
-           int n_streams) {
-    MSAData data = loadData(pairName, B, N);
-    // Points straight into the shared-memory mapping; already the dtype the
-    // kernels want, so it is uploaded byte-for-byte.
-    const MSAScalar* msaHost = data.MSA.data();
-    const WMap& W = data.W;
-
-    const int q_pad = ((q + 7) / 8) * 8;
-    const size_t n_params = (size_t)q_pad + (size_t)N * q_pad * q_pad;
+// Per-site path: one cudaOptimizeSite per site, the sites spread over
+// n_streams CUDA streams. Returns the total L-BFGS iterations; n_streams is
+// updated to the number of streams actually used, f_sum to the final
+// objective summed over sites.
+static long optimizeSitesStreams(const signed char* d_MSA, const float* d_W,
+                                 __half* d_x0, int B, int N, int q, int q_pad,
+                                 size_t n_params, float lambdaH, float lambdaJ,
+                                 float eps_conv, int maxeval, int& n_streams,
+                                 double& f_sum) {
     // Must track the L-BFGS m_corr default in cudaOptimizeSite; only used to
     // size the stream budget below.
     const int m_corr_hint = 8;
 
-    // ---- The only host-side conversion left is the (B,) weight vector ----
-    // The MSA goes up as the int8 it already is, and the (B, N, q_pad) fp16
-    // one-hot is expanded on the device (see cudaBuildMsaOneHot below), so it
-    // never costs B*N*q_pad*2 bytes of host RAM nor the same again over PCIe.
-    std::vector<float> wHost((size_t)B);
-    for (int b = 0; b < B; ++b) wHost[b] = static_cast<float>(W(b));
-
-    // ---- Upload to device ----
-    signed char* d_MSA      = nullptr;
-    float*       d_W        = nullptr;
-    __half*      d_MSA_pad  = nullptr;
-    // TODO: Now the x0 for all sites are on GPU, but if this is going to occupy 
-    // 60%+ of GPU memory on current device, only put one site on GPU at a time 
-    // and keep the rest on CPU.
-    __half*      d_x0       = nullptr;  // (N, n_params) fp16, one row per site
-
-    const size_t msa_elems     = (size_t)B * N;
-    const size_t msa_pad_elems = msa_elems * (size_t)q_pad;
-
-    CUDA_CHECK(cudaMalloc(&d_MSA,     msa_elems    * sizeof(signed char)));
-    CUDA_CHECK(cudaMalloc(&d_W,       wHost.size() * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_MSA_pad, msa_pad_elems * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&d_x0,      (size_t)N * n_params * sizeof(__half)));
-
-    CUDA_CHECK(cudaMemcpy(d_MSA, msaHost, msa_elems * sizeof(signed char),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_W,   wHost.data(), wHost.size() * sizeof(float),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_x0, 0, (size_t)N * n_params * sizeof(__half)));
+    __half* d_MSA_pad = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_MSA_pad, (size_t)B * N * q_pad * sizeof(__half)));
 
     // Expand the one-hot on the device from the int8 MSA. It runs on the legacy
     // default stream, which the per-site non-blocking streams do NOT sync
@@ -419,12 +394,14 @@ int runGpu(const std::string& pairName, int B, int N, int q,
     if (n_streams > N) n_streams = N;
 
     // ---- Optimize every site, distributing them across CUDA streams ----
-
+    const int streams = n_streams;
+    std::atomic<long> total_iters{0};
+    std::vector<double> f_site((size_t)N, 0.0);
     auto worker = [&](int tid) {
         cudaStream_t stream;
         cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-        for (int r = tid; r < N; r += n_streams) {
-            cudaOptimizeSite(
+        for (int r = tid; r < N; r += streams) {
+            const auto res = cudaOptimizeSite(
                 d_MSA_pad, d_MSA, d_W,
                 r, B, N, q, q_pad,
                 lambdaH, lambdaJ, eps_conv, maxeval,
@@ -432,59 +409,155 @@ int runGpu(const std::string& pairName, int B, int N, int q,
                 std::map<std::string, float>{},
                 /*ext_handle=*/nullptr,
                 stream);
+            total_iters += res.first;
+            f_site[r] = res.second;
         }
         cudaStreamSynchronize(stream);
         cudaStreamDestroy(stream);
     };
 
     std::vector<std::thread> threads;
-    for (int t = 0; t < n_streams; ++t) {
+    for (int t = 0; t < streams; ++t) {
         threads.emplace_back(worker, t);
     }
     for (auto& th : threads) th.join();
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    // ---- Copy optimized parameters back to host (pinned: ~25% faster D2H) ----
-    __half* x0Host = nullptr;
-    CUDA_CHECK(cudaHostAlloc(&x0Host, (size_t)N * n_params * sizeof(__half),
-                             cudaHostAllocDefault));
-    CUDA_CHECK(cudaMemcpy(x0Host, d_x0,
-                          (size_t)N * n_params * sizeof(__half), cudaMemcpyDeviceToHost));
-
-    cudaFree(d_MSA);
-    cudaFree(d_W);
     cudaFree(d_MSA_pad);
-    cudaFree(d_x0);
+    f_sum = 0.0;
+    for (double f : f_site) f_sum += f;
+    return total_iters.load();
+}
 
-    // ---- Extract the (q x q) coupling blocks, cropping away q_pad padding ----
-    // Output layout: row r holds site r's couplings against every site i as a
-    // contiguous (N, q, q) block -> a flat (N, N*q*q) float32 buffer.
+// site_batch > 0: optimise up to that many sites in lockstep with the batched
+// L-BFGS (cudaOptimizeSitesBatched), so the PLL GEMMs are q*site_batch columns
+// wide and run on the tensor cores at full width. site_batch == 0: the
+// per-site path, one cudaOptimizeSite per site spread over n_streams CUDA
+// streams. Both run the same L-BFGS and publish the same raw J.
+int runGpu(const std::string& pairName, int B, int N, int q,
+           float lambdaH, float lambdaJ, float eps_conv, int maxeval,
+           int n_streams, int site_batch) {
+    // MASSIVORA_PLM_STATS=1 prints one PLM_STATS line per pair to stderr:
+    // optimizer counters plus wall time per phase.
+    const bool print_stats = std::getenv("MASSIVORA_PLM_STATS") != nullptr;
+    std::ostringstream stats;
+    auto t_phase = std::chrono::steady_clock::now();
+    auto lap = [&](const char* phase) {
+        const auto now = std::chrono::steady_clock::now();
+        stats << " " << phase << "_ms="
+              << std::chrono::duration<double, std::milli>(now - t_phase).count();
+        t_phase = now;
+    };
+
+    MSAData data = loadData(pairName, B, N);
+    // Points straight into the shared-memory mapping; already the dtype the
+    // kernels want, so it is uploaded byte-for-byte.
+    const MSAScalar* msaHost = data.MSA.data();
+    const WMap& W = data.W;
+
+    const int q_pad = ((q + 7) / 8) * 8;
+    const size_t n_params = (size_t)q_pad + (size_t)N * q_pad * q_pad;
+
     // ---- Publish the RAW (un-gauged) J to shared memory. The Ising gauge is
     // applied downstream on the CPU (cpp_bindings.applyIsingGauge in the GPU
     // executor's collect_results), so it no longer occupies this GPU process.
-    //
-    // The destination is mapped first and the blocks are cropped straight into
-    // it: the intermediate buffer only existed to be memcpy'd here. The loop is
-    // a pure gather with no cross-iteration state, so it parallelises directly.
+    // Layout: row r holds site r's couplings against every site i as a
+    // contiguous (N, q, q) block -> a flat (N, N*q*q) float32 buffer.
     const size_t outElems = (size_t)N * N * q * q;
     ShmMapping shmJ = openShm(pairName + "_J", outElems * sizeof(float));
     float* outBuf = static_cast<float*>(shmJ.ptr);
+    lap("load");
 
-    #pragma omp parallel for schedule(static)
-    for (int r = 0; r < N; ++r) {
-        const __half* xr = x0Host + (size_t)r * n_params + q_pad;  // skip h
-        float* out_r = outBuf + (size_t)r * N * q * q;
-        for (int i = 0; i < N; ++i) {
-            const __half* blk = xr + (size_t)i * q_pad * q_pad;
-            float* out_blk = out_r + (size_t)i * q * q;
-            for (int a = 0; a < q; ++a) {
-                for (int b = 0; b < q; ++b) {
-                    out_blk[a * q + b] = __half2float(blk[a * q_pad + b]);
+    if (site_batch > 0) {
+        // ---- Batched multi-site L-BFGS through a plmDCA Session: the host
+        // alignment goes in as it is mapped, and J comes back straight into
+        // the shared-memory output.
+        PlmBatchStats bs{};
+        char err[1024] = "";
+        const int rc = plmCouplingsBatched(msaHost, W.data(), B, N, q,
+                                           lambdaH, lambdaJ, maxeval, site_batch,
+                                           outBuf, &bs, err, sizeof(err));
+        if (rc != 0) {
+            std::cerr << "plm_opt_site: " << err << std::endl;
+            return 1;
+        }
+        stats << " mode=batched slots=" << bs.slots
+              << " rounds=" << bs.rounds << " evals=" << bs.evals
+              << " iters=" << bs.iterations << " converged=" << bs.converged
+              << " stalled=" << bs.stalled << " max_iter=" << bs.max_iter
+              << " ls_failed=" << bs.ls_failed << " f_sum=" << bs.f_sum;
+        lap("opt");
+    } else {
+        // ---- The only host-side conversion left is the (B,) weight vector ----
+        // The MSA goes up as the int8 it already is, and the fp16 one-hot is
+        // expanded on the device, so it never costs B*N*q_pad*2 bytes of host
+        // RAM nor the same again over PCIe.
+        std::vector<float> wHost((size_t)B);
+        for (int b = 0; b < B; ++b) wHost[b] = static_cast<float>(W(b));
+
+        // ---- Upload to device ----
+        signed char* d_MSA      = nullptr;
+        float*       d_W        = nullptr;
+        const size_t msa_elems  = (size_t)B * N;
+        CUDA_CHECK(cudaMalloc(&d_MSA,     msa_elems    * sizeof(signed char)));
+        CUDA_CHECK(cudaMalloc(&d_W,       wHost.size() * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_MSA, msaHost, msa_elems * sizeof(signed char),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_W,   wHost.data(), wHost.size() * sizeof(float),
+                              cudaMemcpyHostToDevice));
+
+        // TODO: Now the x0 for all sites are on GPU, but if this is going to occupy 
+        // 60%+ of GPU memory on current device, only put one site on GPU at a time 
+        // and keep the rest on CPU.
+        __half*      d_x0       = nullptr;  // (N, n_params) fp16, one row per site
+        CUDA_CHECK(cudaMalloc(&d_x0,      (size_t)N * n_params * sizeof(__half)));
+        CUDA_CHECK(cudaMemset(d_x0, 0, (size_t)N * n_params * sizeof(__half)));
+        // The streams are non-blocking, so they do not order against these
+        // legacy-stream copies.
+        CUDA_CHECK(cudaDeviceSynchronize());
+        lap("upload");
+
+        double f_sum = 0.0;
+        const long iters = optimizeSitesStreams(d_MSA, d_W, d_x0, B, N, q, q_pad,
+                                                n_params, lambdaH, lambdaJ,
+                                                eps_conv, maxeval, n_streams, f_sum);
+        stats << " mode=streams n_streams=" << n_streams
+              << " iters=" << iters << " f_sum=" << f_sum;
+        lap("opt");
+
+        // ---- Copy optimized parameters back to host (pinned: ~25% faster D2H) ----
+        __half* x0Host = nullptr;
+        CUDA_CHECK(cudaHostAlloc(&x0Host, (size_t)N * n_params * sizeof(__half),
+                                 cudaHostAllocDefault));
+        CUDA_CHECK(cudaMemcpy(x0Host, d_x0,
+                              (size_t)N * n_params * sizeof(__half), cudaMemcpyDeviceToHost));
+        cudaFree(d_x0);
+        lap("d2h");
+
+        // ---- Extract the (q x q) coupling blocks, cropping away q_pad padding ----
+        // The blocks are cropped straight into the shared-memory output. The loop
+        // is a pure gather with no cross-iteration state, so it parallelises
+        // directly.
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < N; ++r) {
+            const __half* xr = x0Host + (size_t)r * n_params + q_pad;  // skip h
+            float* out_r = outBuf + (size_t)r * N * q * q;
+            for (int i = 0; i < N; ++i) {
+                const __half* blk = xr + (size_t)i * q_pad * q_pad;
+                float* out_blk = out_r + (size_t)i * q * q;
+                for (int a = 0; a < q; ++a) {
+                    for (int b = 0; b < q; ++b) {
+                        out_blk[a * q + b] = __half2float(blk[a * q_pad + b]);
+                    }
                 }
             }
         }
+        cudaFreeHost(x0Host);
+        cudaFree(d_MSA);
+        cudaFree(d_W);
+        lap("crop");
     }
-    cudaFreeHost(x0Host);
+
+    if (print_stats) std::cerr << "PLM_STATS" << stats.str() << std::endl;
 
     return 0;
 }
@@ -527,11 +600,13 @@ int main(int argc, char* argv[]) {
     if (use_gpu) {
 #ifdef ENABLE_CUDA
         // GPU: optimize all sites of a pair in a single process.
-        // args: pairName B N q lambdaH lambdaJ eps_conv maxeval n_streams
+        // args: pairName B N q lambdaH lambdaJ eps_conv maxeval n_streams [site_batch]
+        // Up to site_batch (default 24) sites are optimised in lockstep; 0
+        // selects the per-site path, where n_streams applies.
         if (pos.size() < 9) {
             std::cerr << "Usage: " << argv[0]
                       << " --use-gpu <pairName> <B> <N> <q> <lambdaH> <lambdaJ>"
-                         " <eps_conv> <maxeval> <n_streams>" << std::endl;
+                         " <eps_conv> <maxeval> <n_streams> [site_batch]" << std::endl;
             return 1;
         }
         std::string pairName = pos[0];
@@ -543,7 +618,9 @@ int main(int argc, char* argv[]) {
         float eps_conv  = std::stof(pos[6]);
         int   maxeval   = std::stoi(pos[7]);
         int   n_streams = std::stoi(pos[8]);
-        return runGpu(pairName, B, N, q, lambdaH, lambdaJ, eps_conv, maxeval, n_streams);
+        int   site_batch = (pos.size() > 9) ? std::stoi(pos[9]) : 24;
+        return runGpu(pairName, B, N, q, lambdaH, lambdaJ, eps_conv, maxeval,
+                      n_streams, site_batch);
 #else
         std::cerr << argv[0] << ": built without CUDA support; rebuild with "
                      "-DENABLE_CUDA=ON to use --use-gpu." << std::endl;
