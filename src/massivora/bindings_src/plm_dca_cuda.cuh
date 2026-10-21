@@ -168,6 +168,22 @@ __device__ float block_max(float v) {   /* v >= 0 */
 #define PLM_GRID_STRIDE(i, n) \
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); i += gridDim.x * blockDim.x)
 
+/* The per-slot optimizer vectors (x, xt, g, gt, dir, s, y) are laid out with
+ * stride ns = n rounded up to a multiple of 4, padding held at zero, so the
+ * element-wise kernels below move float4s: 16-byte accesses keep more bytes
+ * in flight than scalar loads and reach ~1.2x the bandwidth on an H100 for
+ * these streams. Every op below is element-wise or a sum over elements, so a
+ * zero pad stays zero and adds nothing to a dot product. */
+__device__ __forceinline__ float4 ld4(const float* p, int i) {
+    return reinterpret_cast<const float4*>(p)[i];
+}
+__device__ __forceinline__ void st4(float* p, int i, float4 v) {
+    reinterpret_cast<float4*>(p)[i] = v;
+}
+__device__ __forceinline__ float dot4(float4 a, float4 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
 /* =========================================================================
  * Setup / slot lifecycle
  * =========================================================================*/
@@ -189,11 +205,12 @@ __global__ void k_onehot(const signed char* __restrict__ MSA, __half* __restrict
 
 /* x = x_trial = 0: every site starts from zero, and its first trial point is
  * that initial guess. */
-__global__ void k_load(SlotArgs a, float* __restrict__ x, float* __restrict__ xt, int n) {
-    const size_t base = (size_t)a.slot[blockIdx.y] * n;
-    PLM_GRID_STRIDE(i, n) {
-        x[base + i] = 0.0f;
-        xt[base + i] = 0.0f;
+__global__ void k_load(SlotArgs a, float* __restrict__ x, float* __restrict__ xt, int ns) {
+    const size_t base = (size_t)a.slot[blockIdx.y] * ns;
+    const float4 z = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    PLM_GRID_STRIDE(i, ns / 4) {
+        st4(x + base, i, z);
+        st4(xt + base, i, z);
     }
 }
 
@@ -202,8 +219,8 @@ __device__ __forceinline__ float round_fp16(float v) { return __half2float(__flo
 /* Row `site` of J = the site's couplings in fp16, the precision the per-site
  * path keeps its solution in. h is not kept. */
 __global__ void k_store(SlotArgs a, const float* __restrict__ x, __half* __restrict__ J,
-                        int n, int q) {
-    const float* xs = x + (size_t)a.slot[blockIdx.y] * n + q;
+                        int n, int q, int ns) {
+    const float* xs = x + (size_t)a.slot[blockIdx.y] * ns + q;
     __half* out = J + (size_t)a.site[blockIdx.y] * (n - q);
     PLM_GRID_STRIDE(i, n - q) out[i] = __float2half(xs[i]);
 }
@@ -224,10 +241,10 @@ __global__ void k_store(SlotArgs a, const float* __restrict__ x, __half* __restr
  * of kThreads. */
 __global__ void k_pack(SlotArgs a, const float* __restrict__ xt, __half* __restrict__ JT,
                        float* __restrict__ h_eval, float* __restrict__ parts,
-                       int n, int q, int K) {
+                       int n, int q, int K, int ns) {
     __shared__ float tile[32][33];
     const int s = a.slot[blockIdx.y];
-    const float* x = xt + (size_t)s * n;
+    const float* x = xt + (size_t)s * ns;
     const int Nq = (n - q) / q;
     const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5, ny = blockDim.x >> 5;
     float hh = 0.0f, jj = 0.0f;
@@ -309,9 +326,9 @@ __global__ void k_vgrad(SlotArgs a, const float* __restrict__ E, const float* __
 __global__ void k_unpack(SlotArgs a, const float* __restrict__ G, const float* __restrict__ xt,
                          const float* __restrict__ h_eval, const float* __restrict__ gh,
                          float* __restrict__ gt, int n, int q, int M,
-                         float lambdaH, float lambdaJ) {
+                         float lambdaH, float lambdaJ, int ns) {
     const int s = a.slot[blockIdx.y], r = a.site[blockIdx.y];
-    const size_t base = (size_t)s * n;
+    const size_t base = (size_t)s * ns;
     PLM_GRID_STRIDE(i, n) {
         if (i < q) {
             gt[base + i] = gh[s * q + i] + 2.0f * lambdaH * h_eval[s * q + i];
@@ -331,17 +348,24 @@ __global__ void k_unpack(SlotArgs a, const float* __restrict__ G, const float* _
 /* dst = alpha * src. alpha = 1 commits g after a site's first evaluation;
  * alpha = -1 is the steepest-descent fallback dir = -g. */
 __global__ void k_scale_copy(SlotArgs a, float* __restrict__ dst, const float* __restrict__ src,
-                             float alpha, int n) {
-    const size_t base = (size_t)a.slot[blockIdx.y] * n;
-    PLM_GRID_STRIDE(i, n) dst[base + i] = alpha * src[base + i];
+                             float alpha, int ns) {
+    const size_t base = (size_t)a.slot[blockIdx.y] * ns;
+    PLM_GRID_STRIDE(i, ns / 4) {
+        const float4 v = ld4(src + base, i);
+        st4(dst + base, i, make_float4(alpha * v.x, alpha * v.y, alpha * v.z, alpha * v.w));
+    }
 }
 
 /* x_trial = x + step * dir */
 __global__ void k_trial(SlotArgs a, float* __restrict__ xt, const float* __restrict__ x,
-                        const float* __restrict__ dir, int n) {
-    const size_t base = (size_t)a.slot[blockIdx.y] * n;
+                        const float* __restrict__ dir, int ns) {
+    const size_t base = (size_t)a.slot[blockIdx.y] * ns;
     const float step = a.step[blockIdx.y];
-    PLM_GRID_STRIDE(i, n) xt[base + i] = 1.0f * x[base + i] + step * dir[base + i];
+    PLM_GRID_STRIDE(i, ns / 4) {
+        const float4 u = ld4(x + base, i), d = ld4(dir + base, i);
+        st4(xt + base, i, make_float4(u.x + step * d.x, u.y + step * d.y,
+                                      u.z + step * d.z, u.w + step * d.w));
+    }
 }
 
 /* Accepted step, one pass: s_k = x_trial - x, y_k = g_trial - g into ring slot
@@ -350,21 +374,23 @@ __global__ void k_trial(SlotArgs a, float* __restrict__ xt, const float* __restr
 __global__ void k_accept(SlotArgs a, float* __restrict__ x, const float* __restrict__ xt,
                          float* __restrict__ g, const float* __restrict__ gt,
                          float* __restrict__ sbuf, float* __restrict__ ybuf,
-                         float* __restrict__ acc, int n, int m) {
+                         float* __restrict__ acc, int ns, int m) {
     const int e = blockIdx.y, s = a.slot[e];
-    const size_t base = (size_t)s * n;
-    float* sv = sbuf + ((size_t)s * m + a.head[e]) * n;
-    float* yv = ybuf + ((size_t)s * m + a.head[e]) * n;
+    const size_t base = (size_t)s * ns;
+    float* sv = sbuf + ((size_t)s * m + a.head[e]) * ns;
+    float* yv = ybuf + ((size_t)s * m + a.head[e]) * ns;
     float lsy = 0.0f, lyy = 0.0f;
-    PLM_GRID_STRIDE(i, n) {
-        const float xn = xt[base + i], gn = gt[base + i];
-        const float sd = xn - x[base + i], yd = gn - g[base + i];
-        sv[i] = sd;
-        yv[i] = yd;
-        x[base + i] = xn;
-        g[base + i] = gn;
-        lsy += sd * yd;
-        lyy += yd * yd;
+    PLM_GRID_STRIDE(i, ns / 4) {
+        const float4 xn = ld4(xt + base, i), gn = ld4(gt + base, i);
+        const float4 xo = ld4(x + base, i),  go = ld4(g + base, i);
+        const float4 sd = make_float4(xn.x - xo.x, xn.y - xo.y, xn.z - xo.z, xn.w - xo.w);
+        const float4 yd = make_float4(gn.x - go.x, gn.y - go.y, gn.z - go.z, gn.w - go.w);
+        st4(sv, i, sd);
+        st4(yv, i, yd);
+        st4(x + base, i, xn);
+        st4(g + base, i, gn);
+        lsy += dot4(sd, yd);
+        lyy += dot4(yd, yd);
     }
     lsy = block_sum(lsy);
     lyy = block_sum(lyy);
@@ -401,28 +427,30 @@ __global__ void k_curvature(SlotArgs a, const float* __restrict__ acc,
 __global__ void k_twoloop(SlotArgs a, int t, const float* __restrict__ g, float* __restrict__ dir,
                           const float* __restrict__ sbuf, const float* __restrict__ ybuf,
                           const float* __restrict__ rho_hist, const float* __restrict__ gamma,
-                          float* __restrict__ scr, int n, int m) {
+                          float* __restrict__ scr, int ns, int m) {
     const int e = blockIdx.y, s = a.slot[e], c = a.count[e], h = a.head[e];
     if (t > 2 * c) return;
+    const int n4 = ns / 4;
 
-    const size_t base = (size_t)s * n;
+    const size_t base = (size_t)s * ns;
     const float* gs = g + base;
     float*       d  = dir + base;
     float*       sc = scr + (size_t)s * (2 * m + 3);
-    const float* S0 = sbuf + (size_t)s * m * n;
-    const float* Y0 = ybuf + (size_t)s * m * n;
+    const float* S0 = sbuf + (size_t)s * m * ns;
+    const float* Y0 = ybuf + (size_t)s * m * ns;
     const float* rh = rho_hist + (size_t)s * m;
     auto sigma = [&](int j) { return (h - 1 - j + 2 * m) % m; };
 
     if (t == 0) {
-        const float* sv = (c > 0) ? S0 + (size_t)sigma(0) * n : nullptr;
+        const float* sv = (c > 0) ? S0 + (size_t)sigma(0) * ns : nullptr;
         float l_dot = 0.0f, l_gg = 0.0f, l_max = 0.0f;
-        PLM_GRID_STRIDE(i, n) {
-            const float gi = gs[i];
-            d[i] = -gi;
-            l_gg += gi * gi;
-            l_max = fmaxf(l_max, fabsf(gi));
-            if (c > 0) l_dot -= sv[i] * gi;
+        PLM_GRID_STRIDE(i, n4) {
+            const float4 gi = ld4(gs, i);
+            st4(d, i, make_float4(-gi.x, -gi.y, -gi.z, -gi.w));
+            l_gg += dot4(gi, gi);
+            l_max = fmaxf(l_max, fmaxf(fmaxf(fabsf(gi.x), fabsf(gi.y)),
+                                       fmaxf(fabsf(gi.z), fabsf(gi.w))));
+            if (c > 0) l_dot -= dot4(ld4(sv, i), gi);
         }
         l_dot = block_sum(l_dot);
         l_gg  = block_sum(l_gg);
@@ -440,35 +468,41 @@ __global__ void k_twoloop(SlotArgs a, int t, const float* __restrict__ g, float*
     if (t < c) {
         const int sp = sigma(t - 1);
         const float alpha = rh[sp] * sc[t - 1];
-        const float* yp = Y0 + (size_t)sp * n;
-        const float* sv = S0 + (size_t)sigma(t) * n;
-        PLM_GRID_STRIDE(i, n) {
-            const float qv = d[i] - alpha * yp[i];
-            d[i] = qv;
-            l += sv[i] * qv;
+        const float* yp = Y0 + (size_t)sp * ns;
+        const float* sv = S0 + (size_t)sigma(t) * ns;
+        PLM_GRID_STRIDE(i, n4) {
+            const float4 dv = ld4(d, i), y = ld4(yp, i);
+            const float4 qv = make_float4(dv.x - alpha * y.x, dv.y - alpha * y.y,
+                                          dv.z - alpha * y.z, dv.w - alpha * y.w);
+            st4(d, i, qv);
+            l += dot4(ld4(sv, i), qv);
         }
         out = &sc[t];
     } else if (t == c) {
         const int sp = sigma(c - 1);                 /* newest-last == oldest */
         const float alpha = rh[sp] * sc[c - 1];
         const float gm = gamma[s];
-        const float* yp = Y0 + (size_t)sp * n;
-        PLM_GRID_STRIDE(i, n) {
-            const float rv = gm * (d[i] - alpha * yp[i]);
-            d[i] = rv;
-            l += yp[i] * rv;
+        const float* yp = Y0 + (size_t)sp * ns;
+        PLM_GRID_STRIDE(i, n4) {
+            const float4 dv = ld4(d, i), y = ld4(yp, i);
+            const float4 rv = make_float4(gm * (dv.x - alpha * y.x), gm * (dv.y - alpha * y.y),
+                                          gm * (dv.z - alpha * y.z), gm * (dv.w - alpha * y.w));
+            st4(d, i, rv);
+            l += dot4(y, rv);
         }
         out = &sc[m];
     } else {
         const int j  = t - c;                        /* 1 .. c */
         const int tp = sigma(c - j);                 /* τ_{j-1} */
         const float coef = rh[tp] * sc[c - j] - rh[tp] * sc[m + j - 1];
-        const float* sp = S0 + (size_t)tp * n;
-        const float* dv = (j < c) ? Y0 + (size_t)sigma(c - 1 - j) * n : gs;
-        PLM_GRID_STRIDE(i, n) {
-            const float rv = d[i] + coef * sp[i];
-            d[i] = rv;
-            l += dv[i] * rv;
+        const float* sp = S0 + (size_t)tp * ns;
+        const float* dv = (j < c) ? Y0 + (size_t)sigma(c - 1 - j) * ns : gs;
+        PLM_GRID_STRIDE(i, n4) {
+            const float4 d0 = ld4(d, i), sx = ld4(sp, i);
+            const float4 rv = make_float4(d0.x + coef * sx.x, d0.y + coef * sx.y,
+                                          d0.z + coef * sx.z, d0.w + coef * sx.w);
+            st4(d, i, rv);
+            l += dot4(ld4(dv, i), rv);
         }
         out = (j < c) ? &sc[m + j] : &sc[2 * m + 2];
     }
@@ -835,6 +869,7 @@ struct Solver {
 
     /* geometry */
     int m = kMCorr, S = 0, n = 0, K = 0, M = 0;
+    int ns = 0;                            /* slot stride of the optimizer vectors: n rounded up to 4 */
 
     /* device buffers */
     __half *X = nullptr, *JT = nullptr, *V = nullptr, *J = nullptr;
@@ -850,7 +885,7 @@ struct Solver {
     size_t scratch_floats() const { return (size_t)(3 * S + S * q + 2 * S); }
 
     int vec_blocks(int entries) const {
-        const int want = (n + kThreads * 4 - 1) / (kThreads * 4);
+        const int want = (ns + kThreads * 4 - 1) / (kThreads * 4);
         const int cap  = std::max(1, (num_sm * 8) / std::max(1, entries));
         return std::max(1, std::min(want, cap));
     }
@@ -876,7 +911,7 @@ inline void Solver::evaluate(int n_active) {
 
     PLM_CUDA(cudaMemsetAsync(scratch, 0, scratch_floats() * sizeof(float), stream));
     const int pack_x = std::max(1, std::min((N * q + 31) / 32, (num_sm * 8) / std::max(1, ev.n)));
-    k_pack<<<dim3(pack_x, ev.n), kThreads, 0, stream>>>(ev, xt, JT, h_eval, parts, n, q, K);
+    k_pack<<<dim3(pack_x, ev.n), kThreads, 0, stream>>>(ev, xt, JT, h_eval, parts, n, q, K, ns);
 
     /* GEMM 1 (col-major view): E^T (Me × B) = JT^T (Me × K) · X^T (K × B).
      * Both operands K-major ("TN"). */
@@ -895,21 +930,21 @@ inline void Solver::evaluate(int n_active) {
                             &zero, G, CUDA_R_32F, M, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 
     k_unpack<<<vec_grid(ev), kThreads, 0, stream>>>(
-        ev, G, xt, h_eval, gh, gt, n, q, M, lambdaH, lambdaJ);
+        ev, G, xt, h_eval, gh, gt, n, q, M, lambdaH, lambdaJ, ns);
 }
 
 /* Move an active slot's optimizer state into a free slot so active slots stay
  * contiguous and the GEMMs only span live columns once the queue drains.
  * g_trial is not moved: the next evaluation overwrites it. */
 inline void Solver::move_slot(int src, int dst) {
-    const size_t v = (size_t)n * sizeof(float), h = (size_t)m * v;
+    const size_t v = (size_t)ns * sizeof(float), h = (size_t)m * v;
     float* vecs[] = {x, xt, g, dir};
     for (float* p : vecs)
-        PLM_CUDA(cudaMemcpyAsync(p + (size_t)dst * n, p + (size_t)src * n, v,
+        PLM_CUDA(cudaMemcpyAsync(p + (size_t)dst * ns, p + (size_t)src * ns, v,
                                  cudaMemcpyDeviceToDevice, stream));
-    PLM_CUDA(cudaMemcpyAsync(sbuf + (size_t)dst * m * n, sbuf + (size_t)src * m * n, h,
+    PLM_CUDA(cudaMemcpyAsync(sbuf + (size_t)dst * m * ns, sbuf + (size_t)src * m * ns, h,
                              cudaMemcpyDeviceToDevice, stream));
-    PLM_CUDA(cudaMemcpyAsync(ybuf + (size_t)dst * m * n, ybuf + (size_t)src * m * n, h,
+    PLM_CUDA(cudaMemcpyAsync(ybuf + (size_t)dst * m * ns, ybuf + (size_t)src * m * ns, h,
                              cudaMemcpyDeviceToDevice, stream));
     PLM_CUDA(cudaMemcpyAsync(rho + dst * m, rho + src * m, m * sizeof(float),
                              cudaMemcpyDeviceToDevice, stream));
@@ -940,7 +975,7 @@ inline void Solver::optimize() {
             st[s].fresh = true;
             add(la, s);
         }
-        k_load<<<vec_grid(la), kThreads, 0, stream>>>(la, x, xt, n);
+        k_load<<<vec_grid(la), kThreads, 0, stream>>>(la, x, xt, ns);
     }
 
     std::vector<int> finished;
@@ -990,10 +1025,10 @@ inline void Solver::optimize() {
         }
 
         if (commit.n)
-            k_scale_copy<<<vec_grid(commit), kThreads, 0, stream>>>(commit, g, gt, 1.0f, n);
+            k_scale_copy<<<vec_grid(commit), kThreads, 0, stream>>>(commit, g, gt, 1.0f, ns);
         if (accept.n) {
             k_accept<<<vec_grid(accept), kThreads, 0, stream>>>(
-                accept, x, xt, g, gt, sbuf, ybuf, acc, n, m);
+                accept, x, xt, g, gt, sbuf, ybuf, acc, ns, m);
             k_curvature<<<1, kMaxSlots, 0, stream>>>(accept, acc, rho, gamma, m);
         }
 
@@ -1004,7 +1039,7 @@ inline void Solver::optimize() {
             for (int e = 0; e < need_dir.n; ++e) cmax = std::max(cmax, need_dir.count[e]);
             for (int t = 0; t <= 2 * cmax; ++t)
                 k_twoloop<<<vec_grid(need_dir), kThreads, 0, stream>>>(
-                    need_dir, t, g, dir, sbuf, ybuf, rho, gamma, scr, n, m);
+                    need_dir, t, g, dir, sbuf, ybuf, rho, gamma, scr, ns, m);
             PLM_CUDA(cudaMemcpyAsync(h_scr, scr, (size_t)n_active * sw * sizeof(float),
                                      cudaMemcpyDeviceToHost, stream));
             PLM_CUDA(cudaGetLastError());
@@ -1025,10 +1060,10 @@ inline void Solver::optimize() {
                 add(trial, s);
             }
             if (fallback.n)
-                k_scale_copy<<<vec_grid(fallback), kThreads, 0, stream>>>(fallback, dir, g, -1.0f, n);
+                k_scale_copy<<<vec_grid(fallback), kThreads, 0, stream>>>(fallback, dir, g, -1.0f, ns);
         }
         if (trial.n)
-            k_trial<<<vec_grid(trial), kThreads, 0, stream>>>(trial, xt, x, dir, n);
+            k_trial<<<vec_grid(trial), kThreads, 0, stream>>>(trial, xt, x, dir, ns);
 
         /* ---- 4. Retire finished sites, refill from the queue, compact ---- */
         if (!finished.empty()) {
@@ -1039,7 +1074,7 @@ inline void Solver::optimize() {
                 tally.iterations += st[s].iter;
                 tally.f_sum += st[s].f_cur;
             }
-            k_store<<<vec_grid(done), kThreads, 0, stream>>>(done, x, J, n, q);
+            k_store<<<vec_grid(done), kThreads, 0, stream>>>(done, x, J, n, q, ns);
             for (int s : finished) {
                 st[s] = SlotState();
                 if (next_site < N) {
@@ -1049,7 +1084,7 @@ inline void Solver::optimize() {
                 }
             }
             if (load.n)
-                k_load<<<vec_grid(load), kThreads, 0, stream>>>(load, x, xt, n);
+                k_load<<<vec_grid(load), kThreads, 0, stream>>>(load, x, xt, ns);
 
             int lo = 0, hi = n_active - 1;
             for (;;) {
@@ -1116,11 +1151,18 @@ public:
     // share of the persisting L2 set-aside -- past that the two-loop recursion
     // runs from DRAM and extra sites mostly add traffic -- but never below 8
     // sites, where the GEMMs get narrow.
+    //
+    // Deep alignments are the exception: each round streams the (B, N*q)
+    // one-hot X through both GEMMs once for all S sites, so for B >= kDeepB
+    // the GEMMs gain more from width than the two-loop loses to the L2, and
+    // site_batch is kept. Measured on an H100 (helpy55, site_batch 24): 1.12x
+    // at B = 7.5k up to 1.32x at B = 10-24k; 0.89x at B = 2.4k.
+    static constexpr int kDeepB = 5000;
+
     static int slots(int device, int B, int N, int q, int site_batch, double l2_share) {
-        (void)B;
         int S = std::max(1, std::min({site_batch, N, detail::kMaxSlots}));
         const size_t set_aside = l2_set_aside(device_props(device));
-        if (set_aside > 0) {
+        if (set_aside > 0 && B < kDeepB) {
             const double share = std::min(1.0, std::max(0.0, l2_share));
             const size_t n = (size_t)q + (size_t)N * q * q;
             const int fit = (int)(share * (double)set_aside / (double)(n * sizeof(float)));
@@ -1144,7 +1186,7 @@ public:
              + (size_t)B * K * sizeof(__half)                           // X
              + K * M * (sizeof(__half) + sizeof(float))                 // JT, G
              + (size_t)B * M * (sizeof(__half) + sizeof(float))         // V, E
-             + (size_t)S * n * sizeof(float) * (5 + 2 * m)              // x, xt, g, gt, dir, s, y
+             + (size_t)S * ((n + 3) & ~(size_t)3) * sizeof(float) * (5 + 2 * m)  // x, xt, g, gt, dir, s, y (padded)
              + (size_t)S * (2 * q + 3 * m + 9) * sizeof(float)          // h, rho, gamma, scratch
              + (size_t)N * Nqq * sizeof(__half)                         // J
              + std::min(Nqq * N, kChunk) * sizeof(float)                // couplings_into staging
@@ -1394,6 +1436,7 @@ inline void Session::run_pair(PairArena& arena, const int8_t* MSA, const double*
     sv.lambdaJ = cfg.lambdaJ;
     sv.S = slots(device_, B, N, q, cfg.site_batch, l2_share_);
     sv.n = q + N * q * q;
+    sv.ns = (sv.n + 3) & ~3;
     sv.K = round_up(N * q, 8);
     sv.M = round_up(q * sv.S, 8);
     const size_t Nqq = (size_t)N * q * q;
@@ -1423,7 +1466,7 @@ inline void Session::run_pair(PairArena& arena, const int8_t* MSA, const double*
     sv.W   = dW;
 
     // ---- Solver buffers ----
-    const size_t Sn = (size_t)sv.S * sv.n;
+    const size_t Sn = (size_t)sv.S * sv.ns;
     sv.X      = arena.get<__half>((size_t)B * sv.K);
     sv.JT     = arena.get<__half>((size_t)sv.K * sv.M);
     sv.V      = arena.get<__half>((size_t)B * sv.M);
@@ -1450,6 +1493,11 @@ inline void Session::run_pair(PairArena& arena, const int8_t* MSA, const double*
     // must at least be finite; everything else is written before it is read.
     PLM_CUDA(cudaMemsetAsync(sv.JT, 0, (size_t)sv.K * sv.M * sizeof(__half), stream_));
     PLM_CUDA(cudaMemsetAsync(sv.V, 0, (size_t)B * sv.M * sizeof(__half), stream_));
+    // The float4 kernels also run over each slot's zero pad [n, ns): k_unpack
+    // writes only the first n of g_trial, so the pads of g, g_trial and dir
+    // start at zero and every element-wise op keeps them there.
+    for (float* p : {sv.g, sv.gt, sv.dir})
+        PLM_CUDA(cudaMemsetAsync(p, 0, Sn * sizeof(float), stream_));
     sv.h_scr = static_cast<float*>(hScr_.reserve((size_t)sv.S * sv.scr_width() * sizeof(float)));
 
     set_l2_window(sv.dir, Sn * sizeof(float));
