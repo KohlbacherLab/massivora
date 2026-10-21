@@ -1192,7 +1192,8 @@ public:
         if (set_aside > 0 && B < kDeepB) {
             const double share = std::min(1.0, std::max(0.0, l2_share));
             const size_t n = (size_t)q + (size_t)N * q * q;
-            const int fit = (int)(share * (double)set_aside / (double)(n * sizeof(float)));
+            const size_t ns = (n + 3) & ~(size_t)3;     /* padded slot stride */
+            const int fit = (int)(share * (double)set_aside / (double)(ns * sizeof(float)));
             S = std::min(S, std::max(8, fit));
         }
         return S;
@@ -1298,8 +1299,9 @@ inline bool Session::settle() noexcept {
 // Pin [base, base + bytes) in this Session's share of the persisting L2 set-
 // aside for the kernels on its stream: the search directions, which every
 // two-loop step reads and rewrites while streaming one history vector past
-// them. slots() sized the pair so they fit. Best effort: without set-aside L2
-// the pair just runs unpinned.
+// them. Below kDeepB slots() sized the pair so they fit; a deep pair's
+// directions can exceed the share, and the window then covers only its first
+// part. Best effort: without set-aside L2 the pair just runs unpinned.
 inline void Session::set_l2_window(void* base, size_t bytes) {
     if (props_.max_persist == 0 || props_.max_window == 0 || l2_share_ <= 0.0) return;
     const size_t share = (size_t)(l2_share_ * (double)l2_set_aside(props_));
