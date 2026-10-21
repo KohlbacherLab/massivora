@@ -516,8 +516,8 @@ __global__ void k_twoloop(SlotArgs a, int t, const float* __restrict__ Q0,
          * step is 1 (z.step is 1 once iter > 0, and c > 0 implies iter > 0).
          * A slot that then needs the -g fallback gets k_trial again. */
         const bool fuse = (j == c);
-        const float* xs = PLM_X(e);
-        float* xts = PLM_XT(e);
+        const float* xs = fuse ? PLM_X(e) : nullptr;
+        float* xts = fuse ? PLM_XT(e) : nullptr;
         PLM_GRID_STRIDE(i, n4) {
             const float4 d0 = ld4(d, i), sx = ld4(sp, i);
             const float4 rv = make_float4(d0.x + coef * sx.x, d0.y + coef * sx.y,
@@ -961,10 +961,11 @@ inline void Solver::evaluate(int n_active) {
 
 /* Move an active slot's optimizer state into a free slot so active slots stay
  * contiguous and the GEMMs only span live columns once the queue drains.
- * g_trial is not moved: the next evaluation overwrites it. */
+ * Both banks of x and g move: which array of each pair holds the current
+ * point depends on the slot's bank bit, which moves with st[]. */
 inline void Solver::move_slot(int src, int dst) {
     const size_t v = (size_t)ns * sizeof(float), h = (size_t)m * v;
-    float* vecs[] = {x, xt, g, dir};
+    float* vecs[] = {x, xt, g, gt, dir};
     for (float* p : vecs)
         PLM_CUDA(cudaMemcpyAsync(p + (size_t)dst * ns, p + (size_t)src * ns, v,
                                  cudaMemcpyDeviceToDevice, stream));
