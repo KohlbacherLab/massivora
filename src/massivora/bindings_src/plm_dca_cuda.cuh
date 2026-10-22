@@ -105,9 +105,8 @@ constexpr int kThreads  = 256;
 constexpr int kVgradWarps = 8;
 
 /* L-BFGS constants and defaults: identical to cudaOptimizeSite's L-BFGS path
- * (m_corr, eps_g, eps_f, eps_x) and LBFGS_Unconstrained's line search. */
+ * (m_corr, eps_f, eps_x; eps_g is Config::eps_g) and LBFGS_Unconstrained's line search. */
 constexpr int   kMCorr         = 8;
-constexpr float kEpsG          = 1e-3f;
 constexpr float kEpsF          = 1e-9f;
 constexpr float kEpsX          = 1e-9f;
 constexpr float kArmijoC1      = 1e-4f;
@@ -697,7 +696,8 @@ struct Stats {
 struct Config {
     float lambdaH = 0.01f;
     float lambdaJ = 0.01f;
-    int   maxeval = 100;    // L-BFGS iterations per site
+    int   maxeval = 200;    // L-BFGS iterations per site (couple.maxit)
+    float eps_g = 1e-3f;    // stop on ‖∇f‖∞ ≤ eps_g (couple.eps_g)
     int   site_batch = 24;  // upper bound on sites in lockstep (see Session::slots)
 };
 
@@ -891,6 +891,7 @@ struct Solver {
     const signed char* MSA = nullptr;      /* (B, N) device */
     const float*       W = nullptr;        /* (B,)   device */
     int   B = 0, N = 0, q = 0, maxeval = 0;
+    float eps_g = 0.0f;
     float lambdaH = 0.0f, lambdaJ = 0.0f;
 
     /* geometry */
@@ -1077,7 +1078,7 @@ inline void Solver::optimize() {
                 SlotState& z = st[s];
                 const float* sc = h_scr + (size_t)s * sw;
                 const float gg = sc[2 * m], ginf = sc[2 * m + 1];
-                if (ginf <= kEpsG) { finished.push_back(s); ++tally.converged; continue; }
+                if (ginf <= eps_g) { finished.push_back(s); ++tally.converged; continue; }
                 float gtd = (z.count > 0) ? sc[2 * m + 2] : -gg;
                 const bool fb = !(gtd < 0.0f);
                 if (fb) { add(fallback, s); gtd = -gg; }
@@ -1462,6 +1463,7 @@ inline void Session::run_pair(PairArena& arena, const int8_t* MSA, const double*
     sv.num_sm  = props_.sm;
     sv.B = B; sv.N = N; sv.q = q;
     sv.maxeval = cfg.maxeval;
+    sv.eps_g   = cfg.eps_g;
     sv.lambdaH = cfg.lambdaH;
     sv.lambdaJ = cfg.lambdaJ;
     sv.S = slots(device_, B, N, q, cfg.site_batch, l2_share_);

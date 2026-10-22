@@ -22,11 +22,11 @@ public:
         : sess_(new plm::cuda::Session(device, l2_share)) {}
 
     py::array_t<float> score(MSAArray MSA, WArray W, int q, float lambdaH, float lambdaJ,
-                             int maxeval, int site_batch) {
+                             int maxeval, int site_batch, float eps_g) {
         int B, N;
         shape(MSA, W, &B, &N);
         py::array_t<float> out({(py::ssize_t)N, (py::ssize_t)N});
-        const plm::cuda::Config cfg = config(lambdaH, lambdaJ, maxeval, site_batch);
+        const plm::cuda::Config cfg = config(lambdaH, lambdaJ, maxeval, site_batch, eps_g);
         const int8_t* zp = MSA.data();
         const double* wp = W.data();
         float* op = out.mutable_data();
@@ -40,11 +40,11 @@ public:
     }
 
     py::array_t<float> couplings(MSAArray MSA, WArray W, int q, float lambdaH, float lambdaJ,
-                                 int maxeval, int site_batch) {
+                                 int maxeval, int site_batch, float eps_g) {
         int B, N;
         shape(MSA, W, &B, &N);
         py::array_t<float> out({(py::ssize_t)N, (py::ssize_t)N * q * q});
-        const plm::cuda::Config cfg = config(lambdaH, lambdaJ, maxeval, site_batch);
+        const plm::cuda::Config cfg = config(lambdaH, lambdaJ, maxeval, site_batch, eps_g);
         const int8_t* zp = MSA.data();
         const double* wp = W.data();
         float* op = out.mutable_data();
@@ -114,12 +114,13 @@ private:
         if ((int)W.shape(0) != *B)
             throw std::invalid_argument("W length must match MSA's first axis");
     }
-    static plm::cuda::Config config(float lambdaH, float lambdaJ, int maxeval, int site_batch) {
+    static plm::cuda::Config config(float lambdaH, float lambdaJ, int maxeval, int site_batch, float eps_g) {
         plm::cuda::Config cfg;
         cfg.lambdaH = lambdaH;
         cfg.lambdaJ = lambdaJ;
         cfg.maxeval = maxeval;
         cfg.site_batch = site_batch;
+        cfg.eps_g = eps_g;
         return cfg;
     }
 
@@ -168,7 +169,7 @@ PYBIND11_MODULE(plm_cuda, m) {
         .def(py::init<int, double>(), py::arg("device") = 0, py::arg("l2_share") = 1.0)
         .def("score", &PySession::score, py::arg("MSA"), py::arg("W"), py::arg("q"),
              py::arg("lambdaH") = 0.01f, py::arg("lambdaJ") = 0.01f,
-             py::arg("maxeval") = 100, py::arg("site_batch") = 24,
+             py::arg("maxeval") = 200, py::arg("site_batch") = 24, py::arg("eps_g") = 1e-3f,
              "(B, N) int8 alignment (states 0 .. q-1) and (B,) weights divided by\n"
              "Beff -> (N, N) float32 score: compute_score of the Ising-gauged\n"
              "couplings, computed on the device. Takes at most\n"
@@ -177,7 +178,7 @@ PYBIND11_MODULE(plm_cuda, m) {
              "DeviceLostError when the CUDA context is gone for the process.")
         .def("couplings", &PySession::couplings, py::arg("MSA"), py::arg("W"), py::arg("q"),
              py::arg("lambdaH") = 0.01f, py::arg("lambdaJ") = 0.01f,
-             py::arg("maxeval") = 100, py::arg("site_batch") = 24,
+             py::arg("maxeval") = 200, py::arg("site_batch") = 24, py::arg("eps_g") = 1e-3f,
              "The raw (N, N*q*q) float32 couplings instead, as plm_opt_site --use-gpu\n"
              "publishes them; for reference comparisons.")
         .def("score_couplings", &PySession::score_couplings, py::arg("J"), py::arg("q"),

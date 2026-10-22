@@ -1880,6 +1880,9 @@ class PLMCouplingExecutorGPU(SessionGPUExecutor, BuiltinPLMCalibrator):
             (config.get('align') or {}).get('col_gap_threshold', 0.5))
         # Upper bound on the sites a pair optimises in lockstep (plm_cuda.slots).
         self.site_batch = int(coupling_cfg.get('site_batch', 24))
+        # The GPU stops a site on ‖∇f‖∞ ≤ eps_g. eps_conv is NLopt's f/x
+        # tolerance on the CPU path, a different rule, so it is not reused.
+        self.eps_g = float(coupling_cfg.get('eps_g', 1e-3))
         # One Session per GPU, whatever couple.gpu_sessions (GaussDCA's) says:
         # one pair already saturates the GPU, so more Sessions only split its
         # L2 and bandwidth between them. Measured on an H100 over a
@@ -1916,8 +1919,10 @@ class PLMCouplingExecutorGPU(SessionGPUExecutor, BuiltinPLMCalibrator):
         columns = params.get('columns')
         if columns is not None:
             MSA = np.ascontiguousarray(MSA[:, columns])
-        return sess.score(MSA, W, params['q'], lambdaH=self.lambda_h, lambdaJ=self.lambda_J,
-                          maxeval=self.maxit, site_batch=params['site_batch'])
+        score = sess.score(MSA, W, params['q'], lambdaH=self.lambda_h, lambdaJ=self.lambda_J,
+                           maxeval=self.maxit, site_batch=params['site_batch'], eps_g=self.eps_g)
+        params['stats'] = getattr(sess, 'last_stats', None)     # logged by collect_score
+        return score
 
     @staticmethod
     def _kept_columns(align):
@@ -1973,6 +1978,11 @@ class PLMCouplingExecutorGPU(SessionGPUExecutor, BuiltinPLMCalibrator):
         return MSA, W, params
 
     def collect_score(self, score, params):
+        stats = params.get('stats')
+        if stats:
+            logging.debug(f"plmDCA GPU pair {params['pair_id']}: {stats['converged']} converged, "
+                          f"{stats['stalled']} stalled, {stats['max_iter']} max_iter, "
+                          f"{stats['ls_failed']} ls_failed")
         self._keep_gpu_weights(params)
         score = np.asarray(score).astype(np.float16)
         if self.fast_approximation:

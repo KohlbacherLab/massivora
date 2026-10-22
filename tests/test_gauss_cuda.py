@@ -291,3 +291,24 @@ def test_neighbour_counts_fit_in_the_pair_reservation(session):
     for B, N in ((60000, 300), (3000, 2600), (5, 2)):
         session.neighbour_counts(np.zeros((N, B), dtype=np.int8), 0.8 * N)
         assert 0 < session.last_pair_bytes <= GC.pair_bytes(N, B)
+
+
+@needs_cuda
+def test_pair_bytes_fit_the_largest_pairs():
+    """N = 4180 (the widest screen pair) fits 0.9 x 80 GB: about 10 bytes per
+    padded NQ^2 element, down from 14 when the merge scratch was np^2 floats
+    and the fp16 copy of R a buffer of its own."""
+    np_ = 4180 * 20
+    assert GC.pair_bytes(4180, 5000) < 72e9
+    assert GC.pair_bytes(4180, 5000) < 10.1 * np_ * np_
+
+
+@needs_cuda
+@pytest.mark.skipif(not os.environ.get("MASSIVORA_BIG_GPU_TEST"),
+                    reason="needs ~70 GB of free device memory; set MASSIVORA_BIG_GPU_TEST=1")
+def test_largest_pair_runs(session):
+    N, B = 4000, 2000
+    A = _family(B, N, seed=4000)
+    score = session.score(np.ascontiguousarray(A.T), np.ones(B))
+    assert score.shape == (N, N) and np.isfinite(score).all()
+    assert 0 < session.last_pair_bytes <= GC.pair_bytes(N, B)
