@@ -592,7 +592,9 @@ def create_job_db(cfg: dict):
 
 
 
-# ORDER BY clauses `couple.cascade.rank_by` may choose from
+# ORDER BY clauses `couple.cascade.rank_by` may choose from.
+# The 0.30 default keeps ~97 % of plmDCA's top-5 % calls on the he2021 benchmark
+# and H. pylori, at ~4.5x less screen compute; 0.16 keeps only ~90 % (8.3x).
 CASCADE_RANKS = {
     'log_lr_raw': 'log_lr_raw DESC',
     'high_precision_hit': 'high_precision_hit DESC, log_lr_raw DESC',
@@ -616,7 +618,7 @@ def apply_cascade(cfg: dict):
         Configuration dict. `couple.cascade` keys: `source_db` (SQLite file of
         the GaussDCA run, relative to project_path; default this project's DB),
         `source_table` (default `couple.db_table`), `keep_fraction` (default
-        0.16) and `rank_by` (a key of `CASCADE_RANKS`, default `log_lr_raw`)
+        0.30) and `rank_by` (a key of `CASCADE_RANKS`, default `log_lr_raw`)
 
     Returns
     -------
@@ -626,7 +628,7 @@ def apply_cascade(cfg: dict):
     cascade = (cfg.get('couple') or {}).get('cascade')
     if not cascade:
         return None
-    fraction = float(cascade.get('keep_fraction', 0.16))
+    fraction = float(cascade.get('keep_fraction', 0.30))
     if not 0.0 < fraction <= 1.0:
         raise ValueError(f"couple.cascade.keep_fraction must be in (0, 1], got {fraction}")
     rank_by = cascade.get('rank_by', 'log_lr_raw')
