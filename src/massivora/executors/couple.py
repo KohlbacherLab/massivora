@@ -21,7 +21,9 @@ from dask.distributed import (Client, Nanny, Scheduler, SpecCluster,
                               TimeoutError, WorkerPlugin, wait)
 
 from massivora import cpp_bindings
-from massivora.alignment import BinaryAlignment
+from massivora.alignment import (BinaryAlignment, SharedSourceError,
+                                 check_shared_source_strategy,
+                                 resolve_shared_source)
 from massivora.config import load_project_and_system_config
 from massivora.db import (STATUS, compute_file_hash, connect_db_rw,
                           ensure_columns, get_db_path, get_hashed_file_path,
@@ -64,6 +66,9 @@ class BaseCouplingExecutor(object):
         self.downsample_to = int(down_cfg.get('to', 30000))
         self.reweighting_threshold = float(
             config.get('concatenate').get('reweighting_threshold', 0.8))
+        # What concatenate() does with a pair that glues a sequence to itself
+        self.shared_source_strategy = check_shared_source_strategy(
+            config.get('concatenate').get('shared-source_strategy', 'skip'))
 
         coupling_cfg = config.get('couple')
         tables = get_table_names(config)
@@ -127,6 +132,16 @@ class BaseCouplingExecutor(object):
 
     def concatenate(self, pair, alignment_dir, downsample=False,
                     downsample_to=None):
+        """
+        Concatenate a pair's monomer alignments on the fly.
+
+        Raises
+        ------
+        `SharedSourceError`
+            If the pair is shared-source and concatenate.shared-source_strategy
+            is 'skip' (or 'fix' left no species); the coordinator marks the
+            pair FAILED instead of retrying it
+        """
         pair_name = pair.get('name')
         pid1 = pair.get('pid1')
         pid2 = pair.get('pid2')
@@ -135,6 +150,7 @@ class BaseCouplingExecutor(object):
         align1 = BinaryAlignment(os.path.join(alignment_dir, pid1))
         align2 = BinaryAlignment(os.path.join(alignment_dir, pid2))
         concatenated = align1 + align2
+        resolve_shared_source(concatenated, self.shared_source_strategy, pair_name)
         if downsample:
             concatenated.Downsample_Randomly(to=downsample_to)
         concatenated.Mask_Gap_Columns(self._config.get('align').get('col_gap_threshold', 0.5))
@@ -209,8 +225,14 @@ class BaseCouplingExecutor(object):
             self.db_conn.rollback()
             raise
 
-    def _db_apply_results(self, done_updates, fail_updates):
-        if not done_updates and not fail_updates:
+    def _db_apply_results(self, done_updates, fail_updates, skipped=()):
+        """
+        Commit finished pairs, count an attempt for failed ones (they are
+        claimed again until their attempts run out and they end FAILED), and
+        mark `skipped` ones FAILED at once: those are shared-source pairs,
+        which another attempt would not change.
+        """
+        if not done_updates and not fail_updates and not skipped:
             return 0
 
         cursor = self.db_conn.cursor()
@@ -273,6 +295,19 @@ class BaseCouplingExecutor(object):
                     [(STATUS['FAILED'], i) for i in fail_updates],
                 )
                 n += len(fail_updates)
+
+            if skipped:
+                cursor.executemany(
+                    f"""
+                    UPDATE {table}
+                    SET status = ?,
+                        claimed_at = NULL,
+                        job_id = NULL
+                    WHERE id = ?
+                    """,
+                    [(STATUS['FAILED'], i) for i in skipped],
+                )
+                n += len(skipped)
 
             self.db_conn.commit()
             return n
@@ -649,25 +684,27 @@ class BaseCouplingExecutor(object):
 
         done_updates = []
         fail_ids = []
+        skipped_ids = []    # shared-source pairs, marked FAILED without a retry
 
         last_commit = float(time.time())
         terminating = False
 
         def flush(force=False):
-            nonlocal done_updates, fail_ids, last_commit
-            if not done_updates and not fail_ids:
+            nonlocal done_updates, fail_ids, skipped_ids, last_commit
+            if not done_updates and not fail_ids and not skipped_ids:
                 return 0
 
             if not force:
-                if (len(done_updates) + len(fail_ids)) < int(commit_every_tasks) and (time.time() - last_commit) < float(commit_every_seconds):
+                if (len(done_updates) + len(fail_ids) + len(skipped_ids)) < int(commit_every_tasks) and (time.time() - last_commit) < float(commit_every_seconds):
                     return 0
 
             self._flush_scores()
-            n = self._db_apply_results(done_updates, fail_ids)
+            n = self._db_apply_results(done_updates, fail_ids, skipped_ids)
             self._checkpoint_wal()
             self._check_shared_memory(inflight)
             done_updates = []
             fail_ids = []
+            skipped_ids = []
             last_commit = float(time.time())
             return n
 
@@ -747,6 +784,9 @@ class BaseCouplingExecutor(object):
                         continue
                     try:
                         res = self._store_score(future.result())
+                    except SharedSourceError as e:
+                        logging.warning(f"Task {task_id}: {e}; marking it FAILED")
+                        skipped_ids.append(task_id)
                     except Exception:
                         logging.exception(f"Task {task_id} failed")
                         fail_ids.append(task_id)
@@ -1646,7 +1686,8 @@ class SessionGPUExecutor(BaseCouplingExecutor):
             collect = self.collect_score
 
         work = queue.Queue(maxsize=self.gpu_workers * 2)
-        done_updates, fail_updates, released = [], [], []
+        # skipped: shared-source pairs, marked FAILED without a retry
+        done_updates, fail_updates, released, skipped = [], [], [], []
         lock = threading.Lock()
         # An illegal address and its like corrupt the context every session in
         # this process shares; from then on every pair would fail and spend its
@@ -1732,6 +1773,10 @@ class SessionGPUExecutor(BaseCouplingExecutor):
                     with lock:
                         done_updates.append(self._store_score(row))
                     clock.add(**spent)
+                except SharedSourceError as e:
+                    logging.warning("Pair %s: %s; marking it FAILED", pair['id'], e)
+                    with lock:
+                        skipped.append(pair['id'])
                 except Exception:
                     logging.exception("Pair %s failed", (pair or {}).get('id'))
                     with lock:
@@ -1746,14 +1791,14 @@ class SessionGPUExecutor(BaseCouplingExecutor):
 
         def flush(force=False):
             with lock:
-                if not force and len(done_updates) + len(fail_updates) < 64:
+                if not force and len(done_updates) + len(fail_updates) + len(skipped) < 64:
                     return
                 # Scores behind these rows must be on disk before the rows are committed.
                 self._flush_scores()
-                d, f, r = list(done_updates), list(fail_updates), list(released)
-                done_updates.clear(); fail_updates.clear(); released.clear()
-            if d or f:
-                self._db_apply_results(d, f)
+                d, f, r, s = list(done_updates), list(fail_updates), list(released), list(skipped)
+                done_updates.clear(); fail_updates.clear(); released.clear(); skipped.clear()
+            if d or f or s:
+                self._db_apply_results(d, f, s)
             if r:
                 self._db_unclaim(r)
 
