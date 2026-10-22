@@ -19,6 +19,159 @@ from massivora.utils import (get_cuda_module, gpu_is_available,
 
 logger = logging.getLogger(__name__)
 
+# What the concatenation stages do with a shared-source pair
+SHARED_SOURCE_STRATEGIES = ('skip', 'fix')
+# Residue codes are 0..21 once lower case is folded onto upper case
+_RESIDUE_BITS = 5
+
+
+class SharedSourceError(RuntimeError):
+    """
+    A concatenated pair whose rows pair a sequence with itself, left unrun
+    because the shared-source strategy is 'skip' (or because 'fix' left no
+    species to run on).
+    """
+
+
+def check_shared_source_strategy(strategy):
+    """
+    Validate a `concatenate.shared-source_strategy` value.
+
+    Parameters
+    ----------
+    `strategy` — str
+        'skip' or 'fix', in any case
+
+    Returns
+    -------
+    `str`
+        The strategy in lower case
+
+    Raises
+    ------
+    `ValueError`
+        If the strategy is not one of `SHARED_SOURCE_STRATEGIES`
+    """
+    value = str(strategy).strip().lower()
+    if value not in SHARED_SOURCE_STRATEGIES:
+        raise ValueError(f"concatenate.shared-source_strategy must be one of "
+                         f"{', '.join(SHARED_SOURCE_STRATEGIES)}, got {strategy!r}")
+    return value
+
+
+def _residue_runs(block, k, row_bits):
+    """
+    Every run of `k` consecutive residues of each row of `block`, packed into
+    one integer per run with the row index in the low `row_bits` bits.
+
+    Gaps are dropped before the runs are taken, so a gap does not break a run,
+    and lower-case residues count as their upper-case letter.
+    """
+    codes = np.abs(block.astype(np.int64))
+    n_rows, n_cols = codes.shape
+    if n_cols < k:
+        return np.empty(0, dtype=np.int64)
+    # Move each row's residues to the front, keeping their order
+    order = np.argsort(codes == 0, axis=1, kind='stable')
+    codes = np.take_along_axis(codes, order, axis=1)
+    n_residues = np.count_nonzero(codes, axis=1)
+
+    n_runs = n_cols - k + 1
+    runs = np.zeros((n_rows, n_runs), dtype=np.int64)
+    for i in range(k):
+        runs = (runs << _RESIDUE_BITS) | codes[:, i:i + n_runs]
+    valid = np.arange(n_runs)[None, :] <= (n_residues - k)[:, None]
+    rows = np.broadcast_to(np.arange(n_rows, dtype=np.int64)[:, None], runs.shape)
+    return (runs[valid] << row_bits) | rows[valid]
+
+
+def _shared_source_rows(part_a, part_b, k=10):
+    """
+    Which rows of two column blocks share an exact run of `k` residues.
+
+    Two different proteins essentially never share such a run, so a row that
+    does pairs one source sequence with itself: the homologue searches of both
+    proteins recruited the same sequence in that species.
+
+    Parameters
+    ----------
+    `part_a`, `part_b` — numpy.ndarray
+        Encoded columns of the first and of the second protein, one row per
+        sequence
+    `k` — int (optional)
+        Length of the residue run, at most 12 (default: `10`)
+
+    Returns
+    -------
+    `numpy.ndarray`
+        One boolean per row
+    """
+    k = int(k)
+    if not 1 <= k <= 12:
+        raise ValueError(f"k must be between 1 and 12, got {k}")
+    n_rows = part_a.shape[0]
+    shared = np.zeros(n_rows, dtype=bool)
+    # A run takes 5 bits per residue; the row index takes the bits above it,
+    # which bounds how many rows one chunk can test at once.
+    row_bits = min(10, 62 - _RESIDUE_BITS * k)
+    chunk = 1 << row_bits
+    mask = chunk - 1
+    for start in range(0, n_rows, chunk):
+        stop = min(start + chunk, n_rows)
+        runs_a = np.unique(_residue_runs(part_a[start:stop], k, row_bits))
+        runs_b = np.unique(_residue_runs(part_b[start:stop], k, row_bits))
+        common = np.intersect1d(runs_a, runs_b, assume_unique=True)
+        shared[start + (common & mask)] = True
+    return shared
+
+
+def resolve_shared_source(alignment, strategy='skip', name=None, k=10, threshold=0.05):
+    """
+    Apply a shared-source strategy to a freshly concatenated pair.
+
+    Parameters
+    ----------
+    `alignment` — TextAlignment or BinaryAlignment
+        Alignment concatenated from two proteins; changed in place under 'fix'
+    `strategy` — str (optional)
+        'skip' or 'fix' (default: `'skip'`)
+    `name` — str (optional)
+        Pair name for the log and the error message (default: `None`)
+    `k` — int (optional)
+        Length of the residue run that marks a shared source (default: `10`)
+    `threshold` — float (optional)
+        Share of species above which the pair counts as shared-source (default: `0.05`)
+
+    Returns
+    -------
+    TextAlignment or BinaryAlignment
+        The alignment, with its shared-source species removed under 'fix'
+
+    Raises
+    ------
+    `SharedSourceError`
+        Under 'skip', for a shared-source pair; under 'fix', when removing the
+        shared-source species leaves only the query
+    """
+    strategy = check_shared_source_strategy(strategy)
+    if not alignment.Is_Shared_Source(k=k, threshold=threshold):
+        return alignment
+    label = f"Pair '{name}'" if name else "Pair"
+    share = alignment.shared_source_share
+    if strategy == 'skip':
+        raise SharedSourceError(
+            f"{label} is a shared-source concatenation: {share:.1%} of its species pair "
+            f"one sequence with itself (concatenate.shared-source_strategy: skip)")
+    removed = alignment.Remove_Shared_Source(k=k)
+    if alignment.matrix.shape[0] <= 1:
+        raise SharedSourceError(
+            f"{label} is a shared-source concatenation and no species is left after "
+            f"removing the {removed} that pair one sequence with itself")
+    logger.info(f"{label}: removed {removed} shared-source species ({share:.1%}); "
+                f"{alignment.matrix.shape[0]} sequences left")
+    return alignment
+
+
 class TextAlignment(MultipleSeqAlignment):
     def __init__(self, records):
         # Allowing contruction from file path
@@ -82,6 +235,10 @@ class TextAlignment(MultipleSeqAlignment):
         self.sequenceCount = len(self._records)
         self.matrix = self.Get_Numpy_Array()
         self.encoded_matrix = self.Get_Numpy_Array(mapped=True)
+        # Width of each protein in the alignment. A concatenation sets its two
+        # widths itself; a single protein follows its own width.
+        if len(getattr(self, 'lengthes', None) or []) <= 1:
+            self.lengthes = [self.sequenceLength]
 
     @classmethod
     def From_SwissProt(cls, protein_id):
@@ -435,7 +592,90 @@ class TextAlignment(MultipleSeqAlignment):
             new_rec = SeqRecord(most_similar_seq_in_self.seq + most_similar_seq_in_other.seq, id=str(species), name=str(species), description=most_similar_seq_in_self.id+'_'+most_similar_seq_in_other.id)
             merged.append(new_rec)
         logger.info(f'Alignment merged: {len(merged)} sequences, {len(merged[0])} positions')
-        return TextAlignment(merged)
+        concatenated = TextAlignment(merged)
+        concatenated.lengthes = [len(self[0].seq), len(other[0].seq)]
+        return concatenated
+
+    def _pair_blocks(self):
+        """
+        The columns of each protein of an alignment concatenated from two.
+
+        Raises
+        ------
+        `ValueError`
+            If this alignment is not concatenated from exactly two proteins
+        """
+        lengthes = [int(length) for length in (getattr(self, 'lengthes', None) or [])]
+        if len(lengthes) != 2 or sum(lengthes) != self.sequenceLength:
+            raise ValueError(
+                "Shared-source checks need an alignment concatenated from two proteins; "
+                f"this one holds {len(lengthes)} protein(s) of widths {lengthes} "
+                f"over {self.sequenceLength} columns")
+        return self.encoded_matrix[:, :lengthes[0]], self.encoded_matrix[:, lengthes[0]:]
+
+    def Is_Shared_Source(self, k=10, threshold=0.05):
+        """
+        Whether this concatenated pair pairs one sequence with itself.
+
+        When the homologue searches of both proteins recruit the same sequence
+        in a species, concatenation glues that sequence to itself and its
+        matching columns covary perfectly. A species counts as shared-source
+        when its two halves share an exact run of `k` residues (gaps removed),
+        which two different proteins essentially never do. The share of such
+        species, the query excluded, is kept in `shared_source_share`.
+
+        Parameters
+        ----------
+        `k` — int (optional)
+            Length of the residue run, at most 12 (default: `10`)
+        `threshold` — float (optional)
+            Share of species from which the pair counts as shared-source (default: `0.05`)
+
+        Returns
+        -------
+        `bool`
+            True if at least `threshold` of the species are shared-source
+
+        Raises
+        ------
+        `ValueError`
+            If this alignment is not concatenated from exactly two proteins
+        """
+        part_a, part_b = self._pair_blocks()
+        shared = _shared_source_rows(part_a[1:], part_b[1:], k)
+        self.shared_source_share = float(shared.mean()) if shared.size else 0.0
+        return self.shared_source_share >= threshold
+
+    def Remove_Shared_Source(self, k=10):
+        """
+        Remove every species whose two halves share an exact run of `k`
+        residues, i.e. that pairs one sequence with itself. The query is kept.
+
+        Parameters
+        ----------
+        `k` — int (optional)
+            Length of the residue run, at most 12 (default: `10`)
+
+        Returns
+        -------
+        `int`
+            Number of sequences removed
+
+        Raises
+        ------
+        `ValueError`
+            If this alignment is not concatenated from exactly two proteins
+        """
+        part_a, part_b = self._pair_blocks()
+        drop = np.flatnonzero(_shared_source_rows(part_a[1:], part_b[1:], k)) + 1
+        for i in sorted(drop, reverse=True):
+            del self._records[i]
+            if hasattr(self, "_desc_list"):
+                del self._desc_list[i]
+        if len(drop):
+            self._update_info()
+        logger.debug(f"Removed {len(drop)} shared-source sequences; {len(self)} left")
+        return int(len(drop))
 
     def Downsample_Randomly(self, to):
         """
@@ -604,6 +844,128 @@ class BinaryAlignment(object):
         new_instance.matrix = np.concatenate((self.matrix[indices1], other.matrix[indices2]), axis=1)
 
         return new_instance
+
+    def _pair_blocks(self):
+        """
+        The columns of each protein of an alignment concatenated from two,
+        before or after `Drop_Masked_Gap_Columns`.
+
+        Raises
+        ------
+        `ValueError`
+            If this alignment is not concatenated from exactly two proteins
+        """
+        lengthes = [int(length) for length in (self.lengthes or [])]
+        n_cols = self.matrix.shape[1]
+        if len(lengthes) != 2:
+            raise ValueError(
+                "Shared-source checks need an alignment concatenated from two proteins; "
+                f"this one holds {len(lengthes)} protein(s) of widths {lengthes}")
+        if n_cols == sum(lengthes):
+            split = lengthes[0]
+        else:
+            saved = self.saved_columns or []
+            if len(saved) == 2 and n_cols == len(saved[0]) + len(saved[1]):
+                split = len(saved[0])   # the masked gap columns are already dropped
+            else:
+                raise ValueError(
+                    f"The alignment's {n_cols} columns match neither its protein widths "
+                    f"{lengthes} nor its saved columns")
+        return self.matrix[:, :split], self.matrix[:, split:]
+
+    def _row_species(self):
+        """The species of every row, from species_list and species_index_map."""
+        species_list = list(getattr(self, 'species_list', None) or [])
+        starts = [int(i) for i in (getattr(self, 'species_index_map', None) or [])]
+        n_rows = self.matrix.shape[0]
+        if not species_list or len(starts) != len(species_list):
+            raise ValueError("species_list and species_index_map do not describe the rows")
+        rows = []
+        for species, start, stop in zip(species_list, starts, starts[1:] + [n_rows]):
+            rows += [species] * (stop - start)
+        if len(rows) != n_rows:
+            raise ValueError("species_list and species_index_map do not describe the rows")
+        return rows
+
+    def Is_Shared_Source(self, k=10, threshold=0.05):
+        """
+        Whether this concatenated pair pairs one sequence with itself.
+
+        When the homologue searches of both proteins recruit the same sequence
+        in a species, concatenation glues that sequence to itself and its
+        matching columns covary perfectly. A species counts as shared-source
+        when its two halves share an exact run of `k` residues (gaps removed),
+        which two different proteins essentially never do. The share of such
+        species, the query excluded, is kept in `shared_source_share`.
+
+        Parameters
+        ----------
+        `k` — int (optional)
+            Length of the residue run, at most 12 (default: `10`)
+        `threshold` — float (optional)
+            Share of species from which the pair counts as shared-source (default: `0.05`)
+
+        Returns
+        -------
+        `bool`
+            True if at least `threshold` of the species are shared-source
+
+        Raises
+        ------
+        `ValueError`
+            If this alignment is not concatenated from exactly two proteins
+        """
+        part_a, part_b = self._pair_blocks()
+        shared = _shared_source_rows(part_a[1:], part_b[1:], k)
+        self.shared_source_share = float(shared.mean()) if shared.size else 0.0
+        return self.shared_source_share >= threshold
+
+    def Remove_Shared_Source(self, k=10):
+        """
+        Remove every species whose two halves share an exact run of `k`
+        residues, i.e. that pairs one sequence with itself. The query is kept.
+
+        Sequence weights computed before the removal no longer apply and are
+        cleared; call `Reweight_Sequence` again when needed.
+
+        Parameters
+        ----------
+        `k` — int (optional)
+            Length of the residue run, at most 12 (default: `10`)
+
+        Returns
+        -------
+        `int`
+            Number of sequences removed
+
+        Raises
+        ------
+        `ValueError`
+            If this alignment is not concatenated from exactly two proteins
+        """
+        part_a, part_b = self._pair_blocks()
+        shared = _shared_source_rows(part_a[1:], part_b[1:], k)
+        n_removed = int(shared.sum())
+        if not n_removed:
+            return 0
+        keep = np.concatenate(([True], ~shared))
+
+        if getattr(self, 'species_list', None):
+            kept_species = [s for s, kept in zip(self._row_species(), keep) if kept]
+            species_list, species_index_map = [], []
+            for row, species in enumerate(kept_species):
+                if row == 0 or species != kept_species[row - 1]:
+                    species_list.append(species)
+                    species_index_map.append(row)
+            self.species_list = species_list
+            self.species_index_map = species_index_map
+            self.species_list_map = {species: i for i, species in enumerate(species_list)}
+
+        self.matrix = np.ascontiguousarray(self.matrix[keep])
+        if getattr(self, 'weights', None) is not None:
+            self.weights, self.Beff = None, None
+        logger.debug(f"Removed {n_removed} shared-source sequences; {self.matrix.shape[0]} left")
+        return n_removed
 
     def Mask_Gap_Columns(self, gap_ratio=0.5):
         """
@@ -814,6 +1176,7 @@ class BinaryAlignment(object):
         char_matrix = np.frombuffer(ascii_codes.tobytes(), dtype='S1').reshape(self.matrix.shape)
         if restore_gaps:
             monomer_matrices = []
+            monomer_widths = []
             cursor = 0
             for monomer_idx, monomer_saved_cols in enumerate(self.saved_columns):
                 n = len(monomer_saved_cols)
@@ -831,10 +1194,19 @@ class BinaryAlignment(object):
                 if monomer_saved_cols:
                     monomer_original_matrix[:, monomer_saved_cols] = monomer_char_matrix
                 monomer_matrices.append(monomer_original_matrix)
+                monomer_widths.append(monomer_original_length)
 
             original_matrix = np.concatenate(monomer_matrices, axis=1)
         else:
             original_matrix = char_matrix.copy()
+            n_cols = char_matrix.shape[1]
+            saved = self.saved_columns or []
+            if self.lengthes and sum(int(x) for x in self.lengthes) == n_cols:
+                monomer_widths = [int(x) for x in self.lengthes]
+            elif saved and sum(len(c) for c in saved) == n_cols:
+                monomer_widths = [len(c) for c in saved]
+            else:
+                monomer_widths = [n_cols]
         original_matrix = original_matrix.astype('U1')
 
         # Convert matrix back to SeqRecord objects
@@ -868,7 +1240,10 @@ class BinaryAlignment(object):
         if filename:
             SeqIO.write(seq_records, filename, "fasta")
 
-        return TextAlignment(seq_records)
+        text = TextAlignment(seq_records)
+        if len(monomer_widths) > 1:
+            text.lengthes = monomer_widths
+        return text
 
     def To_Zarr(self, filename=None, overwrite=False):
         if not filename: filename = 'merged_alignment'

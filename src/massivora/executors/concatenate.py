@@ -9,9 +9,11 @@ import time
 import numpy as np
 import psutil
 
-from massivora.alignment import BinaryAlignment
+from massivora.alignment import (BinaryAlignment, SharedSourceError,
+                                 check_shared_source_strategy,
+                                 resolve_shared_source)
 from massivora.config import load_project_and_system_config
-from massivora.db import (compute_file_hash, connect_db_rw,
+from massivora.db import (STATUS, compute_file_hash, connect_db_rw,
                           get_hashed_file_path, get_table_names,
                           quote_identifier)
 from massivora.utils import (gpu_is_available, setup_logging,
@@ -72,7 +74,8 @@ def _claim_batch(cfg, job_id, batch_size, table_name='couplings'):
 
 def _run_concatenate(task, monomers_path, output_dir, downsample=False,
                      downsample_to=30000, reweight=True, reweighting_threshold=0.8,
-                     col_gap_threshold=0.5, n_threads=0, gpu_reweight=None):
+                     col_gap_threshold=0.5, n_threads=0, gpu_reweight=None,
+                     shared_source_strategy='skip'):
     """
     Concatenate one pair of monomer alignments and write it to the output tree.
 
@@ -80,13 +83,18 @@ def _run_concatenate(task, monomers_path, output_dir, downsample=False,
     `gpu_reweight` is given: that callable hands the matrix to the GPU pool and
     returns the weights, leaving everything else here on the CPU.
 
+    A shared-source pair, one whose concatenation glues a sequence to itself,
+    is handled by `shared_source_strategy`: 'skip' leaves it unwritten and
+    marks it FAILED, 'fix' removes the offending species and goes on.
+
     Returns
     -------
     `dict` or `None`
         The record to write back to the database, or `None` if the pair could
         not be concatenated. A failed pair keeps the 0 written into `number`
         when it was claimed, so it is neither retried nor taken for a finished
-        one.
+        one. A skipped shared-source pair returns only its name and
+        `status: FAILED`, so the coupling stage does not claim it either.
     """
     name = task['name']
     pid1 = task['pid1']
@@ -102,6 +110,12 @@ def _run_concatenate(task, monomers_path, output_dir, downsample=False,
     try:
         concatenated_align = align1 + align2
         del align1, align2
+
+        try:
+            resolve_shared_source(concatenated_align, shared_source_strategy, name)
+        except SharedSourceError as e:
+            logging.warning(f"{e}; marking it FAILED")
+            return {'name': name, 'status': STATUS['FAILED']}
 
         if downsample:
             concatenated_align.Downsample_Randomly(to=downsample_to)
@@ -151,31 +165,41 @@ def _db_apply_results(cfg, done_updates, table_name='couplings'):
     if not done_updates:
         return 0
 
+    # Skipped shared-source pairs carry only their name and the FAILED status
+    failed = [x for x in done_updates if x.get('status') == STATUS['FAILED']]
+    written = [x for x in done_updates if x.get('status') != STATUS['FAILED']]
+
     conn = connect_db_rw(cfg)
     cur = conn.cursor()
     table = quote_identifier(table_name)
 
     try:
-        cur.executemany(
-            f"""
-            UPDATE {table}
-            SET effnumber = ?,
-                number = ?,
-                length = ?,
-                file_hash = ?
-            WHERE name = ?
-            """,
-            [
-                (
-                    int(round(float(x.get('effnumber') or 0))),
-                    int(x.get('number')),
-                    int(x.get('length')),
-                    x.get('file_hash'),
-                    x.get('name'),
-                )
-                for x in done_updates
-            ],
-        )
+        if written:
+            cur.executemany(
+                f"""
+                UPDATE {table}
+                SET effnumber = ?,
+                    number = ?,
+                    length = ?,
+                    file_hash = ?
+                WHERE name = ?
+                """,
+                [
+                    (
+                        int(round(float(x.get('effnumber') or 0))),
+                        int(x.get('number')),
+                        int(x.get('length')),
+                        x.get('file_hash'),
+                        x.get('name'),
+                    )
+                    for x in written
+                ],
+            )
+        if failed:
+            cur.executemany(
+                f"UPDATE {table} SET status = ? WHERE name = ?",
+                [(STATUS['FAILED'], x.get('name')) for x in failed],
+            )
         conn.commit()
         return len(done_updates)
     except Exception as e:
@@ -482,6 +506,12 @@ if __name__ == '__main__':
     reweighting_enabled = bool(reweighting_cfg.get('enabled', True))
     reweighting_threshold = float(reweighting_cfg.get('threshold', 0.8))
     col_gap_threshold = float(cfg.get('align', {}).get('col_gap_threshold', 0.5))
+    try:
+        shared_source_strategy = check_shared_source_strategy(
+            concat_cfg.get('shared-source_strategy', 'skip'))
+    except ValueError as e:
+        raise SystemExit(str(e))
+    logging.info(f"Shared-source pairs: {shared_source_strategy}")
 
     reweight_threads = 4
     use_gpu = gpu_is_available()
@@ -531,6 +561,7 @@ if __name__ == '__main__':
         reweighting_threshold=reweighting_threshold,
         col_gap_threshold=col_gap_threshold,
         n_threads=0 if use_gpu else reweight_threads,
+        shared_source_strategy=shared_source_strategy,
     )
 
     workers = []

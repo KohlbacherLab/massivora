@@ -797,10 +797,16 @@ class BaseCalibrator(object):
 
     # -- public API -----------------------------------------------------------
     def ConfidenceFlag(self, coverage):
-        """Reliability flag from coverage-per-length (M_eff / L): `low` or `high`.
+        """Reliability flag from coverage-per-length (M_eff / L).
 
         A DATA-QUALITY judgement - is the alignment deep enough for DCA to say
         anything - and independent of how high the pair scores.
+
+        Returns
+        -------
+        `bool`
+            False (low confidence) when M_eff / L < LOW_CUT, otherwise True
+            (high confidence).
         """
         return False if coverage < self.LOW_CUT else True
 
@@ -817,16 +823,36 @@ class BaseCalibrator(object):
 
         Returns
         -------
-        dict with `log_lr_raw`, `pcontact` (that evidence as a probability at PI),
-        `confidence_flag` (`False` for low /`True` for high) and `high_precision_hit`.
+        `dict`
+            `log_lr_raw` — float
+                Ranker log likelihood ratio, the prevalence-free evidence for an
+                interaction.  UNCAPPED: cap it at `MAX_LOG_LR` before turning it
+                into a probability at another prior, i.e.
+                ``P = sigmoid(min(log_lr_raw, MAX_LOG_LR) + logit(q))``.
+                Uncapped values above the cap (up to ~120 on the benchmark) keep
+                the strongest pairs rankable but carry no extra calibrated
+                evidence.
+            `pcontact` — float
+                Interaction probability at `PI`, computed from the capped
+                evidence, so it never exceeds ``sigmoid(MAX_LOG_LR + LOGIT_PI)``
+                (0.7995 at PI = 1e-3).
+            `confidence_flag` — bool
+                False for low, True for high; see `ConfidenceFlag`.
+            `high_precision_hit` — bool
+                Whether the DETECTOR's evidence reaches `DETECTOR["hit_log_lr"]`,
+                its held-out 0.1%-FPR operating point.
+            `neffoverL` — float
+                M_eff / L, the coverage the confidence flag is read from.
         """
         if self.RANKER is None or self.DETECTOR is None:
             raise NotImplementedError(
                 f"{type(self).__name__} defines no RANKER/DETECTOR constants")
         L = int(analyzer.raw_couplings.shape[0])
         log_lr_raw = self._model_log_lr(analyzer, self.RANKER, N_eff)
-        # logit(P at prior q) = log_lr + logit(q), so log_lr is the prevalence-free part
-        # Capped because with 3984 labelled negatives no likelihood ratio finer than 1/3984 can be demonstrated
+        # logit(P at prior q) = log_lr + logit(q), so log_lr is the prevalence-free
+        # part.  The cap applies because with 3984 labelled negatives no
+        # likelihood ratio finer than 1/3984 can be demonstrated; only pcontact
+        # uses the capped value, log_lr_raw is returned as is.
         log_lr = min(log_lr_raw, self.MAX_LOG_LR)
         hit_log_lr = self._model_log_lr(analyzer, self.DETECTOR, N_eff)
         coverage = float(N_eff) / float(L)
@@ -842,7 +868,7 @@ class BaseCalibrator(object):
 class BuiltinPLMCalibrator(BaseCalibrator):
     """Calibration fitted on plmDCA couplings.
 
-    Held out: ranker AUC 0.879, AUPRC 0.803, ECE 0.040.
+    Pooled held-out ranker: AUC 0.873, AUPRC 0.720, ECE 0.023.
     """
 
     LOW_CUT = 0.8734290196703057
@@ -868,7 +894,7 @@ class BuiltinPLMCalibrator(BaseCalibrator):
 class BuiltinGaussCalibrator(BaseCalibrator):
     """Calibration fitted on GaussDCA couplings.
 
-    Held out: ranker AUC 0.890, AUPRC 0.801, ECE 0.033.
+    Pooled held-out ranker: AUC 0.884, AUPRC 0.709, ECE 0.022.
     """
 
     LOW_CUT = 1.5964534737486649

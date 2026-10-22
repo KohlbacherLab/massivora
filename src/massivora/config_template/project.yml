@@ -73,6 +73,10 @@ concatenate:
   db_table: couplings
   # method for pairing sequences in concatenated alignment
   method: best_hit
+  # when a pair is shared-source, what to do:
+  #   skip: log the pair and mark it FAILED (default)
+  #   fix:  remove those species and go on with the rest
+  shared-source_strategy: skip
   reweighting:
     enabled: true
     threshold: 0.8
