@@ -141,10 +141,23 @@ void applyIsingGauge(py::array_t<T> J, int q) {
     }
 }
 
-static inline long matchCount(const int8_t* a, const int8_t* b, long n) {
-    long c = 0;
-    for (long i = 0; i < n; ++i) c += (a[i] == b[i]) ? 1 : 0;
-    return c;
+// Whether two sequences match at >= thr of their n positions. Matches are
+// counted 192 positions at a time in a byte (a plain byte compare and add,
+// where a long counter is widened byte by byte to 64 bits), and the test stops
+// once the outcome is settled either way. 192 = 3 x 64 vectorises cleanly; the
+// byte caps the chunk at 255.
+static inline bool reachesMatches(const int8_t* a, const int8_t* b, long n, double thr) {
+    constexpr int kChunk = 192;
+    long c = 0, i = 0;
+    for (; i + kChunk <= n; i += kChunk) {
+        uint8_t m = 0;
+        for (int k = 0; k < kChunk; ++k) m += (a[i + k] == b[i + k]);
+        c += m;
+        if (static_cast<double>(c) >= thr) return true;
+        if (static_cast<double>(c + (n - i - kChunk)) < thr) return false;
+    }
+    for (; i < n; ++i) c += (a[i] == b[i]);
+    return static_cast<double>(c) >= thr;
 }
 
 py::array_t<int32_t> reweightNeighbourCounts(
@@ -199,8 +212,7 @@ py::array_t<int32_t> reweightNeighbourCounts(
                     // pair is visited exactly once across all tiles.
                     const long lstart = (I == J) ? k + 1 : j0;
                     for (long l = lstart; l < j1; ++l) {
-                        if (static_cast<double>(matchCount(zk, Z + l * N, N))
-                                >= identical_threshold) {
+                        if (reachesMatches(zk, Z + l * N, N, identical_threshold)) {
                             ++acc[k];
                             ++acc[l];
                         }

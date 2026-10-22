@@ -30,3 +30,10 @@ add_executable(site_optimizer_shm site_optimizer_shm.cpp)
 target_include_directories(site_optimizer_shm PRIVATE ${EIGEN3_INCLUDE_DIR})
 target_link_libraries(site_optimizer_shm PRIVATE Eigen3::Eigen NLopt::nlopt rt)
 target_compile_options(site_optimizer_shm PRIVATE $<$<CONFIG:Release>:-O3 -march=native>)
+
+# Blocked CPU plmDCA objective against the loop it replaced (bitwise)
+add_executable(test_plm_objective test_plm_objective.cpp)
+target_include_directories(test_plm_objective PRIVATE ${EIGEN3_INCLUDE_DIR}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../src/massivora/bindings_src)
+target_link_libraries(test_plm_objective PRIVATE Eigen3::Eigen)
+target_compile_options(test_plm_objective PRIVATE $<$<CONFIG:Release>:-O3 -march=native>)
