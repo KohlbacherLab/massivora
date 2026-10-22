@@ -15,6 +15,8 @@
 
 #include <nlopt.hpp>
 
+#include "plm_objective.hpp"
+
 using PLMV = double;
 
 // The MSA in Zarr is int8
@@ -26,105 +28,6 @@ using WMap   = Eigen::Map<const Eigen::Matrix<PLMV, -1, 1>>;
 // ===========================================================================
 // CPU implementation (NLopt L-BFGS, one process per site)
 // ===========================================================================
-
-Eigen::Matrix<PLMV, -1, 1> getEnergies(
-    const Eigen::Matrix<PLMV, -1, 1>& x,
-    int r,
-    int q,
-    int N,
-    int b,
-    const MSAMap& MSA) {
-
-    Eigen::Matrix<PLMV, -1, 1> energies = Eigen::Matrix<PLMV, -1, 1>::Zero(q);
-
-    Eigen::Map<const Eigen::Matrix<PLMV, -1, 1>> h(x.data(), q);
-    Eigen::TensorMap<const Eigen::Tensor<PLMV, 3>> Jr(x.data() + q, q, q, N-1);
-
-    for (int l = 0; l < q; l++) {
-        PLMV sum_Jri = 0.0;
-
-        for (int i = 0; i < r; i++) {
-            int k = MSA(b, i);
-            sum_Jri += Jr(l, k, i);
-        }
-        for (int i = r + 1; i < N; i++) {
-            int k = MSA(b, i);
-            sum_Jri += Jr(l, k, i-1);
-        }
-
-        energies(l) = h(l) + sum_Jri;
-    }
-
-    return energies;
-}
-
-PLMV mergeEnergyTerm(const Eigen::Matrix<PLMV, -1, 1>& energies) {
-    PLMV max = energies.maxCoeff();
-    return max + std::log((energies.array() - max).exp().sum());
-}
-
-PLMV l2Regularization(
-    const Eigen::Matrix<PLMV, -1, 1>& vec,
-    int q,
-    PLMV lambdaH,
-    PLMV lambdaJ) {
-
-    PLMV reg_h = vec.head(q).array().square().sum() * lambdaH;
-    PLMV reg_J = vec.tail(vec.size() - q).array().square().sum() * 0.5 * lambdaJ;
-
-    return reg_h + reg_J;
-}
-
-std::tuple<PLMV, Eigen::Matrix<PLMV, -1, 1>> perSitePllGradient(
-    const Eigen::Matrix<PLMV, -1, 1>& x,
-    int r,
-    int q,
-    int N,
-    int B,
-    const MSAMap& MSA,
-    const WMap& W,
-    PLMV lambdaH,
-    PLMV lambdaJ) {
-
-    PLMV pll = 0.0;
-    Eigen::Matrix<PLMV, -1, 1> gradients = Eigen::Matrix<PLMV, -1, 1>::Zero(x.size());
-    Eigen::TensorMap<Eigen::Tensor<PLMV, 3>> Tgradients(gradients.data() + q, q, q, N - 1);
-
-    for (int b = 0; b < B; b++) {
-        Eigen::Matrix<PLMV, -1, 1> energies = getEnergies(x, r, q, N, b, MSA);
-        PLMV lnorm = mergeEnergyTerm(energies);
-        pll -= W(b) * (energies(MSA(b, r)) - lnorm);
-
-        Eigen::Matrix<PLMV, -1, 1> Ps = (energies.array() - lnorm).exp();
-        Eigen::Matrix<PLMV, -1, 1> vGrad = Eigen::Matrix<PLMV, -1, 1>::Zero(q);
-
-        for (int s = 0; s < q; s++) {
-            int indicator = (s == MSA(b, r)) ? 1 : 0;
-            vGrad(s) = W(b) * (indicator - Ps(s));
-        }
-
-        gradients.head(q) -= vGrad;
-
-        for (int i = 0; i < r; i++) {
-            int s_ib = MSA(b, i);
-            for (int s = 0; s < q; s++) {
-                Tgradients(s, s_ib, i) -= vGrad(s);
-            }
-        }
-        for (int i = r+1; i < N; i++) {
-            int s_ib = MSA(b, i);
-            for (int s = 0; s < q; s++) {
-                Tgradients(s, s_ib, i-1) -= vGrad(s);
-            }
-        }
-    }
-
-    gradients.head(q) += 2.0f * lambdaH * x.head(q);
-    gradients.tail(x.size() - q) += lambdaJ * x.tail(x.size() - q);
-    pll += l2Regularization(x, q, lambdaH, lambdaJ);
-
-    return std::make_tuple(pll, gradients);
-}
 
 struct NLoptContext {
     int r = 0;
@@ -139,26 +42,12 @@ struct NLoptContext {
 
 double pllTarget(const std::vector<double> &x, std::vector<double> &grad, void* f_data){
     auto* ctx = reinterpret_cast<NLoptContext*>(f_data);
-    // Map NLopt's vector<double> to Eigen without copying
-    Eigen::Map<const Eigen::VectorXd> x_d(x.data(), x.size());
-
-    auto [pll, gradients] = perSitePllGradient(
-        x_d,
-        ctx->r,
-        ctx->q,
-        ctx->N,
-        ctx->B,
-        *(ctx->MSA),
-        *(ctx->W),
-        ctx->lambdaH,
-        ctx->lambdaJ
-    );
-
-    if (!grad.empty()) {
-        Eigen::Map<Eigen::VectorXd>(grad.data(), grad.size()) = gradients;
-    }
-
-    return pll;
+    // L-BFGS always asks for the gradient; a scratch one covers a caller that does not.
+    std::vector<double> scratch;
+    double* g = grad.empty() ? (scratch.resize(x.size()), scratch.data()) : grad.data();
+    return plmobj::pllGradient(x.data(), ctx->r, ctx->q, ctx->N, ctx->B,
+                               ctx->MSA->data(), ctx->W->data(),
+                               ctx->lambdaH, ctx->lambdaJ, g);
 }
 
 
