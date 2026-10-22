@@ -115,6 +115,14 @@ couple:
   gpu_host_processes: auto  # processes loading alignments and analysing scores; 'auto' or integer (0: in the coordinator)
   gpu_workers: 16  # pairs in flight; at least gpu_sessions x GPUs + gpu_host_processes
 
+  # Cascade: couple only the best pairs of a finished GaussDCA run; the rest
+  # are marked SKIPPED. Pairs the GaussDCA run did not finish are still coupled.
+  # cascade:
+  #   source_db: gauss.sqlite3  # DB of the GaussDCA run (default: this project's DB)
+  #   source_table: couplings   # its couplings table (default: couple.db_table)
+  #   keep_fraction: 0.16       # share of the GaussDCA-scored pairs to couple
+  #   rank_by: log_lr_raw       # or high_precision_hit (detector hits first)
+
   # Applies when one wants to split the calculation to multiple clusters
   # portion: 1.0
   # portion_start: 0.0

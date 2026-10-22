@@ -160,8 +160,8 @@ def _too_many_failures_local(cfg, command):
         ).fetchone()[0] or 0)
 
         workable = cursor.execute(
-            f"SELECT 1 FROM {table} WHERE status NOT IN (?, ?) AND id >= ? AND id < ? LIMIT 1",
-            (STATUS['DONE'], STATUS['FAILED'], idx_start, idx_end),
+            f"SELECT 1 FROM {table} WHERE status NOT IN (?, ?, ?) AND id >= ? AND id < ? LIMIT 1",
+            (STATUS['DONE'], STATUS['FAILED'], STATUS['SKIPPED'], idx_start, idx_end),
         ).fetchone()
 
         prev = cursor.execute(
@@ -246,7 +246,7 @@ def _project_is_complete(cfg, command):
     try:
         cursor = conn.cursor()
 
-        # Is finished if there are no rows outside DONE/FAILED in the slice
+        # Is finished if there are no rows outside DONE/FAILED/SKIPPED in the slice
         portion = float(stage_cfg.get('portion', 1.0))
         portion_start = float(stage_cfg.get('portion_start', 0.0))
         cursor.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}")
@@ -254,8 +254,8 @@ def _project_is_complete(cfg, command):
 
         idx_start, idx_end = compute_id_range(portion, portion_start, total)
 
-        where = ["status NOT IN (?, ?)", "id >= ? AND id < ?"]
-        params = [STATUS['DONE'], STATUS['FAILED'], idx_start, idx_end]
+        where = ["status NOT IN (?, ?, ?)", "id >= ? AND id < ?"]
+        params = [STATUS['DONE'], STATUS['FAILED'], STATUS['SKIPPED'], idx_start, idx_end]
 
         row = cursor.execute(
             f"SELECT 1 FROM {table} WHERE {' AND '.join(where)} LIMIT 1",
