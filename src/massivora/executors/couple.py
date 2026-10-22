@@ -23,7 +23,7 @@ from dask.distributed import (Client, Nanny, Scheduler, SpecCluster,
 from massivora import cpp_bindings
 from massivora.alignment import BinaryAlignment
 from massivora.config import load_project_and_system_config
-from massivora.db import (STATUS, compute_file_hash, connect_db_rw,
+from massivora.db import (STATUS, apply_cascade, compute_file_hash, connect_db_rw,
                           ensure_columns, get_db_path, get_hashed_file_path,
                           get_table_names, quote_identifier)
 from massivora.utils import (SHM_PREFIX, ShardWriter, compute_id_range,
@@ -98,6 +98,7 @@ class BaseCouplingExecutor(object):
         self.plm_opt_exe = None
 
         ensure_columns(self._config)
+        apply_cascade(self._config)
 
         # Maintain database connection for the lifetime of this executor
         self.db_conn = connect_db_rw(self._config)
