@@ -80,7 +80,9 @@ concatenate:
   # The check uses each monomer's residue runs (run tables), computed once
   # per protein and saved so that every process and run maps the same copy.
   # Each saved table carries a fingerprint of the monomer it was built from
-  # and is rebuilt when the monomer changes. Where they are kept:
+  # (shape, species, a sample of rows and the files of its zarr 'align'
+  # array) and is rebuilt when the monomer's store is written again. Where
+  # they are kept:
   #   auto:    <project_path>/shared_source_cache (default); the monomer
   #            tree is never written
   #   off:     in memory only, per process (every process builds the tables

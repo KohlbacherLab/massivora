@@ -164,13 +164,43 @@ def build_run_table(block, k=10):
     return runs[keep], offsets
 
 
-def alignment_fingerprint(matrix, species_index_map=(), species_list=()):
+def store_signature(path):
+    """
+    The files of the `align` array of the zarr store at `path` (relative
+    name, size, mtime in ns), as bytes: it changes whenever the store is
+    written again, however little of the matrix changed. Empty when `path`
+    holds no `align` directory (an alignment that was never stored).
+    """
+    root = os.path.join(path, 'align')
+    if not os.path.isdir(root):
+        return b''
+    entries = []
+    for directory, _, files in os.walk(root):
+        for name in files:
+            full = os.path.join(directory, name)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            entries.append(f'{os.path.relpath(full, root)}\0{st.st_size}\0{st.st_mtime_ns}')
+    return '\n'.join(sorted(entries)).encode('utf-8')
+
+
+def alignment_fingerprint(matrix, species_index_map=(), species_list=(), store=None):
     """
     16 bytes that identify the content of an alignment matrix for the run
     table cache: its shape, its species index map and list, every
-    `n_rows // 256`-th row and its last row. A re-generated alignment of the
-    same shape gets another fingerprint, so a table built for the old one is
-    not reused for it (`RunTable.load`).
+    `n_rows // 256`-th row and its last row (at most 512 rows, so ≈ 0.1 ms
+    per monomer; hashing all rows would cost 25 ms per median monomer, 60 %
+    of its zarr load, on every pair with the executor's 8-entry monomer
+    cache), plus the `store_signature` of the zarr store `store` when one
+    is given. A re-generated alignment is therefore told from the old one
+    when its store was written again (new chunk files: size or mtime), when
+    its shape, species or a sampled row changed, or when it has more than
+    512 rows and the change lies in an unsampled row of a store rewritten
+    with the old files' sizes and mtimes to the nanosecond — the one case
+    that is not detected. A table built for the old alignment is then not
+    reused (`RunTable.load`).
     """
     matrix = np.asarray(matrix)
     n_rows = int(matrix.shape[0])
@@ -182,6 +212,9 @@ def alignment_fingerprint(matrix, species_index_map=(), species_list=()):
         step = max(1, n_rows // 256)
         h.update(np.ascontiguousarray(matrix[::step], dtype=np.int8).tobytes())
         h.update(np.ascontiguousarray(matrix[-1], dtype=np.int8).tobytes())
+    signature = store_signature(store) if store else b''
+    if signature:
+        h.update(b'\0store\0' + signature)
     return h.digest()
 
 
@@ -404,23 +437,30 @@ def resolve_shared_source(alignment, strategy='skip', name=None, k=10, threshold
     """
     strategy = check_shared_source_strategy(strategy)
     # The run-table cache is a BinaryAlignment feature
-    kwargs = {'cache': cache} if isinstance(alignment, BinaryAlignment) else {}
-    if not alignment.Is_Shared_Source(k=k, threshold=threshold, **kwargs):
+    is_binary = isinstance(alignment, BinaryAlignment)
+    kwargs = {'cache': cache} if is_binary else {}
+    try:
+        if not alignment.Is_Shared_Source(k=k, threshold=threshold, **kwargs):
+            return alignment
+        label = f"Pair '{name}'" if name else "Pair"
+        share = alignment.shared_source_share
+        if strategy == 'skip':
+            raise SharedSourceError(
+                f"{label} is a shared-source concatenation: {share:.1%} of its species pair "
+                f"one sequence with itself (concatenate.shared-source_strategy: skip)")
+        removed = alignment.Remove_Shared_Source(k=k, **kwargs)
+        if alignment.matrix.shape[0] <= 1:
+            raise SharedSourceError(
+                f"{label} is a shared-source concatenation and no species is left after "
+                f"removing the {removed} that pair one sequence with itself")
+        logger.info(f"{label}: removed {removed} shared-source species ({share:.1%}); "
+                    f"{alignment.matrix.shape[0]} sequences left")
         return alignment
-    label = f"Pair '{name}'" if name else "Pair"
-    share = alignment.shared_source_share
-    if strategy == 'skip':
-        raise SharedSourceError(
-            f"{label} is a shared-source concatenation: {share:.1%} of its species pair "
-            f"one sequence with itself (concatenate.shared-source_strategy: skip)")
-    removed = alignment.Remove_Shared_Source(k=k, **kwargs)
-    if alignment.matrix.shape[0] <= 1:
-        raise SharedSourceError(
-            f"{label} is a shared-source concatenation and no species is left after "
-            f"removing the {removed} that pair one sequence with itself")
-    logger.info(f"{label}: removed {removed} shared-source species ({share:.1%}); "
-                f"{alignment.matrix.shape[0]} sequences left")
-    return alignment
+    finally:
+        if is_binary:
+            # The check is done: let go of the monomers the pair was made
+            # from, so the caller's `del` of them frees their matrices
+            alignment._pair_source = None
 
 
 class TextAlignment(MultipleSeqAlignment):
@@ -1106,11 +1146,12 @@ class BinaryAlignment(object):
         return new_instance
 
     def fingerprint(self):
-        """`alignment_fingerprint` of this alignment's matrix, computed once."""
+        """`alignment_fingerprint` of this alignment's matrix and, for one
+        loaded from a store, of the store's `align` files; computed once."""
         if self._fingerprint is None:
             self._fingerprint = alignment_fingerprint(
                 self.matrix, getattr(self, 'species_index_map', ()),
-                getattr(self, 'species_list', ()))
+                getattr(self, 'species_list', ()), store=self._path)
         return self._fingerprint
 
     def run_table(self, k=10, cache=None):
@@ -1161,7 +1202,12 @@ class BinaryAlignment(object):
     def _shared_rows(self, k=10, cache=None):
         """One boolean per row but the query: whether its two halves share a
         run of `k` residues. From the monomers' run tables when this pair was
-        concatenated here and is still as concatenated, else from its rows."""
+        concatenated here (`__add__`) and its matrix still has the shape of
+        that concatenation: `Downsample_Randomly`, `Remove_Shared_Source`,
+        `Drop_Masked_Gap_Columns`, `resolve_shared_source` and a reassigned
+        matrix of another shape all send it back to its rows; an in-place
+        edit of `matrix` that keeps the shape is not noticed (no production
+        path does that between `+` and the check). Else from its rows."""
         part_a, part_b = self._pair_blocks()         # also checks it is a pair
         source = self._pair_source
         if source is not None:

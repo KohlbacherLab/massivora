@@ -6,8 +6,10 @@ which are built once per protein and may be saved for every process to map.
 These tests check that the tables give exactly the booleans of the row-wise
 check (`_shared_source_rows`) through the C++ merge and the numpy fallback,
 that saved tables round-trip and are only reused for the matrix they were
-built from, that nothing is written unless asked, and that a pair modified
-after concatenation falls back to its rows.
+built from, that nothing is written unless asked, and that a pair reshaped
+after concatenation (Downsample, Remove, Drop, a reassigned matrix) falls
+back to its rows. An in-place edit of the pair's matrix that keeps its shape
+is not detected; no production path does that between `+` and the check.
 """
 import logging
 import os
@@ -301,6 +303,58 @@ def test_stale_tables_are_not_reused(tmp_path, merge):
     # the stale table was replaced by the new one
     assert RunTable.load(os.path.join(cache, 'A'), 10, a.matrix.shape, a.fingerprint()) is not None
     assert RunTable.load(os.path.join(cache, 'A'), 10, a.matrix.shape, old_fp) is None
+
+
+def test_rewritten_store_is_told_apart_even_in_unsampled_rows(tmp_path, merge):
+    """More than 512 rows: the content sample skips rows, but a store written
+    again has other `align` files (size, mtime), so a change confined to an
+    unsampled row still gets new tables."""
+    n = 700                                   # 701 rows: every 2nd row is sampled
+    path_a, path_b = _store(tmp_path, n_species=n, shared=(1, 2, 3), seed=0)
+    cache = str(tmp_path / 'cache')
+    pair = BinaryAlignment(path_a) + BinaryAlignment(path_b)
+    assert _flagged(pair, pair._shared_rows(cache=cache)) == {'sp1', 'sp2', 'sp3'}
+    old_b = BinaryAlignment(path_b)
+    old_fp, old_sig = old_b.fingerprint(), alignment.store_signature(path_b)
+    assert old_sig and alignment.store_signature(str(tmp_path / 'nowhere')) == b''
+
+    # regenerate B with one more copied run, in row 301 (odd: not sampled)
+    _, m2 = _pair_monomers(n_species=n, shared=(1, 2, 3, 301), seed=0)
+    assert np.array_equal(m2.matrix[::2], old_b.matrix[::2]) and not np.array_equal(m2.matrix, old_b.matrix)
+    assert alignment_fingerprint(m2.matrix, m2.species_index_map, m2.species_list) == \
+        alignment_fingerprint(old_b.matrix, old_b.species_index_map, old_b.species_list)
+    m2.To_Zarr(path_b, overwrite=True)
+    b = BinaryAlignment(path_b)
+    assert alignment.store_signature(path_b) != old_sig and b.fingerprint() != old_fp
+    fresh = BinaryAlignment(path_a) + b
+    np.testing.assert_array_equal(fresh._shared_rows(cache=cache), _row_check(fresh))
+    assert _flagged(fresh, fresh._shared_rows(cache=cache)) == {'sp1', 'sp2', 'sp3', 'sp301'}
+    assert RunTable.load(os.path.join(cache, 'B'), 10, b.matrix.shape, b.fingerprint()) is not None
+    assert RunTable.load(os.path.join(cache, 'B'), 10, b.matrix.shape, old_fp) is None
+    # an unchanged store keeps its fingerprint across loads and processes
+    assert BinaryAlignment(path_b).fingerprint() == b.fingerprint()
+
+
+def test_resolve_shared_source_lets_go_of_the_monomers(merge):
+    """After the check the pair no longer references the monomers it was made
+    from, so a caller that deletes them frees their matrices."""
+    import gc
+    import weakref
+    for case, strategy in (('clean', 'skip'), ('shared', 'fix')):
+        m1, m2 = _pair_monomers(**CASES[case])
+        pair = m1 + m2
+        ref = weakref.ref(m1)
+        del m1, m2
+        assert pair._pair_source is not None and ref() is not None
+        resolve_shared_source(pair, strategy, 'p')
+        assert pair._pair_source is None
+        gc.collect()
+        assert ref() is None
+    m1, m2 = _pair_monomers(**CASES['shared'])
+    pair = m1 + m2
+    with pytest.raises(SharedSourceError):
+        resolve_shared_source(pair, 'skip', 'p')
+    assert pair._pair_source is None
 
 
 def test_overwriting_a_store_removes_its_tables(tmp_path):
