@@ -1,3 +1,5 @@
+import glob
+import hashlib
 import logging
 import math
 import os
@@ -23,6 +25,13 @@ logger = logging.getLogger(__name__)
 SHARED_SOURCE_STRATEGIES = ('skip', 'fix')
 # Residue codes are 0..21 once lower case is folded onto upper case
 _RESIDUE_BITS = 5
+# Where the shared-source run tables of an alignment are kept (see
+# `resolve_run_table_cache`): in memory only, next to the alignment, or in a
+# directory given by the caller
+RUN_TABLE_CACHE_MEMORY = None
+RUN_TABLE_CACHE_MONOMER = 'monomer'
+# Cache roots whose first failed save was already logged by this process
+_run_table_save_warned = set()
 
 
 class SharedSourceError(RuntimeError):
@@ -155,42 +164,90 @@ def build_run_table(block, k=10):
     return runs[keep], offsets
 
 
+def alignment_fingerprint(matrix, species_index_map=(), species_list=()):
+    """
+    16 bytes that identify the content of an alignment matrix for the run
+    table cache: its shape, its species index map and list, every
+    `n_rows // 256`-th row and its last row. A re-generated alignment of the
+    same shape gets another fingerprint, so a table built for the old one is
+    not reused for it (`RunTable.load`).
+    """
+    matrix = np.asarray(matrix)
+    n_rows = int(matrix.shape[0])
+    h = hashlib.blake2b(digest_size=16)
+    h.update(np.array(matrix.shape, dtype=np.int64).tobytes())
+    h.update(np.asarray(list(species_index_map), dtype=np.int64).tobytes())
+    h.update('\n'.join(str(s) for s in species_list).encode('utf-8'))
+    if n_rows:
+        step = max(1, n_rows // 256)
+        h.update(np.ascontiguousarray(matrix[::step], dtype=np.int8).tobytes())
+        h.update(np.ascontiguousarray(matrix[-1], dtype=np.int8).tobytes())
+    return h.digest()
+
+
 class RunTable(object):
     """
     The residue runs of some rows of one protein's alignment, computed once
     and reused by every pair the protein is part of (issue #15): the runs of a
     row do not depend on the partner protein. Held as `build_run_table`'s CSR
     arrays for `rows` of the matrix, and optionally saved next to the
-    alignment, where every process maps the same copy.
+    alignment or in a cache directory, where every process maps the same copy.
+    A saved table carries the `alignment_fingerprint` of the matrix it was
+    built from and is only reused for that matrix.
     """
-    FORMAT = 1
-    __slots__ = ('k', 'codes', 'offsets', 'rows', 'shape')
+    FORMAT = 2
+    FINGERPRINT_BYTES = 16
+    __slots__ = ('k', 'codes', 'offsets', 'rows', 'shape', 'fingerprint')
 
-    def __init__(self, k, codes, offsets, rows, shape):
+    def __init__(self, k, codes, offsets, rows, shape, fingerprint=b''):
         self.k, self.codes, self.offsets = int(k), codes, offsets
         self.rows, self.shape = np.asarray(rows, dtype=np.int64), tuple(int(s) for s in shape)
+        self.fingerprint = bytes(fingerprint)
 
     @classmethod
-    def build(cls, matrix, rows, k=10):
+    def build(cls, matrix, rows, k=10, fingerprint=None):
         rows = np.asarray(rows, dtype=np.int64)
         codes, offsets = build_run_table(matrix[rows], k)
-        return cls(k, codes, offsets, rows, matrix.shape)
+        if fingerprint is None:
+            fingerprint = alignment_fingerprint(matrix)
+        return cls(k, codes, offsets, rows, matrix.shape, fingerprint)
 
     @staticmethod
     def directory(path, k):
         return os.path.join(path, f'shared_source_k{int(k)}')
 
+    @staticmethod
+    def remove_all(path):
+        """Remove every run table saved under `path` (any k): the alignment
+        there is about to be overwritten."""
+        for directory in glob.glob(os.path.join(glob.escape(path), 'shared_source_k*')):
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def _meta(self):
+        fp = np.frombuffer(self.fingerprint.ljust(self.FINGERPRINT_BYTES, b'\0')
+                           [:self.FINGERPRINT_BYTES], dtype=np.int64)
+        return np.array([self.FORMAT, self.k, *self.shape, *fp], dtype=np.int64)
+
     @classmethod
-    def load(cls, path, k, shape):
+    def load(cls, path, k, shape, fingerprint=None):
         """The table saved under `path` for runs of `k`, mapped read-only, or
-        None when there is none or it was built for another matrix."""
+        None when there is none or it was built for another matrix (another
+        shape, or another `fingerprint` when one is given)."""
         directory = cls.directory(path, k)
         meta = os.path.join(directory, 'meta.npy')
         if not os.path.exists(meta):
             return None
         try:
-            fmt, kk, n_rows, n_cols = (int(v) for v in np.load(meta))
+            values = np.load(meta)
+            if len(values) != 4 + cls.FINGERPRINT_BYTES // 8:
+                return None
+            fmt, kk, n_rows, n_cols = (int(v) for v in values[:4])
+            saved_fp = np.ascontiguousarray(values[4:], dtype=np.int64).tobytes()
             if fmt != cls.FORMAT or kk != int(k) or (n_rows, n_cols) != tuple(int(s) for s in shape):
+                return None
+            if fingerprint is not None and saved_fp != bytes(fingerprint):
+                logger.info(f"Ignoring the shared-source run table under {directory}: "
+                            "built for another alignment of the same shape")
                 return None
             codes = np.load(os.path.join(directory, 'codes.npy'), mmap_mode='r')
             offsets = np.load(os.path.join(directory, 'offsets.npy'), mmap_mode='r')
@@ -198,14 +255,19 @@ class RunTable(object):
         except (OSError, ValueError) as e:
             logger.warning(f"Ignoring the shared-source run table under {directory}: {e}")
             return None
-        return cls(k, codes, offsets, rows, shape)
+        return cls(k, codes, offsets, rows, shape, saved_fp)
 
-    def save(self, path):
+    def save(self, path, replace=False):
         """Save under `path` (atomically: a finished table appears or none).
-        False if the location cannot be written, which is not an error."""
+        A table already there is kept unless `replace` (it is stale: built
+        for another matrix). False if the location cannot be written: logged
+        once per cache root and process, since every pair then pays for
+        building the table."""
         directory = self.directory(path, self.k)
         if os.path.exists(os.path.join(directory, 'meta.npy')):
-            return True
+            if not replace:
+                return True
+            shutil.rmtree(directory, ignore_errors=True)
         tmp = f'{directory}.{os.getpid()}.tmp'
         try:
             os.makedirs(path, exist_ok=True)
@@ -213,14 +275,19 @@ class RunTable(object):
             np.save(os.path.join(tmp, 'codes.npy'), np.ascontiguousarray(self.codes))
             np.save(os.path.join(tmp, 'offsets.npy'), np.ascontiguousarray(self.offsets))
             np.save(os.path.join(tmp, 'rows.npy'), self.rows)
-            np.save(os.path.join(tmp, 'meta.npy'),
-                    np.array([self.FORMAT, self.k, *self.shape], dtype=np.int64))
+            np.save(os.path.join(tmp, 'meta.npy'), self._meta())
             os.rename(tmp, directory)
         except OSError as e:
             shutil.rmtree(tmp, ignore_errors=True)
             if os.path.exists(os.path.join(directory, 'meta.npy')):
                 return True                 # another process won the race
-            logger.debug(f"Not saving the shared-source run table under {directory}: {e}")
+            root = os.path.dirname(os.path.normpath(path)) or path
+            if root not in _run_table_save_warned:
+                _run_table_save_warned.add(root)
+                logger.warning(
+                    f"Cannot save the shared-source run table under {directory}: {e}. "
+                    "Every process builds the tables itself (about 0.3 s per pair); point "
+                    "concatenate.shared-source_cache at a writable directory")
             return False
         return True
 
@@ -278,8 +345,32 @@ def _gather_rows(table, pos):
     return np.array(table.codes[first + np.arange(total)], dtype=np.uint64), local
 
 
+def resolve_run_table_cache(setting, project_path=None):
+    """
+    The `cache` argument of `resolve_shared_source` for a
+    `concatenate.shared-source_cache` setting:
+      off:       None, the run tables stay in memory, per process
+      monomer:   next to each monomer alignment (writes into the MSA tree)
+      auto:      `<project_path>/shared_source_cache` (the default; None
+                 without a project path, so nothing is ever written)
+      directory: that directory, relative to `project_path` when given
+    """
+    if setting is None:
+        return RUN_TABLE_CACHE_MEMORY
+    mode = str(setting).strip()
+    if mode.lower() in ('', 'off', 'none', 'memory'):
+        return RUN_TABLE_CACHE_MEMORY
+    if mode.lower() == RUN_TABLE_CACHE_MONOMER:
+        return RUN_TABLE_CACHE_MONOMER
+    if mode.lower() == 'auto':
+        return os.path.join(project_path, 'shared_source_cache') if project_path else None
+    if project_path and not os.path.isabs(mode):
+        return os.path.join(project_path, mode)
+    return mode
+
+
 def resolve_shared_source(alignment, strategy='skip', name=None, k=10, threshold=0.05,
-                          cache='auto'):
+                          cache=None):
     """
     Apply a shared-source strategy to a freshly concatenated pair.
 
@@ -296,8 +387,9 @@ def resolve_shared_source(alignment, strategy='skip', name=None, k=10, threshold
     `threshold` — float (optional)
         Share of species above which the pair counts as shared-source (default: `0.05`)
     `cache` — str (optional)
-        For a BinaryAlignment pair, whether the monomers' run tables are kept
-        on disk next to them ('auto') or in memory only ('off') (default: `'auto'`)
+        For a BinaryAlignment pair, where the monomers' run tables are kept:
+        None in memory only, 'monomer' next to each monomer, anything else a
+        directory (`resolve_run_table_cache`) (default: `None`)
 
     Returns
     -------
@@ -875,6 +967,7 @@ class TextAlignment(MultipleSeqAlignment):
             if overwrite:
                 logger.warning(f"File {filename} already exists. Overwriting it.")
                 shutil.rmtree(os.path.join(filename, 'align'), ignore_errors=True)
+                RunTable.remove_all(filename)      # built for the old matrix
             else:
                 logger.error(f"File {filename} already exists. Use overwrite=True to overwrite it.")
                 return
@@ -934,9 +1027,10 @@ class BinaryAlignment(object):
         self.species_list_map = {}
         self.saved_columns = []
         self.lengthes = []
-        # Where this alignment was loaded from (its run table is kept there)
+        # Where this alignment was loaded from (its run table may be kept there)
         self._path = filename if isinstance(filename, str) else None
         self._run_table = None
+        self._fingerprint = None
         # Set by __add__: the two monomers and the rows taken from each, so
         # the shared-source check can use their run tables
         self._pair_source = None
@@ -1011,45 +1105,60 @@ class BinaryAlignment(object):
 
         return new_instance
 
-    def run_table(self, k=10, cache='auto'):
+    def fingerprint(self):
+        """`alignment_fingerprint` of this alignment's matrix, computed once."""
+        if self._fingerprint is None:
+            self._fingerprint = alignment_fingerprint(
+                self.matrix, getattr(self, 'species_index_map', ()),
+                getattr(self, 'species_list', ()))
+        return self._fingerprint
+
+    def run_table(self, k=10, cache=None):
         """
         This alignment's residue runs for the shared-source check, for the
         rows a concatenation can take from it (one per species), built once
-        and kept. With `cache` 'auto' an alignment loaded from a zarr store
-        also keeps the table on disk next to it (`shared_source_k<k>/`), so
-        the next process maps it instead of building it again.
+        and kept. With a `cache` location (`run_table_path`) an alignment
+        loaded from a zarr store also keeps the table on disk
+        (`shared_source_k<k>/`), so the next process maps it instead of
+        building it again; a saved table is used only when its fingerprint
+        is this alignment's.
         """
         table = self._run_table
         if table is not None and table.k == int(k) and table.shape == self.matrix.shape:
             return table
         path = self.run_table_path(cache)
-        table = RunTable.load(path, k, self.matrix.shape) if path else None
+        table = RunTable.load(path, k, self.matrix.shape, self.fingerprint()) if path else None
         if table is None:
             rows = np.asarray(self.species_index_map if len(self.species_index_map) else
                               np.arange(self.matrix.shape[0]), dtype=np.int64)
-            table = RunTable.build(self.matrix, rows, k)
+            table = RunTable.build(self.matrix, rows, k, self.fingerprint())
             if path:
-                table.save(path)
+                # A table that is there but was not loaded is stale: replace it
+                stale = os.path.exists(os.path.join(RunTable.directory(path, k), 'meta.npy'))
+                table.save(path, replace=stale)
         self._run_table = table
         return table
 
-    def run_table_path(self, cache='auto'):
+    def run_table_path(self, cache=None):
         """
-        Where this alignment's run tables are kept: 'auto' puts them next to
-        the alignment, 'off' keeps them in memory only (None), and any other
-        value is a directory that holds one subdirectory per alignment name
-        (on a file system where mapping is cheap, such as tmpfs; ZFS is not).
+        Where this alignment's run tables are kept, or None for in memory
+        only: `cache` None (or 'off') keeps them in memory, 'monomer' puts
+        them next to the alignment, and any other value is a directory that
+        holds one subdirectory per alignment name (on a file system where
+        mapping is cheap, such as tmpfs; ZFS is not). 'auto' is resolved by
+        the executors (`resolve_run_table_cache`); here it means in memory.
+        An alignment not loaded from a store keeps its tables in memory.
         """
         if cache is None or self._path is None:
             return None
         mode = str(cache).strip()
-        if mode.lower() == 'off':
+        if mode.lower() in ('', 'off', 'none', 'memory', 'auto'):
             return None
-        if mode.lower() == 'auto':
+        if mode.lower() == RUN_TABLE_CACHE_MONOMER:
             return self._path
         return os.path.join(mode, os.path.basename(os.path.normpath(self._path)))
 
-    def _shared_rows(self, k=10, cache='auto'):
+    def _shared_rows(self, k=10, cache=None):
         """One boolean per row but the query: whether its two halves share a
         run of `k` residues. From the monomers' run tables when this pair was
         concatenated here and is still as concatenated, else from its rows."""
@@ -1108,7 +1217,7 @@ class BinaryAlignment(object):
             raise ValueError("species_list and species_index_map do not describe the rows")
         return rows
 
-    def Is_Shared_Source(self, k=10, threshold=0.05, cache='auto'):
+    def Is_Shared_Source(self, k=10, threshold=0.05, cache=None):
         """
         Whether this concatenated pair pairs one sequence with itself.
 
@@ -1129,9 +1238,9 @@ class BinaryAlignment(object):
         `threshold` — float (optional)
             Share of species from which the pair counts as shared-source (default: `0.05`)
         `cache` — str (optional)
-            'auto' keeps the monomers' run tables next to them on disk, 'off'
-            keeps them in memory only, anything else is a directory to keep
-            them in, one subdirectory per monomer (default: `'auto'`)
+            None keeps the monomers' run tables in memory only, 'monomer'
+            next to them on disk, anything else is a directory to keep them
+            in, one subdirectory per monomer (default: `None`)
 
         Returns
         -------
@@ -1147,7 +1256,7 @@ class BinaryAlignment(object):
         self.shared_source_share = float(shared.mean()) if shared.size else 0.0
         return self.shared_source_share >= threshold
 
-    def Remove_Shared_Source(self, k=10, cache='auto'):
+    def Remove_Shared_Source(self, k=10, cache=None):
         """
         Remove every species whose two halves share an exact run of `k`
         residues, i.e. that pairs one sequence with itself. The query is kept.
@@ -1160,7 +1269,7 @@ class BinaryAlignment(object):
         `k` — int (optional)
             Length of the residue run, at most 12 (default: `10`)
         `cache` — str (optional)
-            As for `Is_Shared_Source` (default: `'auto'`)
+            As for `Is_Shared_Source` (default: `None`)
 
         Returns
         -------
@@ -1482,6 +1591,7 @@ class BinaryAlignment(object):
             if overwrite:
                 logger.warning(f"File {filename} already exists. Overwriting it.")
                 shutil.rmtree(os.path.join(filename, 'align'), ignore_errors=True)
+                RunTable.remove_all(filename)      # built for the old matrix
             else:
                 logger.error(f"File {filename} already exists. Use overwrite=True to overwrite it.")
                 return

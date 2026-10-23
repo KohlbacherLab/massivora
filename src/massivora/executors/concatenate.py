@@ -11,7 +11,7 @@ import psutil
 
 from massivora.alignment import (BinaryAlignment, SharedSourceError,
                                  check_shared_source_strategy,
-                                 resolve_shared_source)
+                                 resolve_run_table_cache, resolve_shared_source)
 from massivora.config import load_project_and_system_config
 from massivora.db import (STATUS, compute_file_hash, connect_db_rw,
                           get_hashed_file_path, get_table_names,
@@ -75,7 +75,7 @@ def _claim_batch(cfg, job_id, batch_size, table_name='couplings'):
 def _run_concatenate(task, monomers_path, output_dir, downsample=False,
                      downsample_to=30000, reweight=True, reweighting_threshold=0.8,
                      col_gap_threshold=0.5, n_threads=0, gpu_reweight=None,
-                     shared_source_strategy='skip', shared_source_cache='auto'):
+                     shared_source_strategy='skip', shared_source_cache=None):
     """
     Concatenate one pair of monomer alignments and write it to the output tree.
 
@@ -563,7 +563,8 @@ if __name__ == '__main__':
         col_gap_threshold=col_gap_threshold,
         n_threads=0 if use_gpu else reweight_threads,
         shared_source_strategy=shared_source_strategy,
-        shared_source_cache=str(concat_cfg.get('shared-source_cache', 'auto')).strip(),
+        shared_source_cache=resolve_run_table_cache(
+            concat_cfg.get('shared-source_cache', 'auto'), project_path),
     )
 
     workers = []

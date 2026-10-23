@@ -24,7 +24,7 @@ from dask.distributed import (Client, Nanny, Scheduler, SpecCluster,
 from massivora import cpp_bindings
 from massivora.alignment import (BinaryAlignment, SharedSourceError,
                                  check_shared_source_strategy,
-                                 resolve_shared_source)
+                                 resolve_run_table_cache, resolve_shared_source)
 from massivora.config import load_project_and_system_config
 from massivora.db import (STATUS, apply_cascade, compute_file_hash, connect_db_rw,
                           ensure_columns, get_db_path, get_hashed_file_path,
@@ -77,11 +77,13 @@ class BaseCouplingExecutor(object):
         # What concatenate() does with a pair that glues a sequence to itself
         self.shared_source_strategy = check_shared_source_strategy(
             config.get('concatenate').get('shared-source_strategy', 'skip'))
-        # 'auto': the monomers' shared-source run tables are kept on disk next
-        # to them (built once per protein); 'off': in memory per process only;
-        # a directory: kept there (tmpfs on a ZFS host, say)
-        self.shared_source_cache = str(
-            config.get('concatenate').get('shared-source_cache', 'auto')).strip()
+        # Where the monomers' shared-source run tables (built once per protein)
+        # are kept: 'auto' (default) under <project_path>/shared_source_cache,
+        # 'off' in memory per process, 'monomer' next to each monomer, or a
+        # directory (tmpfs on a ZFS host, say). The MSA tree is never written
+        # unless 'monomer' is asked for.
+        self.shared_source_cache = resolve_run_table_cache(
+            config.get('concatenate').get('shared-source_cache', 'auto'), project_path)
 
         coupling_cfg = config.get('couple')
         # False: pairs concatenated here are coupled from memory and not
@@ -167,7 +169,7 @@ class BaseCouplingExecutor(object):
         concatenated = _monomer(os.path.join(alignment_dir, pid1)) + \
             _monomer(os.path.join(alignment_dir, pid2))
         resolve_shared_source(concatenated, self.shared_source_strategy, pair_name,
-                              cache=getattr(self, 'shared_source_cache', 'auto'))
+                              cache=getattr(self, 'shared_source_cache', None))
         if downsample:
             concatenated.Downsample_Randomly(to=downsample_to)
         concatenated.Mask_Gap_Columns(self._config.get('align').get('col_gap_threshold', 0.5))

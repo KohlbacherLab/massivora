@@ -77,14 +77,23 @@ concatenate:
   #   skip: log the pair and mark it FAILED (default)
   #   fix:  remove those species and go on with the rest
   shared-source_strategy: skip
-  # The check uses each monomer's residue runs, computed once per protein.
-  #   auto: keep them on disk next to the monomer (shared_source_k10/), so
-  #         every process and run maps the same copy (default)
-  #   off:  keep them in memory, per process
-  #   a directory: keep them there, one subdirectory per monomer. Mapping the
-  #         tables is cheap on tmpfs (/dev/shm) and ext4/xfs, but not on ZFS:
-  #         there, point this at /dev/shm/<something> (about 3x the monomers'
-  #         size in RAM: 47 GB for the 1,554 H. pylori proteins)
+  # The check uses each monomer's residue runs (run tables), computed once
+  # per protein and saved so that every process and run maps the same copy.
+  # Each saved table carries a fingerprint of the monomer it was built from
+  # and is rebuilt when the monomer changes. Where they are kept:
+  #   auto:    <project_path>/shared_source_cache (default); the monomer
+  #            tree is never written
+  #   off:     in memory only, per process (every process builds the tables
+  #            of the monomers it meets: about 0.3 s per pair)
+  #   monomer: next to each monomer (<monomer>/shared_source_k10/); only for
+  #            an MSA tree this project owns and may write
+  #   a directory (relative to the project path): keep them there, one
+  #            subdirectory per monomer. Mapping the tables is cheap on tmpfs
+  #            (/dev/shm) and ext4/xfs, but not on ZFS or BeeGFS: there point
+  #            this at /dev/shm/<something> (about 3x the monomers' size in
+  #            RAM: 47 GB for the 1,554 H. pylori proteins)
+  # A location that cannot be written is logged once (WARNING) and the
+  # tables are then built in memory, as with 'off'.
   shared-source_cache: auto
   reweighting:
     enabled: true
