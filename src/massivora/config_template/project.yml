@@ -102,6 +102,10 @@ couple:
   eps_conv: 3e-4   # CPU path: NLopt f/x tolerance
   eps_g: 1e-3      # GPU path: stop a site on max |gradient| <= eps_g
   maxit: 200
+  fp16_history: false  # GPU path: L-BFGS history in fp16 (approximation, 1.12x)
+  # Screen profile (plmDCA after a cascade, ranking only): fp16_history: true,
+  # maxit: 50 and concatenate.downsample.to: 10000 run 1.7x faster and lost no
+  # detector hits on 60 random H. pylori screen pairs (top-L/5 contacts move more).
   fast_approximation: false
   site_batch: 24  # GPU: sites optimised in lockstep per pair (an upper bound)
 

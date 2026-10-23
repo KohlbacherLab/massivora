@@ -1936,6 +1936,8 @@ class PLMCouplingExecutorGPU(SessionGPUExecutor, BuiltinPLMCalibrator):
         # The GPU stops a site on ‖∇f‖∞ ≤ eps_g. eps_conv is NLopt's f/x
         # tolerance on the CPU path, a different rule, so it is not reused.
         self.eps_g = float(coupling_cfg.get('eps_g', 1e-3))
+        # fp16 L-BFGS history: 1.12x, an approximation (rounds the curvature pairs)
+        self.fp16_history = bool(coupling_cfg.get('fp16_history', False))
         # One Session per GPU, whatever couple.gpu_sessions (GaussDCA's) says:
         # one pair already saturates the GPU, so more Sessions only split its
         # L2 and bandwidth between them. Measured on an H100 over a
@@ -1973,7 +1975,8 @@ class PLMCouplingExecutorGPU(SessionGPUExecutor, BuiltinPLMCalibrator):
         if columns is not None:
             MSA = np.ascontiguousarray(MSA[:, columns])
         score = sess.score(MSA, W, params['q'], lambdaH=self.lambda_h, lambdaJ=self.lambda_J,
-                           maxeval=self.maxit, site_batch=params['site_batch'], eps_g=self.eps_g)
+                           maxeval=self.maxit, site_batch=params['site_batch'], eps_g=self.eps_g,
+                           fp16_history=self.fp16_history)
         params['stats'] = getattr(sess, 'last_stats', None)     # logged by collect_score
         return score
 

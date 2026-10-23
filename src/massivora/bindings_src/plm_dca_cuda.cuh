@@ -189,6 +189,31 @@ __device__ __forceinline__ float4 ld4(const float* p, int i) {
 __device__ __forceinline__ void st4(float* p, int i, float4 v) {
     reinterpret_cast<float4*>(p)[i] = v;
 }
+/* L-BFGS history element: float, or __half with Config::fp16_history (an
+ * APPROXIMATION: it rounds the curvature pairs, halving their traffic; 1.12x). */
+__device__ __forceinline__ float4 ldh4(const __half* p, int i) {
+    const uint2 u = reinterpret_cast<const uint2*>(p)[i];
+    const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
+    const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+__device__ __forceinline__ float4 sth4(__half* p, int i, float4 v) {
+    __half2 a = __floats2half2_rn(v.x, v.y), b = __floats2half2_rn(v.z, v.w);
+    uint2 u;
+    u.x = *reinterpret_cast<unsigned int*>(&a);
+    u.y = *reinterpret_cast<unsigned int*>(&b);
+    reinterpret_cast<uint2*>(p)[i] = u;
+    const float2 fa = __half22float2(a), fb = __half22float2(b);
+    return make_float4(fa.x, fa.y, fb.x, fb.y);     /* the values actually stored */
+}
+__device__ __forceinline__ float4 ldh4(const float* p, int i) {
+    return reinterpret_cast<const float4*>(p)[i];
+}
+__device__ __forceinline__ float4 sth4(float* p, int i, float4 v) {
+    reinterpret_cast<float4*>(p)[i] = v;
+    return v;
+}
+
 __device__ __forceinline__ float dot4(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
@@ -385,24 +410,24 @@ __global__ void k_trial(SlotArgs a, float* __restrict__ P0, float* __restrict__ 
 /* Accepted step, one pass: s_k = x_trial - x, y_k = g_trial - g into ring slot
  * head and accumulate s·y, y·y into acc[2s], acc[2s + 1]. The caller commits
  * x <- x_trial and g <- g_trial by flipping the slot's bank bit. */
+template <typename Hist>
 __global__ void k_accept(SlotArgs a, const float* __restrict__ P0, const float* __restrict__ P1,
                          const float* __restrict__ Q0, const float* __restrict__ Q1,
-                         float* __restrict__ sbuf, float* __restrict__ ybuf,
+                         Hist* __restrict__ sbuf, Hist* __restrict__ ybuf,
                          float* __restrict__ acc, int ns, int m) {
     const int e = blockIdx.y, s = a.slot[e];
     const float *x = PLM_X(e), *xt = PLM_XT(e), *g = PLM_G(e), *gt = PLM_GT(e);
-    float* sv = sbuf + ((size_t)s * m + a.head[e]) * ns;
-    float* yv = ybuf + ((size_t)s * m + a.head[e]) * ns;
+    Hist* sv = sbuf + ((size_t)s * m + a.head[e]) * ns;
+    Hist* yv = ybuf + ((size_t)s * m + a.head[e]) * ns;
     float lsy = 0.0f, lyy = 0.0f;
     PLM_GRID_STRIDE(i, ns / 4) {
         const float4 xn = ld4(xt, i), gn = ld4(gt, i);
         const float4 xo = ld4(x, i),  go = ld4(g, i);
         const float4 sd = make_float4(xn.x - xo.x, xn.y - xo.y, xn.z - xo.z, xn.w - xo.w);
         const float4 yd = make_float4(gn.x - go.x, gn.y - go.y, gn.z - go.z, gn.w - go.w);
-        st4(sv, i, sd);
-        st4(yv, i, yd);
-        lsy += dot4(sd, yd);
-        lyy += dot4(yd, yd);
+        const float4 sr = sth4(sv, i, sd), yr = sth4(yv, i, yd);
+        lsy += dot4(sr, yr);
+        lyy += dot4(yr, yr);
     }
     lsy = block_sum(lsy);
     lyy = block_sum(lyy);
@@ -436,10 +461,11 @@ __global__ void k_curvature(SlotArgs a, const float* __restrict__ acc,
  * σ_j is the j-th newest pair, τ_j = σ_{c-1-j} the j-th oldest. With c = 0 the
  * single step t = 0 leaves dir = -g. Per-slot scratch sc (2m + 3 floats):
  * [a1 (m), a2 (m), g·g, ‖g‖∞, gᵀd], zeroed before t = 0. */
+template <typename Hist>
 __global__ void k_twoloop(SlotArgs a, int t, const float* __restrict__ Q0,
                           const float* __restrict__ Q1, float* __restrict__ P0,
                           float* __restrict__ P1, float* __restrict__ dir,
-                          const float* __restrict__ sbuf, const float* __restrict__ ybuf,
+                          const Hist* __restrict__ sbuf, const Hist* __restrict__ ybuf,
                           const float* __restrict__ rho_hist, const float* __restrict__ gamma,
                           float* __restrict__ scr, int ns, int m) {
     const int e = blockIdx.y, s = a.slot[e], c = a.count[e], h = a.head[e];
@@ -450,13 +476,13 @@ __global__ void k_twoloop(SlotArgs a, int t, const float* __restrict__ Q0,
     const float* gs = PLM_G(e);
     float*       d  = dir + base;
     float*       sc = scr + (size_t)s * (2 * m + 3);
-    const float* S0 = sbuf + (size_t)s * m * ns;
-    const float* Y0 = ybuf + (size_t)s * m * ns;
+    const Hist* S0 = sbuf + (size_t)s * m * ns;
+    const Hist* Y0 = ybuf + (size_t)s * m * ns;
     const float* rh = rho_hist + (size_t)s * m;
     auto sigma = [&](int j) { return (h - 1 - j + 2 * m) % m; };
 
     if (t == 0) {
-        const float* sv = (c > 0) ? S0 + (size_t)sigma(0) * ns : nullptr;
+        const Hist* sv = (c > 0) ? S0 + (size_t)sigma(0) * ns : nullptr;
         float l_dot = 0.0f, l_gg = 0.0f, l_max = 0.0f;
         PLM_GRID_STRIDE(i, n4) {
             const float4 gi = ld4(gs, i);
@@ -464,7 +490,7 @@ __global__ void k_twoloop(SlotArgs a, int t, const float* __restrict__ Q0,
             l_gg += dot4(gi, gi);
             l_max = fmaxf(l_max, fmaxf(fmaxf(fabsf(gi.x), fabsf(gi.y)),
                                        fmaxf(fabsf(gi.z), fabsf(gi.w))));
-            if (c > 0) l_dot -= dot4(ld4(sv, i), gi);
+            if (c > 0) l_dot -= dot4(ldh4(sv, i), gi);
         }
         l_dot = block_sum(l_dot);
         l_gg  = block_sum(l_gg);
@@ -482,23 +508,23 @@ __global__ void k_twoloop(SlotArgs a, int t, const float* __restrict__ Q0,
     if (t < c) {
         const int sp = sigma(t - 1);
         const float alpha = rh[sp] * sc[t - 1];
-        const float* yp = Y0 + (size_t)sp * ns;
-        const float* sv = S0 + (size_t)sigma(t) * ns;
+        const Hist* yp = Y0 + (size_t)sp * ns;
+        const Hist* sv = S0 + (size_t)sigma(t) * ns;
         PLM_GRID_STRIDE(i, n4) {
-            const float4 dv = ld4(d, i), y = ld4(yp, i);
+            const float4 dv = ld4(d, i), y = ldh4(yp, i);
             const float4 qv = make_float4(dv.x - alpha * y.x, dv.y - alpha * y.y,
                                           dv.z - alpha * y.z, dv.w - alpha * y.w);
             st4(d, i, qv);
-            l += dot4(ld4(sv, i), qv);
+            l += dot4(ldh4(sv, i), qv);
         }
         out = &sc[t];
     } else if (t == c) {
         const int sp = sigma(c - 1);                 /* newest-last == oldest */
         const float alpha = rh[sp] * sc[c - 1];
         const float gm = gamma[s];
-        const float* yp = Y0 + (size_t)sp * ns;
+        const Hist* yp = Y0 + (size_t)sp * ns;
         PLM_GRID_STRIDE(i, n4) {
-            const float4 dv = ld4(d, i), y = ld4(yp, i);
+            const float4 dv = ld4(d, i), y = ldh4(yp, i);
             const float4 rv = make_float4(gm * (dv.x - alpha * y.x), gm * (dv.y - alpha * y.y),
                                           gm * (dv.z - alpha * y.z), gm * (dv.w - alpha * y.w));
             st4(d, i, rv);
@@ -509,8 +535,8 @@ __global__ void k_twoloop(SlotArgs a, int t, const float* __restrict__ Q0,
         const int j  = t - c;                        /* 1 .. c */
         const int tp = sigma(c - j);                 /* τ_{j-1} */
         const float coef = rh[tp] * sc[c - j] - rh[tp] * sc[m + j - 1];
-        const float* sp = S0 + (size_t)tp * ns;
-        const float* dv = (j < c) ? Y0 + (size_t)sigma(c - 1 - j) * ns : gs;
+        const Hist* sp = S0 + (size_t)tp * ns;
+        const Hist* dvh = (j < c) ? Y0 + (size_t)sigma(c - 1 - j) * ns : nullptr;
         /* The last pass also writes the trial point x + dir: with history the
          * step is 1 (z.step is 1 once iter > 0, and c > 0 implies iter > 0).
          * A slot that then needs the -g fallback gets k_trial again. */
@@ -518,11 +544,11 @@ __global__ void k_twoloop(SlotArgs a, int t, const float* __restrict__ Q0,
         const float* xs = fuse ? PLM_X(e) : nullptr;
         float* xts = fuse ? PLM_XT(e) : nullptr;
         PLM_GRID_STRIDE(i, n4) {
-            const float4 d0 = ld4(d, i), sx = ld4(sp, i);
+            const float4 d0 = ld4(d, i), sx = ldh4(sp, i);
             const float4 rv = make_float4(d0.x + coef * sx.x, d0.y + coef * sx.y,
                                           d0.z + coef * sx.z, d0.w + coef * sx.w);
             st4(d, i, rv);
-            l += dot4(ld4(dv, i), rv);
+            l += dot4(dvh ? ldh4(dvh, i) : ld4(gs, i), rv);
             if (fuse) {
                 const float4 u = ld4(xs, i);
                 st4(xts, i, make_float4(u.x + rv.x, u.y + rv.y, u.z + rv.z, u.w + rv.w));
@@ -698,6 +724,7 @@ struct Config {
     float lambdaJ = 0.01f;
     int   maxeval = 200;    // L-BFGS iterations per site (couple.maxit)
     float eps_g = 1e-3f;    // stop on ‖∇f‖∞ ≤ eps_g (couple.eps_g)
+    bool  fp16_history = false;  // L-BFGS s/y history in fp16 (couple.fp16_history; approximation)
     int   site_batch = 24;  // upper bound on sites in lockstep (see Session::slots)
 };
 
@@ -892,6 +919,7 @@ struct Solver {
     const float*       W = nullptr;        /* (B,)   device */
     int   B = 0, N = 0, q = 0, maxeval = 0;
     float eps_g = 0.0f;
+    bool  fp16_history = false;            /* s/y rings in __half (Config::fp16_history) */
     float lambdaH = 0.0f, lambdaJ = 0.0f;
 
     /* geometry */
@@ -902,7 +930,8 @@ struct Solver {
     __half *X = nullptr, *JT = nullptr, *V = nullptr, *J = nullptr;
     float  *E = nullptr, *G = nullptr, *h_eval = nullptr;
     float  *x = nullptr, *xt = nullptr, *g = nullptr, *gt = nullptr, *dir = nullptr;
-    float  *sbuf = nullptr, *ybuf = nullptr, *rho = nullptr, *gamma = nullptr;
+    void   *sbuf = nullptr, *ybuf = nullptr;  /* float or __half (fp16_history) */
+    float  *rho = nullptr, *gamma = nullptr;
     float  *scratch = nullptr, *parts = nullptr, *gh = nullptr, *acc = nullptr, *scr = nullptr;
 
     std::vector<SlotState> st;
@@ -965,15 +994,15 @@ inline void Solver::evaluate(int n_active) {
  * Both banks of x and g move: which array of each pair holds the current
  * point depends on the slot's bank bit, which moves with st[]. */
 inline void Solver::move_slot(int src, int dst) {
-    const size_t v = (size_t)ns * sizeof(float), h = (size_t)m * v;
+    const size_t v = (size_t)ns * sizeof(float),
+                 h = (size_t)m * ns * (fp16_history ? sizeof(__half) : sizeof(float));
     float* vecs[] = {x, xt, g, gt, dir};
     for (float* p : vecs)
         PLM_CUDA(cudaMemcpyAsync(p + (size_t)dst * ns, p + (size_t)src * ns, v,
                                  cudaMemcpyDeviceToDevice, stream));
-    PLM_CUDA(cudaMemcpyAsync(sbuf + (size_t)dst * m * ns, sbuf + (size_t)src * m * ns, h,
-                             cudaMemcpyDeviceToDevice, stream));
-    PLM_CUDA(cudaMemcpyAsync(ybuf + (size_t)dst * m * ns, ybuf + (size_t)src * m * ns, h,
-                             cudaMemcpyDeviceToDevice, stream));
+    char *sb = static_cast<char*>(sbuf), *yb = static_cast<char*>(ybuf);
+    PLM_CUDA(cudaMemcpyAsync(sb + dst * h, sb + src * h, h, cudaMemcpyDeviceToDevice, stream));
+    PLM_CUDA(cudaMemcpyAsync(yb + dst * h, yb + src * h, h, cudaMemcpyDeviceToDevice, stream));
     PLM_CUDA(cudaMemcpyAsync(rho + dst * m, rho + src * m, m * sizeof(float),
                              cudaMemcpyDeviceToDevice, stream));
     PLM_CUDA(cudaMemcpyAsync(gamma + dst, gamma + src, sizeof(float),
@@ -1054,8 +1083,12 @@ inline void Solver::optimize() {
         }
 
         if (accept.n) {
-            k_accept<<<vec_grid(accept), kThreads, 0, stream>>>(
-                accept, x, xt, g, gt, sbuf, ybuf, acc, ns, m);  /* old bank */
+            if (fp16_history)
+                k_accept<<<vec_grid(accept), kThreads, 0, stream>>>(
+                    accept, x, xt, g, gt, (__half*)sbuf, (__half*)ybuf, acc, ns, m);  /* old bank */
+            else
+                k_accept<<<vec_grid(accept), kThreads, 0, stream>>>(
+                    accept, x, xt, g, gt, (float*)sbuf, (float*)ybuf, acc, ns, m);
             k_curvature<<<1, kMaxSlots, 0, stream>>>(accept, acc, rho, gamma, m);
         }
 
@@ -1064,9 +1097,16 @@ inline void Solver::optimize() {
             PLM_CUDA(cudaMemsetAsync(scr, 0, (size_t)S * sw * sizeof(float), stream));
             int cmax = 0;
             for (int e = 0; e < need_dir.n; ++e) cmax = std::max(cmax, need_dir.count[e]);
-            for (int t = 0; t <= 2 * cmax; ++t)
-                k_twoloop<<<vec_grid(need_dir), kThreads, 0, stream>>>(
-                    need_dir, t, g, gt, x, xt, dir, sbuf, ybuf, rho, gamma, scr, ns, m);
+            for (int t = 0; t <= 2 * cmax; ++t) {
+                if (fp16_history)
+                    k_twoloop<<<vec_grid(need_dir), kThreads, 0, stream>>>(
+                        need_dir, t, g, gt, x, xt, dir, (const __half*)sbuf, (const __half*)ybuf,
+                        rho, gamma, scr, ns, m);
+                else
+                    k_twoloop<<<vec_grid(need_dir), kThreads, 0, stream>>>(
+                        need_dir, t, g, gt, x, xt, dir, (const float*)sbuf, (const float*)ybuf,
+                        rho, gamma, scr, ns, m);
+            }
             PLM_CUDA(cudaMemcpyAsync(h_scr, scr, (size_t)n_active * sw * sizeof(float),
                                      cudaMemcpyDeviceToHost, stream));
             PLM_CUDA(cudaGetLastError());
@@ -1464,6 +1504,7 @@ inline void Session::run_pair(PairArena& arena, const int8_t* MSA, const double*
     sv.B = B; sv.N = N; sv.q = q;
     sv.maxeval = cfg.maxeval;
     sv.eps_g   = cfg.eps_g;
+    sv.fp16_history = cfg.fp16_history;
     sv.lambdaH = cfg.lambdaH;
     sv.lambdaJ = cfg.lambdaJ;
     sv.S = slots(device_, B, N, q, cfg.site_batch, l2_share_);
@@ -1510,8 +1551,13 @@ inline void Session::run_pair(PairArena& arena, const int8_t* MSA, const double*
     sv.g      = arena.get<float>(Sn);
     sv.gt     = arena.get<float>(Sn);
     sv.dir    = arena.get<float>(Sn);
-    sv.sbuf   = arena.get<float>(Sn * sv.m);
-    sv.ybuf   = arena.get<float>(Sn * sv.m);
+    if (sv.fp16_history) {
+        sv.sbuf = arena.get<__half>(Sn * sv.m);
+        sv.ybuf = arena.get<__half>(Sn * sv.m);
+    } else {
+        sv.sbuf = arena.get<float>(Sn * sv.m);
+        sv.ybuf = arena.get<float>(Sn * sv.m);
+    }
     sv.rho    = arena.get<float>((size_t)sv.S * sv.m);
     sv.gamma  = arena.get<float>((size_t)sv.S);
     sv.scratch = arena.get<float>(sv.scratch_floats());
