@@ -607,10 +607,27 @@ def apply_cascade(cfg: dict):
 
     With `couple.cascade` set, only the `keep_fraction` best-ranked DONE pairs
     of the source run stay claimable; every other pair the source scored is
-    marked SKIPPED. Pairs the source did not finish stay claimable, since
-    nothing ranks them. Only NOOPT and SKIPPED rows change, so running,
-    finished and retried pairs are left alone. Idempotent, and a larger
-    `keep_fraction` hands skipped pairs back, so every worker calls it at start.
+    marked SKIPPED. With `min_neffoverL` set, kept pairs whose source
+    `neffoverL` (Beff / L of the concatenated alignment) is below it are
+    marked SKIPPED as well: below Beff / L ~ 0.1 the detector fires on 6-7 %
+    of labelled negatives and 3 % of labelled positives (its design FPR is
+    0.1 %), so a call there is an artefact of the shallow alignment.
+
+    A source row with NULL `neffoverL`, or a source table without the column,
+    is never gated; both are logged at WARNING with counts, because a gate
+    that gates nothing costs 2-3x the GPU time it was set to save.
+
+    Pairs the source did not finish are not ranked, so by default they stay
+    claimable at full cost. `skip_unranked` (default false) marks them SKIPPED
+    instead. That is a coverage decision, not a depth gate -- on the H. pylori
+    screen those 12,457 FAILED rows have median B 7,129, i.e. they are the deep
+    pairs the gate exists to protect -- so it is a separate key and off by
+    default. RUNNING rows are never skipped: the source may still be working on
+    them, and every worker calls apply_cascade at start.
+
+    Only NOOPT and SKIPPED rows change, so running, finished and retried pairs
+    are left alone. Idempotent, and a larger `keep_fraction` or a lower gate
+    hands skipped pairs back, so every worker calls it at start.
 
     Parameters
     ----------
@@ -618,12 +635,16 @@ def apply_cascade(cfg: dict):
         Configuration dict. `couple.cascade` keys: `source_db` (SQLite file of
         the GaussDCA run, relative to project_path; default this project's DB),
         `source_table` (default `couple.db_table`), `keep_fraction` (default
-        0.30) and `rank_by` (a key of `CASCADE_RANKS`, default `log_lr_raw`)
+        0.30), `rank_by` (a key of `CASCADE_RANKS`, default `log_lr_raw`),
+        `min_neffoverL` (float, default None: no depth gate) and
+        `skip_unranked` (bool, default False: pairs the source never finished
+        stay claimable)
 
     Returns
     -------
     `tuple` or `None`
-        (pairs ranked, pairs kept, rows changed), or None without a cascade
+        (pairs ranked, pairs kept, rows changed), or None without a cascade;
+        "kept" counts the ranked pairs that stay claimable after the gate
     """
     cascade = (cfg.get('couple') or {}).get('cascade')
     if not cascade:
@@ -634,6 +655,12 @@ def apply_cascade(cfg: dict):
     rank_by = cascade.get('rank_by', 'log_lr_raw')
     if rank_by not in CASCADE_RANKS:
         raise ValueError(f"couple.cascade.rank_by must be one of {sorted(CASCADE_RANKS)}, got {rank_by!r}")
+    gate = cascade.get('min_neffoverL')
+    if gate is not None:
+        gate = float(gate)
+        if not gate >= 0.0:
+            raise ValueError(f"couple.cascade.min_neffoverL must be >= 0 or null, got {gate}")
+    skip_unfinished = bool(cascade.get('skip_unranked', False))
 
     couple_table = get_table_names(cfg)['couplings']
     source_table = cascade.get('source_table', couple_table)
@@ -648,15 +675,52 @@ def apply_cascade(cfg: dict):
     src = connect_db_ro(source_cfg)
     try:
         cur = src.cursor()
+        quoted_source = quote_identifier(source_table)
+        # An older source DB may predate the neffoverL column: then nothing is gated
+        cur.execute(f"SELECT * FROM {quoted_source} LIMIT 0")
+        has_depth = 'neffoverL' in {d[0] for d in cur.description}
+        depth_col = 'neffoverL' if has_depth else 'NULL'
         cur.execute(
-            f"SELECT name FROM {quote_identifier(source_table)} WHERE status = ? "
+            f"SELECT name, {depth_col} FROM {quoted_source} WHERE status = ? "
             f"ORDER BY {CASCADE_RANKS[rank_by]}, id",
             (STATUS['DONE'],))
-        ranked = [row[0] for row in cur.fetchall()]
+        ranked = cur.fetchall()
+        unranked = []
+        if skip_unfinished:
+            # RUNNING is deliberately excluded: a source worker may still be on that
+            # pair, and every worker calls apply_cascade at start, so skipping RUNNING
+            # would make the kept set depend on who ran when (fused mode races).
+            cur.execute(
+                f"SELECT name FROM {quoted_source} "
+                f"WHERE status IS NOT NULL AND status NOT IN (?, ?)",
+                (STATUS['DONE'], STATUS['RUNNING']))
+            unranked = [row[0] for row in cur.fetchall()]
     finally:
         src.close()
     n_keep = math.ceil(fraction * len(ranked))
-    skip = set(ranked[n_keep:])
+    skip_rank = {name for name, _ in ranked[n_keep:]}
+    skip_depth = set()
+    ungated = 0
+    if gate is not None:
+        skip_depth = {name for name, depth in ranked[:n_keep]
+                      if depth is not None and float(depth) < gate}
+        ungated = sum(1 for _, depth in ranked[:n_keep] if depth is None)
+    skip_unranked = set(unranked)
+    skip = skip_rank | skip_depth | skip_unranked
+
+    # A gate that silently gates nothing is a 2-3x cost blowout, not a no-op: on the
+    # H. pylori screen the top 20 % is 238,721 pairs (50.7 model h) against 76,212
+    # (22.6 h) gated. Say so loudly rather than in an info line nobody reads.
+    if gate is not None and not has_depth:
+        logging.warning(
+            f"couple.cascade.min_neffoverL = {gate:g} is set, but source table "
+            f"{source_table} has no neffoverL column: NO pair is gated by depth and all "
+            f"{n_keep} ranked pairs stay claimable. Re-run the source so it stores "
+            f"neffoverL, or remove the gate.")
+    elif gate is not None and ungated:
+        logging.warning(
+            f"couple.cascade.min_neffoverL = {gate:g}: {ungated} of {n_keep} kept pairs "
+            f"have NULL neffoverL in {source_table} and are NOT gated by depth.")
 
     table = quote_identifier(couple_table)
     conn = connect_db_rw(cfg)
@@ -674,6 +738,11 @@ def apply_cascade(cfg: dict):
         conn.commit()
     finally:
         conn.close()
-    logging.info(f"cascade: keeping {n_keep} of {len(ranked)} GaussDCA pairs from "
-                 f"{source_table} (top {fraction:g} by {rank_by}); {len(changes)} rows changed")
-    return len(ranked), n_keep, len(changes)
+    kept = n_keep - len(skip_depth)
+    logging.info(f"cascade: keeping {kept} of {len(ranked)} GaussDCA pairs from "
+                 f"{source_table} (top {fraction:g} by {rank_by}"
+                 + (f", neffoverL >= {gate:g}" if gate is not None else "") + "); "
+                 f"skipped by rank {len(skip_rank)}, by depth {len(skip_depth)}, "
+                 f"unfinished-in-source {len(skip_unranked)}, ungated (NULL depth) {ungated}"
+                 + f"; {len(changes)} rows changed")
+    return len(ranked), kept, len(changes)

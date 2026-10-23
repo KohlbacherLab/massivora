@@ -601,7 +601,13 @@ def fix_zombie_tasks(cfg, command):
                 new_status = STATUS['DONE']
                 # Backfill any metric the executor never got to write (its
                 # completion update was lost), leaving present values untouched.
+                # A calibrator key that is not a selected column is ignored
+                # rather than raising IndexError and aborting the recovery.
+                selected = set(r.keys())
                 for col, val in result.items():
+                    if col not in selected:
+                        logging.debug(f"zombie recovery: ignoring {col!r}, not a task column")
+                        continue
                     if val is not None and r[col] is None:
                         set_clauses.append(f"{col} = ?")
                         values.append(val)

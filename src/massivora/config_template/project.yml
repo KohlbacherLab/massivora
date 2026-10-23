@@ -146,12 +146,43 @@ couple:
   keep_concatenated: true
 
   # Cascade: couple only the best pairs of a finished GaussDCA run; the rest
-  # are marked SKIPPED. Pairs the GaussDCA run did not finish are still coupled.
+  # are marked SKIPPED. Pairs the GaussDCA run did not finish are still
+  # coupled, unless skip_unranked is set.
   # cascade:
   #   source_db: gauss.sqlite3  # DB of the GaussDCA run (default: this project's DB)
   #   source_table: couplings   # its couplings table (default: couple.db_table)
   #   keep_fraction: 0.30       # share of the GaussDCA-scored pairs to couple
   #   rank_by: log_lr_raw       # or high_precision_hit (detector hits first)
+  #   min_neffoverL: null       # depth gate on the kept pairs (see below)
+  #   skip_unranked: false      # also skip pairs the GaussDCA run never finished
+  #
+  # min_neffoverL: kept pairs whose GaussDCA row has neffoverL (Beff / L of
+  # the concatenated alignment) below it are SKIPPED too. null (default) keeps
+  # today's behaviour. A source row with NULL neffoverL, or a source table
+  # without the column, is NOT gated; both are logged at WARNING, because a
+  # gate that gates nothing costs 2-3x the GPU time it was set to save.
+  # Below Beff / L = 0.1 the plmDCA detector is an artefact of the shallow
+  # alignment: on labelled he2021 negatives subsampled to that depth it fires
+  # on 6.0-6.7 % (its design FPR is 0.1 %), on labelled positives on 3 %
+  # (37 of 38 true hits vanish), and log_lr_raw ranks at chance (AUC 0.56-0.57);
+  # in situ it calls 12.7 % of random screen pairs below the gate against
+  # 0.52 % above it, at a PPI prior of ~1e-3. On the H. pylori screen 72 % of
+  # the top-16 % pairs sit there and take 61 % of the plmDCA hours.
+  # keep_fraction 0.20 with min_neffoverL 0.1 shows no detectable loss of
+  # labelled benchmark recall against the ungated top 16 % (plm top-5 %
+  # positives 91 -> 91 %, detector hits 84 -> 86 %; CIs admit up to ~10 points,
+  # and the benchmark holds only 13 of 4,545 pairs below the gate) at 1.6x less
+  # plmDCA time. The threshold is bracketed by the labelled bands to
+  # [0.05, 0.34]; 0.1 is the low end, i.e. the conservative choice.
+  # State the gate in Methods; apply the same criterion to reported GaussDCA
+  # calls.
+  #
+  # skip_unranked: pairs the GaussDCA run never finished (FAILED; RUNNING rows
+  # are never skipped) are unranked, so by default they stay claimable at full
+  # cost. true marks them SKIPPED. This is a coverage decision, not a depth
+  # gate: on the H. pylori screen those 12,457 rows have median B 7,129, i.e.
+  # they are the deep pairs the gate exists to protect, and their hit loss is
+  # unmeasured. Prefer finishing the source run.
 
   # Applies when one wants to split the calculation to multiple clusters
   # portion: 1.0
