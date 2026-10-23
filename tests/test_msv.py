@@ -1066,7 +1066,7 @@ def _fake_gpu_executor(couple, monkeypatch, cfg, depth=lambda pair: 4):
                  'lengthes': lengthes})
 
     monkeypatch.setattr(executor, 'load_pair_arrays', load_pair_arrays)
-    monkeypatch.setattr(executor, 'Calibrate', lambda analyzer, n_eff: {'pcontact': 0.25, 'log_lr_raw': 0.0})
+    monkeypatch.setattr(executor, 'Calibrate', lambda analyzer, n_eff: {'pcontact': 0.25})
     return executor
 
 
