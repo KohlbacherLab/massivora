@@ -121,7 +121,8 @@ couple:
   #   source_db: gauss.sqlite3  # DB of the GaussDCA run (default: this project's DB)
   #   source_table: couplings   # its couplings table (default: couple.db_table)
   #   keep_fraction: 0.30       # share of the GaussDCA-scored pairs to couple
-  #   rank_by: log_lr_raw       # or high_precision_hit (detector hits first)
+  #   rank_by: log_lr_raw       # high_precision_hit (detector hits first), or cascade_score
+  #                             # (ranker; keep_fraction 0.16 keeps what log_lr_raw keeps at 0.30)
 
   # Applies when one wants to split the calculation to multiple clusters
   # portion: 1.0

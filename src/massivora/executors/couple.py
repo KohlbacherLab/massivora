@@ -32,6 +32,7 @@ from massivora.utils import (SHM_PREFIX, ShardWriter, compute_id_range,
                              gpu_is_available, massivora_pkg_dir,
                              saved_columns_to_bitmask, setup_logging,
                              visible_gpu_devices, worker_id)
+from massivora.ranker import cascade_score
 from massivora.analyzer import (BuiltinGaussCalibrator, BuiltinPLMCalibrator,
                                 ComplexAnalyzer)
 
@@ -254,6 +255,7 @@ class BaseCouplingExecutor(object):
                         log_lr_raw = ?,
                         confidence_flag = ?,
                         high_precision_hit = ?,
+                        cascade_score = ?,
                         file_hash = ?,
                         score_file_id = ?,
                         score_offset = ?,
@@ -273,6 +275,7 @@ class BaseCouplingExecutor(object):
                             x.get('log_lr_raw', 0),
                             x.get('confidence_flag', False),
                             x.get('high_precision_hit', False),
+                            x.get('cascade_score'),
                             x.get('file_hash'),
                             x.get('score_file_id'),
                             x.get('score_offset'),
@@ -1298,6 +1301,8 @@ class GaussCouplingExecutor(BaseCouplingExecutor, BuiltinGaussCalibrator):
             'number': int(params["B"]),
             'file_hash': params.get("file_hash"),
             **calibrated,
+            'cascade_score': cascade_score(analyzer, self, params["Beff"], params["B"],
+                                           calibrated['log_lr_raw']),
             **self._score_fields(score, params),
         }
         try:
@@ -1906,6 +1911,8 @@ class GaussCouplingExecutorGPU(SessionGPUExecutor, BuiltinGaussCalibrator):
             'number': int(params['B']),
             'file_hash': params['file_hash'],
             **calibrated,
+            'cascade_score': cascade_score(analyzer, self, params['Beff'], params['B'],
+                                           calibrated['log_lr_raw']),
             **self._score_fields(s16, params),
         }
 

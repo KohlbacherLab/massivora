@@ -458,6 +458,7 @@ def ensure_columns(cfg: dict):
     add_col(tables['couplings'], 'log_lr_raw REAL')
     add_col(tables['couplings'], 'confidence_flag BOOLEAN')
     add_col(tables['couplings'], 'high_precision_hit BOOLEAN')
+    add_col(tables['couplings'], 'cascade_score REAL')
     add_col(tables['alignments'], 'job_id TEXT')
     add_col(tables['alignments'], 'claimed_at REAL')
 
@@ -544,6 +545,7 @@ def create_job_db(cfg: dict):
         log_lr_raw REAL,
         confidence_flag BOOLEAN,
         high_precision_hit BOOLEAN,
+        cascade_score REAL,
         status INTEGER,
         job_id TEXT,
         claimed_at REAL,
@@ -592,12 +594,15 @@ def create_job_db(cfg: dict):
 
 
 
-# ORDER BY clauses `couple.cascade.rank_by` may choose from.
-# The 0.30 default keeps ~97 % of plmDCA's top-5 % calls on the he2021 benchmark
-# and H. pylori, at ~4.5x less screen compute; 0.16 keeps only ~90 % (8.3x).
+# ORDER BY clauses `couple.cascade.rank_by` may choose from; each key is a column.
+# By log_lr_raw, the 0.30 default keeps ~97 % of plmDCA's top-5 % calls on the
+# he2021 benchmark and H. pylori, at ~4.5x less screen compute; 0.16 keeps only
+# ~90 % (8.3x). cascade_score (massivora.ranker) keeps as much at 0.16 as
+# log_lr_raw at 0.30, at about half the plmDCA cost.
 CASCADE_RANKS = {
     'log_lr_raw': 'log_lr_raw DESC',
     'high_precision_hit': 'high_precision_hit DESC, log_lr_raw DESC',
+    'cascade_score': 'cascade_score DESC',
 }
 
 
@@ -649,7 +654,10 @@ def apply_cascade(cfg: dict):
     try:
         cur = src.cursor()
         cur.execute(
-            f"SELECT name FROM {quote_identifier(source_table)} WHERE status = ? "
+            # Rows without the score (cascade_score of a run older than the
+            # ranker) are left unranked, so they stay claimable
+            f"SELECT name FROM {quote_identifier(source_table)} "
+            f"WHERE status = ? AND {rank_by} IS NOT NULL "
             f"ORDER BY {CASCADE_RANKS[rank_by]}, id",
             (STATUS['DONE'],))
         ranked = [row[0] for row in cur.fetchall()]

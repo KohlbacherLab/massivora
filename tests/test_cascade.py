@@ -66,6 +66,17 @@ def test_detector_ranking_puts_hits_first(project):
     assert st['p9'] == st['p0'] == STATUS['NOOPT'] and st['p2'] == STATUS['SKIPPED']
 
 
+def test_ranker_score_ranks_and_unscored_pairs_stay_claimable(project):
+    conn = sqlite3.connect(project / 'gauss.sqlite3')
+    # Ranker reverses the log_lr_raw order; p0 has no score (run before the ranker)
+    conn.executemany("UPDATE couplings SET cascade_score = ? WHERE name = ?",
+                     [(float(i), f'p{i}') for i in range(1, 10)])
+    conn.commit()
+    assert apply_cascade(_cfg(project, keep_fraction=0.25, rank_by='cascade_score'))[:2] == (9, 3)
+    st = _status(project / 'plm.sqlite3')
+    assert [n for n, s in sorted(st.items()) if s == STATUS['NOOPT']] == ['p0', 'p7', 'p8', 'p9', 'px']
+
+
 def test_skipped_pairs_count_as_finished(project):
     cfg = _cfg(project, keep_fraction=0.3)
     apply_cascade(cfg)
