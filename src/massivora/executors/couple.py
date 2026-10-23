@@ -78,9 +78,10 @@ class BaseCouplingExecutor(object):
         self.shared_source_strategy = check_shared_source_strategy(
             config.get('concatenate').get('shared-source_strategy', 'skip'))
         # 'auto': the monomers' shared-source run tables are kept on disk next
-        # to them (built once per protein); 'off': in memory per process only
+        # to them (built once per protein); 'off': in memory per process only;
+        # a directory: kept there (tmpfs on a ZFS host, say)
         self.shared_source_cache = str(
-            config.get('concatenate').get('shared-source_cache', 'auto')).lower()
+            config.get('concatenate').get('shared-source_cache', 'auto')).strip()
 
         coupling_cfg = config.get('couple')
         # False: pairs concatenated here are coupled from memory and not

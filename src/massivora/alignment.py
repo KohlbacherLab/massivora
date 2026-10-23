@@ -208,6 +208,7 @@ class RunTable(object):
             return True
         tmp = f'{directory}.{os.getpid()}.tmp'
         try:
+            os.makedirs(path, exist_ok=True)
             os.makedirs(tmp, exist_ok=True)
             np.save(os.path.join(tmp, 'codes.npy'), np.ascontiguousarray(self.codes))
             np.save(os.path.join(tmp, 'offsets.npy'), np.ascontiguousarray(self.offsets))
@@ -1021,8 +1022,7 @@ class BinaryAlignment(object):
         table = self._run_table
         if table is not None and table.k == int(k) and table.shape == self.matrix.shape:
             return table
-        cache = str(cache).lower() if cache is not None else 'off'
-        path = self._path if cache != 'off' else None
+        path = self.run_table_path(cache)
         table = RunTable.load(path, k, self.matrix.shape) if path else None
         if table is None:
             rows = np.asarray(self.species_index_map if len(self.species_index_map) else
@@ -1032,6 +1032,22 @@ class BinaryAlignment(object):
                 table.save(path)
         self._run_table = table
         return table
+
+    def run_table_path(self, cache='auto'):
+        """
+        Where this alignment's run tables are kept: 'auto' puts them next to
+        the alignment, 'off' keeps them in memory only (None), and any other
+        value is a directory that holds one subdirectory per alignment name
+        (on a file system where mapping is cheap, such as tmpfs; ZFS is not).
+        """
+        if cache is None or self._path is None:
+            return None
+        mode = str(cache).strip()
+        if mode.lower() == 'off':
+            return None
+        if mode.lower() == 'auto':
+            return self._path
+        return os.path.join(mode, os.path.basename(os.path.normpath(self._path)))
 
     def _shared_rows(self, k=10, cache='auto'):
         """One boolean per row but the query: whether its two halves share a
@@ -1114,7 +1130,8 @@ class BinaryAlignment(object):
             Share of species from which the pair counts as shared-source (default: `0.05`)
         `cache` — str (optional)
             'auto' keeps the monomers' run tables next to them on disk, 'off'
-            keeps them in memory only (default: `'auto'`)
+            keeps them in memory only, anything else is a directory to keep
+            them in, one subdirectory per monomer (default: `'auto'`)
 
         Returns
         -------

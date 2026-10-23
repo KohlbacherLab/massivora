@@ -563,7 +563,7 @@ if __name__ == '__main__':
         col_gap_threshold=col_gap_threshold,
         n_threads=0 if use_gpu else reweight_threads,
         shared_source_strategy=shared_source_strategy,
-        shared_source_cache=str(concat_cfg.get('shared-source_cache', 'auto')).lower(),
+        shared_source_cache=str(concat_cfg.get('shared-source_cache', 'auto')).strip(),
     )
 
     workers = []

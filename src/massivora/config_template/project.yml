@@ -81,6 +81,10 @@ concatenate:
   #   auto: keep them on disk next to the monomer (shared_source_k10/), so
   #         every process and run maps the same copy (default)
   #   off:  keep them in memory, per process
+  #   a directory: keep them there, one subdirectory per monomer. Mapping the
+  #         tables is cheap on tmpfs (/dev/shm) and ext4/xfs, but not on ZFS:
+  #         there, point this at /dev/shm/<something> (about 3x the monomers'
+  #         size in RAM: 47 GB for the 1,554 H. pylori proteins)
   shared-source_cache: auto
   reweighting:
     enabled: true
