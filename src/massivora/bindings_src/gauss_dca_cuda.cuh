@@ -26,7 +26,8 @@
 //
 // The extra NQ x NQ buffer is the price. Device memory is 2 x NQ^2 x
 // sizeof(CovScalar), which for the widest alignment in a typical proteome run
-// (N ~ 500, NQ ~ 10k) is 0.8 GB of the card's 16.
+// (N ~ 500, NQ ~ 10k) is 0.8 GB of the card's 16. The tensor-core path adds one
+// NQ^2 x 2-byte buffer (Session::tc_scratch_bytes), ~10 NQ^2 bytes in all.
 
 #pragma once
 
@@ -799,17 +800,32 @@ inline void potrf_blocked_tf32(cublasHandle_t hb, cusolverDnHandle_t hs, float* 
 
 struct MergeNode { long p, n1, n2; int level; };
 
-// The TF32 merge needs an n2 x n1 scratch per node, and a level's nodes are
-// dealt round-robin over the fan, so any node can land on any slot. That forces
-// uniform slices, hence (widest node) x (streams) rather than the smaller peak
-// aggregate demand -- sizing by the latter underflows the slice the single
-// top-level node needs.
-inline size_t merge_scratch_elems(const std::vector<MergeNode>& nodes,
-                                  int nstreams) {
-    size_t widest = 0;
+// Widest n2 x n1 tile per level, indexed by level (entry 0 unused).
+inline std::vector<size_t> merge_level_widest(const std::vector<MergeNode>& nodes,
+                                              int maxlevel) {
+    std::vector<size_t> w(maxlevel + 1, 0);
     for (const MergeNode& nd : nodes)
-        widest = std::max(widest, (size_t)nd.n1 * nd.n2);
-    return widest * (size_t)nstreams;
+        w[nd.level] = std::max(w[nd.level], (size_t)nd.n1 * nd.n2);
+    return w;
+}
+
+// The TF32 merge needs an n2 x n1 scratch per node. Levels are joined before
+// the next one starts, so the scratch is reused level by level: the k-th node
+// of a level takes slice (k % streams), the slices sized by that level's
+// widest node -- and the k-th and (k + streams)-th node of a level run on the
+// same stream, one after the other. The peak is the largest level's
+// (widest) x min(nodes, streams): about np^2 / 4 for the single top node,
+// against (widest of all) x streams = np^2 when every level got the top
+// node's slice per stream.
+inline size_t merge_scratch_elems(const std::vector<MergeNode>& nodes, int maxlevel,
+                                  int nstreams) {
+    const std::vector<size_t> w = merge_level_widest(nodes, maxlevel);
+    std::vector<int> count(maxlevel + 1, 0);
+    for (const MergeNode& nd : nodes) ++count[nd.level];
+    size_t peak = 0;
+    for (int lv = 1; lv <= maxlevel; ++lv)
+        peak = std::max(peak, w[lv] * (size_t)std::min(count[lv], nstreams));
+    return peak;
 }
 
 inline int build_merge_tree(std::vector<MergeNode>& out, long p, long n) {
@@ -934,15 +950,17 @@ inline void trtri(cublasHandle_t hb, cudaStream_t main, StreamFan& fan,
     }
 
     const bool tf32 = use_tf32 && std::is_same<S, float>::value && scratch != nullptr;
-    // Hand each node in a level its own slice of the scratch pool; run_levels
-    // deals them round-robin over the same number of streams, so slice i is
-    // only ever in use by one node at a time.
-    size_t slice = 0;
-    int slot = 0;
+    // Slices as merge_scratch_elems sizes them: run_levels deals a level's
+    // nodes round-robin over the fan, so the k-th node of a level and slice
+    // (k % K) always share a stream.
     const int K = fan.size();
+    std::vector<size_t> widest;
     if (tf32) {
-        slice = scratch_elems / (size_t)K;
+        widest = merge_level_widest(nodes, maxlevel);
+        if (merge_scratch_elems(nodes, maxlevel, K) > scratch_elems)
+            throw std::logic_error("trtri: TF32 merge scratch too small");
     }
+    int level = 0, k = 0;
     run_levels(hb, main, fan, nodes, maxlevel, /*independent=*/false,
                [&](const MergeNode& nd) {
         S* R11 = R + nd.p * np + nd.p;
@@ -953,8 +971,8 @@ inline void trtri(cublasHandle_t hb, cudaStream_t main, StreamFan& fan,
             // R21 = -R22 * L21 * R11, as two GEMMs through a scratch tile.
             // R11/R22 are read as full blocks, which is correct because the
             // strictly upper triangle of R is zero by construction.
-            float* T = scratch + (size_t)slot * slice;
-            slot = (slot + 1) % K;
+            if (nd.level != level) { level = nd.level; k = 0; }
+            float* T = scratch + (size_t)(k++ % K) * widest[level];
             GD_CUBLAS(xgemm_tf32(hb, CUBLAS_OP_N, CUBLAS_OP_N, (int)nd.n2, (int)nd.n1,
                                  (int)nd.n2, -1.f, (const float*)R22, (int)np,
                                  (const float*)L21, (int)np, 0.f, T, (int)nd.n2));
@@ -1228,7 +1246,7 @@ public:
         GD_CUDA(cudaStreamCreate(&stream_));
         GD_CUBLAS(cublasSetStream(hb_, stream_));
         GD_CUSOLVER(cusolverDnSetStream(hs_, stream_));
-        fan_.reset(new StreamFan(4));
+        fan_.reset(new StreamFan(kFanStreams));
         cudaDeviceProp prop{};
         GD_CUDA(cudaGetDeviceProperties(&prop, device));
         name_ = prop.name;
@@ -1281,8 +1299,7 @@ public:
         const long np = pad(NQ);
         const long Bp = padB(B);
         return 2 * (size_t)np * np * sizeof(S)          // C (then C^-1) and R
-             + (size_t)np * np * sizeof(__half)         // fp16 lauum operand
-             + (size_t)np * np * sizeof(S)              // TF32 merge scratch
+             + tc_scratch_bytes(np)                     // TF32 merge scratch / fp16 R
              + (size_t)32 * np * sizeof(S)              // batched trtri tile
              + (size_t)N * B + (size_t)N * Bp           // alignment, raw and recoded
              + (size_t)B * sizeof(double)
@@ -1326,6 +1343,15 @@ public:
     }
 
     static long pad(long n) { return ((n + GD_BOT - 1) / GD_BOT) * GD_BOT; }
+    static constexpr int kFanStreams = 4;
+    // One buffer serves trtri's TF32 merge scratch and then lauum's fp16 copy
+    // of R, which are never live at once: the larger of the two, in bytes.
+    static size_t tc_scratch_bytes(long np) {
+        std::vector<MergeNode> nodes;
+        const int levels = build_merge_tree(nodes, 0, np);
+        return std::max(merge_scratch_elems(nodes, levels, kFanStreams) * sizeof(float),
+                        (size_t)np * np * sizeof(__half));
+    }
     static long padB(int B) { return ((long)(B + 15) / 16) * 16; }
     // Blocks of the pair-frequency kernel: one per GD_PAIR_WARPS columns j > i.
     static size_t pair_groups(int N) {
@@ -1499,7 +1525,7 @@ void Session::run_pair(PairArena& arena, const int8_t* MSA, int N, int B,
     if (cached_np_ != np) {
         merge_.clear();
         merge_levels_ = build_merge_tree(merge_, 0, np);
-        merge_scratch_ = merge_scratch_elems(merge_, fan_->size());
+        merge_scratch_ = merge_scratch_elems(merge_, merge_levels_, fan_->size());
         cached_np_ = np;
     }
 
@@ -1590,19 +1616,19 @@ void Session::run_pair(PairArena& arena, const int8_t* MSA, int N, int B,
     // ---- R = L^-1 ----------------------------------------------------------
     tm.start();
     GD_CUDA(cudaMemsetAsync(dR, 0, (size_t)np * np * sizeof(S), stream_));
-    float* mscratch = nullptr;
     const bool tc = tensor_path() && std::is_same<S, float>::value;
-    if (tc && merge_scratch_ > 0)
-        mscratch = arena.get<float>(merge_scratch_ * sizeof(float));
+    // trtri's merge scratch, then (once the fan has joined back into stream_)
+    // lauum's fp16 R.
+    void* tcbuf = tc ? arena.get<char>(tc_scratch_bytes(np)) : nullptr;
     trtri<S>(hb_, stream_, *fan_, dA, dR, np, dTmp, merge_, merge_levels_,
-             tc, mscratch, merge_scratch_);
+             tc, (float*)tcbuf, merge_scratch_);
     tm.stop(&t_.trtri);
 
     // ---- A = R^T R = C^-1 (reusing the now-dead factor buffer) -------------
     tm.start();
     if (tc) {
         // R in half plus the norm scratch; the result lands straight in A.
-        __half* hbuf = arena.get<__half>((size_t)np * np * sizeof(__half));
+        __half* hbuf = (__half*)tcbuf;
         float* scratch = arena.get<float>(sizeof(float));
         lauum_blocked_half(hb_, stream_, (const float*)dR, (float*)dA, np, hbuf,
                            scratch);

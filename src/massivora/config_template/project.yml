@@ -99,8 +99,14 @@ couple:
   # plmDCA parameters
   lambda_h: 0.01
   lambda_J: 0.01
-  eps_conv: 3e-4
+  eps_conv: 3e-4   # CPU path: NLopt f/x tolerance
+  eps_g: 1e-3      # GPU path: stop a site on max |gradient| <= eps_g
   maxit: 200
+  fp16_history: false  # GPU path: L-BFGS history in fp16 (approximation, 1.12x)
+  # Screen profile (plmDCA after a cascade, ranking only): fp16_history: true,
+  # maxit: 50 and concatenate.downsample.to: 10000 ran 1.7x faster on random
+  # H. pylori screen pairs and lost no detector hits on 120 screen pairs (the
+  # top contacts move more, so not for contact maps).
   fast_approximation: false
   site_batch: 24  # GPU: sites optimised in lockstep per pair (an upper bound)
 
@@ -113,6 +119,14 @@ couple:
   gpu_memory_limit: 0.9  # share of each GPU's free memory the pairs in flight may hold
   gpu_host_processes: auto  # processes loading alignments and analysing scores; 'auto' or integer (0: in the coordinator)
   gpu_workers: 16  # pairs in flight; at least gpu_sessions x GPUs + gpu_host_processes
+
+  # Cascade: couple only the best pairs of a finished GaussDCA run; the rest
+  # are marked SKIPPED. Pairs the GaussDCA run did not finish are still coupled.
+  # cascade:
+  #   source_db: gauss.sqlite3  # DB of the GaussDCA run (default: this project's DB)
+  #   source_table: couplings   # its couplings table (default: couple.db_table)
+  #   keep_fraction: 0.30       # share of the GaussDCA-scored pairs to couple
+  #   rank_by: log_lr_raw       # or high_precision_hit (detector hits first)
 
   # Applies when one wants to split the calculation to multiple clusters
   # portion: 1.0
