@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+from functools import lru_cache
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import shared_memory
 
@@ -34,6 +35,13 @@ from massivora.utils import (SHM_PREFIX, ShardWriter, compute_id_range,
                              visible_gpu_devices, worker_id)
 from massivora.analyzer import (BuiltinGaussCalibrator, BuiltinPLMCalibrator,
                                 ComplexAnalyzer)
+
+@lru_cache(maxsize=8)
+def _monomer(path):
+    """A monomer alignment, cached per process: consecutive pairs mostly share
+    their first protein. Concatenation copies the rows, so it stays unchanged."""
+    return BinaryAlignment(path)
+
 
 class LoggingWorkerPlugin(WorkerPlugin):
     def __init__(self, cfg):
@@ -71,6 +79,9 @@ class BaseCouplingExecutor(object):
             config.get('concatenate').get('shared-source_strategy', 'skip'))
 
         coupling_cfg = config.get('couple')
+        # False: pairs concatenated here are coupled from memory and not
+        # stored (the fused screen mode, without the concatenate stage)
+        self.keep_concatenated = bool(coupling_cfg.get('keep_concatenated', True))
         tables = get_table_names(config)
         self.align_table = tables['alignments']
         self.couple_table = tables['couplings']
@@ -148,14 +159,29 @@ class BaseCouplingExecutor(object):
         pid2 = pair.get('pid2')
         if os.path.exists(os.path.join(alignment_dir, pair_name)):
             return BinaryAlignment(os.path.join(alignment_dir, pair_name))
-        align1 = BinaryAlignment(os.path.join(alignment_dir, pid1))
-        align2 = BinaryAlignment(os.path.join(alignment_dir, pid2))
-        concatenated = align1 + align2
+        concatenated = _monomer(os.path.join(alignment_dir, pid1)) + \
+            _monomer(os.path.join(alignment_dir, pid2))
         resolve_shared_source(concatenated, self.shared_source_strategy, pair_name)
         if downsample:
             concatenated.Downsample_Randomly(to=downsample_to)
         concatenated.Mask_Gap_Columns(self._config.get('align').get('col_gap_threshold', 0.5))
         return concatenated
+
+    def _load_or_concatenate(self, pair, filename, kwargs):
+        """The pair's stored alignment, or one concatenated here from the
+        monomers, which is stored unless couple.keep_concatenated is false."""
+        if os.path.exists(filename):
+            try:
+                return BinaryAlignment(filename)
+            except Exception:
+                logging.warning(f"Failed to load pair {pair.get('id')} '{pair.get('name')}', "
+                                "concatenating it again.")
+        align = self.concatenate(pair, kwargs.get('alignment_dir'),
+                                 downsample=kwargs.get('downsample', False),
+                                 downsample_to=kwargs.get('downsample_to'))
+        if self.keep_concatenated:
+            align.To_Zarr(filename, overwrite=True)
+        return align
 
     # -- DB helpers --
 
@@ -1591,6 +1617,8 @@ class SessionGPUExecutor(BaseCouplingExecutor):
             return
         filename, _ = get_hashed_file_path(params['name'], params['file_hash'],
                                            self.output_dir)
+        if not os.path.exists(filename):        # coupled from memory, not stored
+            return
         zarr.open_group(store=filename)['align'].attrs.update(
             {'weights': np.asarray(weights).tolist(), 'Beff': params['Beff']})
 
@@ -1870,13 +1898,7 @@ class GaussCouplingExecutorGPU(SessionGPUExecutor, BuiltinGaussCalibrator):
         file_hash = pair.get('file_hash') or compute_file_hash(pair_name)
         filename, _ = get_hashed_file_path(pair_name, file_hash,
                                            kwargs.get('output_dir'))
-        try:
-            align = BinaryAlignment(filename)
-        except Exception:
-            align = self.concatenate(pair, kwargs.get('alignment_dir'),
-                                     downsample=kwargs.get('downsample', False),
-                                     downsample_to=kwargs.get('downsample_to'))
-            align.To_Zarr(filename, overwrite=True)
+        align = self._load_or_concatenate(pair, filename, kwargs)
 
         B, N = align.matrix.shape
         MSA = np.ascontiguousarray(align.matrix.T, dtype=np.int8)      # (N, B)
@@ -1986,15 +2008,7 @@ class PLMCouplingExecutorGPU(SessionGPUExecutor, BuiltinPLMCalibrator):
         pair_name = pair.get('name')
         file_hash = pair.get('file_hash') or compute_file_hash(pair_name)
         filename, _ = get_hashed_file_path(pair_name, file_hash, kwargs.get('output_dir'))
-        try:
-            align = BinaryAlignment(filename)
-        except Exception:
-            logging.warning(f"Failed to load pair {pair.get('id')} '{pair_name}', "
-                            "trying to concatenate.")
-            align = self.concatenate(pair, kwargs.get('alignment_dir'),
-                                     downsample=kwargs.get('downsample', False),
-                                     downsample_to=kwargs.get('downsample_to'))
-            align.To_Zarr(filename, overwrite=True)
+        align = self._load_or_concatenate(pair, filename, kwargs)
         q = int(align.matrix.max()) + 1
 
         # Weights the store already has are used as they are. Otherwise W is
@@ -2011,7 +2025,8 @@ class PLMCouplingExecutorGPU(SessionGPUExecutor, BuiltinPLMCalibrator):
         columns = None
         if self.fast_approximation:
             align.Mask_Gap_Columns(self.col_gap_threshold)
-            align.To_Zarr(filename, overwrite=True)
+            if os.path.exists(filename):
+                align.To_Zarr(filename, overwrite=True)
             if W is not None:
                 align.Drop_Masked_Gap_Columns()
             else:
