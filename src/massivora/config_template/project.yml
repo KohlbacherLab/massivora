@@ -127,7 +127,7 @@ couple:
   #   source_table: couplings   # its couplings table (default: couple.db_table)
   #   keep_fraction: 0.30       # share of the GaussDCA-scored pairs to couple
   #   rank_by: log_lr_raw       # high_precision_hit (detector hits first), or cascade_score
-  #                             # (ranker; keep_fraction 0.16 keeps what log_lr_raw keeps at 0.30)
+  #                             # (trained ranker; on H. pylori about as good as log_lr_raw)
 
   # Applies when one wants to split the calculation to multiple clusters
   # portion: 1.0

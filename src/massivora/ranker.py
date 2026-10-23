@@ -6,8 +6,11 @@ instead of `log_lr_raw`. It is a gradient-boosted tree model on the GaussDCA
 inter-protein block (calibrator evidence, score quantiles, top-10 mean,
 focality) and the alignment depth (N, B, Beff, Neff/L, chain lengths), fitted
 on the he2021 benchmark against plmDCA's top-5 % calls and detector hits.
-On the H. pylori screen, its top 16 % keeps as many plmDCA calls as the top
-30 % by `log_lr_raw`, at about half the plmDCA cost.
+It beats `log_lr_raw` on the benchmark (top 16 %: 98 % against 91 % of
+plmDCA's top-5 % calls), but not clearly on H. pylori: cut at 16 % of the full
+screen, it keeps 84 % (helpy55) and 92 % (500 random screen pairs) of plmDCA's
+top-5 % calls, against 88 % / 84 % for `log_lr_raw` at 16 % and 97 % / 100 %
+at 30 %.
 
 The model ships as JSON trees (scikit-learn's HistGradientBoostingClassifier
 nodes) and is evaluated here with numpy, so scikit-learn is not needed.

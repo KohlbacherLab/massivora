@@ -597,8 +597,8 @@ def create_job_db(cfg: dict):
 # ORDER BY clauses `couple.cascade.rank_by` may choose from; each key is a column.
 # By log_lr_raw, the 0.30 default keeps ~97 % of plmDCA's top-5 % calls on the
 # he2021 benchmark and H. pylori, at ~4.5x less screen compute; 0.16 keeps only
-# ~90 % (8.3x). cascade_score (massivora.ranker) keeps as much at 0.16 as
-# log_lr_raw at 0.30, at about half the plmDCA cost.
+# ~90 % (8.3x). cascade_score (massivora.ranker) is better on the benchmark but
+# not clearly better than log_lr_raw on H. pylori at the same keep_fraction.
 CASCADE_RANKS = {
     'log_lr_raw': 'log_lr_raw DESC',
     'high_precision_hit': 'high_precision_hit DESC, log_lr_raw DESC',
