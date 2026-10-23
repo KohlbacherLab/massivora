@@ -75,7 +75,7 @@ def _claim_batch(cfg, job_id, batch_size, table_name='couplings'):
 def _run_concatenate(task, monomers_path, output_dir, downsample=False,
                      downsample_to=30000, reweight=True, reweighting_threshold=0.8,
                      col_gap_threshold=0.5, n_threads=0, gpu_reweight=None,
-                     shared_source_strategy='skip'):
+                     shared_source_strategy='skip', shared_source_cache='auto'):
     """
     Concatenate one pair of monomer alignments and write it to the output tree.
 
@@ -112,7 +112,8 @@ def _run_concatenate(task, monomers_path, output_dir, downsample=False,
         del align1, align2
 
         try:
-            resolve_shared_source(concatenated_align, shared_source_strategy, name)
+            resolve_shared_source(concatenated_align, shared_source_strategy, name,
+                                  cache=shared_source_cache)
         except SharedSourceError as e:
             logging.warning(f"{e}; marking it FAILED")
             return {'name': name, 'status': STATUS['FAILED']}
@@ -562,6 +563,7 @@ if __name__ == '__main__':
         col_gap_threshold=col_gap_threshold,
         n_threads=0 if use_gpu else reweight_threads,
         shared_source_strategy=shared_source_strategy,
+        shared_source_cache=str(concat_cfg.get('shared-source_cache', 'auto')).lower(),
     )
 
     workers = []

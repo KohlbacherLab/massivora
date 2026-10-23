@@ -160,6 +160,57 @@ static inline bool reachesMatches(const int8_t* a, const int8_t* b, long n, doub
     return static_cast<double>(c) >= thr;
 }
 
+// Shared-source test on two per-protein run tables (alignment.RunTable): each
+// table holds, per cached row, its sorted unique k-residue run codes (CSR:
+// codes, offsets). Row r of the pair is rows_a[r] of table A against rows_b[r]
+// of table B; it is shared when the two sorted lists have a code in common.
+py::array_t<bool> sharedSourceRows(
+        py::array_t<uint64_t, py::array::c_style | py::array::forcecast> codes_a,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> offsets_a,
+        py::array_t<uint64_t, py::array::c_style | py::array::forcecast> codes_b,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> offsets_b,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> rows_a,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> rows_b) {
+    if (rows_a.ndim() != 1 || rows_b.ndim() != 1 || rows_a.shape(0) != rows_b.shape(0))
+        throw std::runtime_error("sharedSourceRows: rows_a and rows_b must be 1-D and of equal length");
+    const long n = static_cast<long>(rows_a.shape(0));
+    const long n_a = static_cast<long>(offsets_a.shape(0)) - 1;
+    const long n_b = static_cast<long>(offsets_b.shape(0)) - 1;
+    const uint64_t* ca = codes_a.data();
+    const uint64_t* cb = codes_b.data();
+    const int64_t* oa = offsets_a.data();
+    const int64_t* ob = offsets_b.data();
+    const int64_t* ra = rows_a.data();
+    const int64_t* rb = rows_b.data();
+    const long len_a = static_cast<long>(codes_a.shape(0));
+    const long len_b = static_cast<long>(codes_b.shape(0));
+    for (long r = 0; r < n; ++r) {
+        if (ra[r] < 0 || ra[r] >= n_a || rb[r] < 0 || rb[r] >= n_b)
+            throw std::runtime_error("sharedSourceRows: row index outside its table");
+        if (oa[ra[r] + 1] > len_a || ob[rb[r] + 1] > len_b || oa[ra[r]] < 0 || ob[rb[r]] < 0)
+            throw std::runtime_error("sharedSourceRows: offsets outside the codes");
+    }
+    py::array_t<bool> out(n);
+    bool* o = out.mutable_data();
+    {
+        py::gil_scoped_release release;
+        for (long r = 0; r < n; ++r) {
+            const uint64_t* a = ca + oa[ra[r]];
+            const uint64_t* ae = ca + oa[ra[r] + 1];
+            const uint64_t* b = cb + ob[rb[r]];
+            const uint64_t* be = cb + ob[rb[r] + 1];
+            bool hit = false;
+            while (a < ae && b < be) {
+                if (*a < *b) ++a;
+                else if (*b < *a) ++b;
+                else { hit = true; break; }
+            }
+            o[r] = hit;
+        }
+    }
+    return out;
+}
+
 py::array_t<int32_t> reweightNeighbourCounts(
         py::array_t<int8_t, py::array::c_style | py::array::forcecast> MSA,
         double identical_threshold,
@@ -315,6 +366,15 @@ For each of the B sequences, the number of sequences in the alignment
 caller forms the weights as 1/counts.
 
 MSA is (B, N) int8; identical_threshold is x * N.)doc");
+
+    m.def("sharedSourceRows", &sharedSourceRows,
+        py::arg("codes_a"), py::arg("offsets_a"), py::arg("codes_b"), py::arg("offsets_b"),
+        py::arg("rows_a"), py::arg("rows_b"),
+        R"doc(Which paired rows share a residue run, from two cached run tables.
+
+codes_*/offsets_* are a protein's run table (per cached row, its sorted
+unique run codes, CSR). Row r of the pair is rows_a[r] of the first table
+against rows_b[r] of the second; the result holds one boolean per row.)doc");
 
     m.def("gaussCouplings", &gaussCouplings,
         py::arg("MSA"), py::arg("W"), py::arg("q") = 21,

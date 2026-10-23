@@ -77,6 +77,10 @@ class BaseCouplingExecutor(object):
         # What concatenate() does with a pair that glues a sequence to itself
         self.shared_source_strategy = check_shared_source_strategy(
             config.get('concatenate').get('shared-source_strategy', 'skip'))
+        # 'auto': the monomers' shared-source run tables are kept on disk next
+        # to them (built once per protein); 'off': in memory per process only
+        self.shared_source_cache = str(
+            config.get('concatenate').get('shared-source_cache', 'auto')).lower()
 
         coupling_cfg = config.get('couple')
         # False: pairs concatenated here are coupled from memory and not
@@ -161,7 +165,8 @@ class BaseCouplingExecutor(object):
             return BinaryAlignment(os.path.join(alignment_dir, pair_name))
         concatenated = _monomer(os.path.join(alignment_dir, pid1)) + \
             _monomer(os.path.join(alignment_dir, pid2))
-        resolve_shared_source(concatenated, self.shared_source_strategy, pair_name)
+        resolve_shared_source(concatenated, self.shared_source_strategy, pair_name,
+                              cache=getattr(self, 'shared_source_cache', 'auto'))
         if downsample:
             concatenated.Downsample_Randomly(to=downsample_to)
         concatenated.Mask_Gap_Columns(self._config.get('align').get('col_gap_threshold', 0.5))

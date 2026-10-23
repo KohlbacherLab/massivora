@@ -77,6 +77,11 @@ concatenate:
   #   skip: log the pair and mark it FAILED (default)
   #   fix:  remove those species and go on with the rest
   shared-source_strategy: skip
+  # The check uses each monomer's residue runs, computed once per protein.
+  #   auto: keep them on disk next to the monomer (shared_source_k10/), so
+  #         every process and run maps the same copy (default)
+  #   off:  keep them in memory, per process
+  shared-source_cache: auto
   reweighting:
     enabled: true
     threshold: 0.8
