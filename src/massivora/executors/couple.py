@@ -1616,6 +1616,19 @@ class SessionGPUExecutor(BaseCouplingExecutor):
     def collect_score(self, score, params):
         raise NotImplementedError
 
+    def _skipped_row(self, params):
+        """The DB row of a pair the stage loaded and reweighted but did not
+        score (`params['skipped']` says why): status SKIPPED, with its depth
+        (number, effnumber, neffoverL) and no score, so the cascade can
+        rank it as a pair below the gate and nothing claims it again."""
+        Beff, N = params.get('Beff'), int(params['N'])
+        return {'id': params['pair_id'], 'status': STATUS['SKIPPED'],
+                'effnumber': Beff, 'number': int(params['B']), 'length': N,
+                'pcontact': None, 'neffoverL': None if Beff is None else float(Beff) / N,
+                'log_lr_raw': None, 'confidence_flag': False, 'high_precision_hit': False,
+                'file_hash': params.get('file_hash'), 'score_file_id': None,
+                'score_offset': None, 'score_len': None}
+
     def _keep_gpu_weights(self, params):
         """A pair reweighted on the GPU: keep the weights with the stored
         alignment, where the CPU path's To_Zarr puts them, so a later run
@@ -1725,6 +1738,7 @@ class SessionGPUExecutor(BaseCouplingExecutor):
         work = queue.Queue(maxsize=self.gpu_workers * 2)
         # skipped: shared-source pairs, marked FAILED without a retry
         done_updates, fail_updates, released, skipped = [], [], [], []
+        skipped_by_stage = [0]              # pairs the stage left unscored (depth gate)
         lock = threading.Lock()
         # An illegal address and its like corrupt the context every session in
         # this process shares; from then on every pair would fail and spend its
@@ -1791,7 +1805,7 @@ class SessionGPUExecutor(BaseCouplingExecutor):
                 try:
                     if pair is None:
                         return
-                    score, spent = None, {}
+                    score, spent, params = None, {}, None
                     if not halt.is_set():
                         t0 = time.monotonic()
                         arrays, params = load(pair)
@@ -1801,6 +1815,14 @@ class SessionGPUExecutor(BaseCouplingExecutor):
                         finally:
                             arrays.release()
                     if score is None:
+                        if params is not None and params.get('skipped'):
+                            # The stage decided against scoring this pair
+                            # (a depth gate, say): DONE with its depth, no score
+                            with lock:
+                                done_updates.append(self._skipped_row(params))
+                                skipped_by_stage[0] += 1
+                            clock.add(**spent)
+                            continue
                         with lock:
                             released.append(pair['id'])
                         continue
@@ -1866,6 +1888,9 @@ class SessionGPUExecutor(BaseCouplingExecutor):
             self.close_db_connection()
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
+        if skipped_by_stage[0]:
+            logging.info(f"{self.GPU_LABEL}: %d pairs left unscored by the stage (SKIPPED)",
+                         skipped_by_stage[0])
         if lost.is_set():
             raise RuntimeError(f"{self.GPU_LABEL}: the CUDA context was lost (see the first "
                                "DeviceLostError above); the pairs not yet run were handed "
@@ -1882,6 +1907,22 @@ class GaussCouplingExecutorGPU(SessionGPUExecutor, BuiltinGaussCalibrator):
         super().__init__(config)
         coupling_cfg = config.get('couple')
         self.pseudocount = float(coupling_cfg.get('pseudocount', 0.8))
+        # The cascade's depth gate (couple.cascade.min_neffoverL, applied by
+        # apply_cascade to the ranked pairs): a pair below it is never handed
+        # to plmDCA, so it is not worth a GaussDCA score either. Read here,
+        # applied after reweighting (_run_on_session); None keeps every pair.
+        self.min_neffoverL = self._depth_gate(coupling_cfg)
+
+    @staticmethod
+    def _depth_gate(coupling_cfg):
+        cascade = coupling_cfg.get('cascade') or {}
+        gate = cascade.get('min_neffoverL') if isinstance(cascade, dict) else None
+        if gate is None or (isinstance(gate, str) and gate.strip().lower() in ('', 'null', 'none')):
+            return None
+        gate = float(gate)
+        if gate < 0:
+            raise ValueError(f"couple.cascade.min_neffoverL must be >= 0, got {gate}")
+        return gate
 
     def _gpu_module(self):
         from massivora.cpp_bindings import gauss_cuda
@@ -1899,6 +1940,13 @@ class GaussCouplingExecutorGPU(SessionGPUExecutor, BuiltinGaussCalibrator):
             W = 1.0 / m.astype(np.int64)        # exactly as Reweight_Sequence
             params['Beff'] = float(W.sum())
             params['weights'] = W
+        if self.min_neffoverL is not None:
+            neff_over_L = params['Beff'] / params['N']
+            if neff_over_L < self.min_neffoverL:
+                params['skipped'] = (f"Neff/L {neff_over_L:.3f} below "
+                                     f"couple.cascade.min_neffoverL {self.min_neffoverL:g}")
+                params.pop('weights', None)
+                return None
         return sess.score(MSA, W, q=params['q'], pseudocount=self.pseudocount)
 
     def load_pair_arrays(self, pair, **kwargs):
