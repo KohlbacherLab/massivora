@@ -10,6 +10,13 @@ from scipy.stats import ecdf, spearmanr
 
 from massivora.utils import bitmask_to_saved_columns
 
+
+class DegenerateCouplingsError(RuntimeError):
+    """The coupling matrix cannot be normalised: its minimum absolute score is
+    0, which happens when the alignment is degenerate (one or two distinct
+    sequences, B <= 3 on the screen) and the inter-protein block is all zero.
+    A RuntimeError, so callers that caught the old error still do."""
+
 logger = logging.getLogger(__name__)
 
 class BaseAnalyzer(object):
@@ -451,7 +458,9 @@ class ComplexAnalyzer(BaseAnalyzer):
         Raises
         ------
         `RuntimeError`
-            If no interprotein coupling was found or the minimum coupling score is 0.
+            If no interprotein coupling was found
+        `DegenerateCouplingsError`
+            If the minimum absolute coupling score is 0 (a RuntimeError as well)
         """
         if full:
             if self.raw_couplings.empty:
@@ -473,7 +482,7 @@ class ComplexAnalyzer(BaseAnalyzer):
         constant = 1 + (N_eff / L) ** -0.5
         abs_min = abs(np.nanmin(df.to_numpy()))
         if abs_min == 0:
-            raise RuntimeError('Cannot normalize: minimum absolute score is 0')
+            raise DegenerateCouplingsError('Cannot normalize: minimum absolute score is 0')
 
         return (df / abs_min) / constant
 
@@ -843,25 +852,45 @@ class BaseCalibrator(object):
                 its held-out 0.1%-FPR operating point.
             `neffoverL` — float
                 M_eff / L, the coverage the confidence flag is read from.
+            `reason` — str or None
+                None for a scored pair. "degenerate alignment" when the
+                coupling matrix could not be normalised (minimum absolute
+                score 0: an alignment of one or two distinct sequences); then
+                `log_lr_raw` and `pcontact` are NaN (NULL once stored),
+                `high_precision_hit` and `confidence_flag` are False, and the
+                pair counts as finished without a score rather than failed.
         """
         if self.RANKER is None or self.DETECTOR is None:
             raise NotImplementedError(
                 f"{type(self).__name__} defines no RANKER/DETECTOR constants")
         L = int(analyzer.raw_couplings.shape[0])
-        log_lr_raw = self._model_log_lr(analyzer, self.RANKER, N_eff)
+        coverage = float(N_eff) / float(L)
+        try:
+            log_lr_raw = self._model_log_lr(analyzer, self.RANKER, N_eff)
+        except DegenerateCouplingsError as e:
+            logging.warning(f"{e}; degenerate alignment (Beff {float(N_eff):.3g}, L {L}): "
+                            "finished without a score")
+            return {
+                "log_lr_raw": float('nan'),
+                "pcontact": float('nan'),
+                "confidence_flag": False,
+                "high_precision_hit": False,
+                "neffoverL": coverage,
+                "reason": "degenerate alignment",
+            }
         # logit(P at prior q) = log_lr + logit(q), so log_lr is the prevalence-free
         # part.  The cap applies because with 3984 labelled negatives no
         # likelihood ratio finer than 1/3984 can be demonstrated; only pcontact
         # uses the capped value, log_lr_raw is returned as is.
         log_lr = min(log_lr_raw, self.MAX_LOG_LR)
         hit_log_lr = self._model_log_lr(analyzer, self.DETECTOR, N_eff)
-        coverage = float(N_eff) / float(L)
         return {
             "log_lr_raw": log_lr_raw,
             "pcontact": float(1.0 / (1.0 + np.exp(-(log_lr + self.LOGIT_PI)))),
             "confidence_flag": self.ConfidenceFlag(coverage),
             "high_precision_hit": bool(hit_log_lr >= self.DETECTOR["hit_log_lr"]),
             "neffoverL": coverage,
+            "reason": None,
         }
 
 
