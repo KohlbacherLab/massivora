@@ -852,21 +852,30 @@ class BaseCalibrator(object):
                 its held-out 0.1%-FPR operating point.
             `neffoverL` — float
                 M_eff / L, the coverage the confidence flag is read from.
-            `reason` — str or None
-                None for a scored pair. "degenerate alignment" when the
-                coupling matrix could not be normalised (minimum absolute
-                score 0: an alignment of one or two distinct sequences); then
-                `log_lr_raw` and `pcontact` are NaN (NULL once stored),
-                `high_precision_hit` and `confidence_flag` are False, and the
-                pair counts as finished without a score rather than failed.
+
+        Every key is a column of the couplings table: callers spread this dict
+        into row updates (`massiveilance._coupling_result_info`), so a key with
+        no column raises there. Do not add one without the column and writer.
+
+        When the coupling matrix cannot be normalised (minimum absolute score
+        0: an alignment of one or two distinct sequences, B <= 3 on the screen)
+        `log_lr_raw` and `pcontact` are NaN (NULL once stored),
+        `high_precision_hit` and `confidence_flag` are False, and the reason is
+        logged at WARNING; the pair then counts as finished without a score
+        rather than failed. The reason is *not* stored: a degenerate pair is a
+        DONE row with a NULL score, indistinguishable in the DB from any other
+        NULL-score DONE row.
         """
         if self.RANKER is None or self.DETECTOR is None:
             raise NotImplementedError(
                 f"{type(self).__name__} defines no RANKER/DETECTOR constants")
         L = int(analyzer.raw_couplings.shape[0])
         coverage = float(N_eff) / float(L)
+        # Both models normalise the same coupling matrix, so either call can hit the
+        # degenerate case; catch them together.
         try:
             log_lr_raw = self._model_log_lr(analyzer, self.RANKER, N_eff)
+            hit_log_lr = self._model_log_lr(analyzer, self.DETECTOR, N_eff)
         except DegenerateCouplingsError as e:
             logging.warning(f"{e}; degenerate alignment (Beff {float(N_eff):.3g}, L {L}): "
                             "finished without a score")
@@ -876,21 +885,18 @@ class BaseCalibrator(object):
                 "confidence_flag": False,
                 "high_precision_hit": False,
                 "neffoverL": coverage,
-                "reason": "degenerate alignment",
             }
         # logit(P at prior q) = log_lr + logit(q), so log_lr is the prevalence-free
         # part.  The cap applies because with 3984 labelled negatives no
         # likelihood ratio finer than 1/3984 can be demonstrated; only pcontact
         # uses the capped value, log_lr_raw is returned as is.
         log_lr = min(log_lr_raw, self.MAX_LOG_LR)
-        hit_log_lr = self._model_log_lr(analyzer, self.DETECTOR, N_eff)
         return {
             "log_lr_raw": log_lr_raw,
             "pcontact": float(1.0 / (1.0 + np.exp(-(log_lr + self.LOGIT_PI)))),
             "confidence_flag": self.ConfidenceFlag(coverage),
             "high_precision_hit": bool(hit_log_lr >= self.DETECTOR["hit_log_lr"]),
             "neffoverL": coverage,
-            "reason": None,
         }
 
 

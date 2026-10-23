@@ -609,16 +609,24 @@ def apply_cascade(cfg: dict):
     of the source run stay claimable; every other pair the source scored is
     marked SKIPPED. With `min_neffoverL` set, kept pairs whose source
     `neffoverL` (Beff / L of the concatenated alignment) is below it are
-    marked SKIPPED as well: below Beff / L ~ 0.1 the detector fires on 6.7 %
+    marked SKIPPED as well: below Beff / L ~ 0.1 the detector fires on 6-7 %
     of labelled negatives and 3 % of labelled positives (its design FPR is
-    0.1 %), so a call there is an artefact of the shallow alignment, and the
-    pairs the source did not finish (FAILED, RUNNING) are SKIPPED too, since
-    an unranked pair could otherwise cost full plmDCA time on a run that is
-    meant to be depth-gated. Without a gate, pairs the source did not finish
-    stay claimable, since nothing ranks them. A source row with NULL
-    `neffoverL`, or a source table without the column, is never gated. Only
-    NOOPT and SKIPPED rows change, so running, finished and retried pairs are
-    left alone. Idempotent, and a larger `keep_fraction` or a lower gate
+    0.1 %), so a call there is an artefact of the shallow alignment.
+
+    A source row with NULL `neffoverL`, or a source table without the column,
+    is never gated; both are logged at WARNING with counts, because a gate
+    that gates nothing costs 2-3x the GPU time it was set to save.
+
+    Pairs the source did not finish are not ranked, so by default they stay
+    claimable at full cost. `skip_unranked` (default false) marks them SKIPPED
+    instead. That is a coverage decision, not a depth gate -- on the H. pylori
+    screen those 12,457 FAILED rows have median B 7,129, i.e. they are the deep
+    pairs the gate exists to protect -- so it is a separate key and off by
+    default. RUNNING rows are never skipped: the source may still be working on
+    them, and every worker calls apply_cascade at start.
+
+    Only NOOPT and SKIPPED rows change, so running, finished and retried pairs
+    are left alone. Idempotent, and a larger `keep_fraction` or a lower gate
     hands skipped pairs back, so every worker calls it at start.
 
     Parameters
@@ -627,8 +635,10 @@ def apply_cascade(cfg: dict):
         Configuration dict. `couple.cascade` keys: `source_db` (SQLite file of
         the GaussDCA run, relative to project_path; default this project's DB),
         `source_table` (default `couple.db_table`), `keep_fraction` (default
-        0.30), `rank_by` (a key of `CASCADE_RANKS`, default `log_lr_raw`) and
-        `min_neffoverL` (float, default None: no depth gate)
+        0.30), `rank_by` (a key of `CASCADE_RANKS`, default `log_lr_raw`),
+        `min_neffoverL` (float, default None: no depth gate) and
+        `skip_unranked` (bool, default False: pairs the source never finished
+        stay claimable)
 
     Returns
     -------
@@ -650,6 +660,7 @@ def apply_cascade(cfg: dict):
         gate = float(gate)
         if not gate >= 0.0:
             raise ValueError(f"couple.cascade.min_neffoverL must be >= 0 or null, got {gate}")
+    skip_unfinished = bool(cascade.get('skip_unranked', False))
 
     couple_table = get_table_names(cfg)['couplings']
     source_table = cascade.get('source_table', couple_table)
@@ -675,19 +686,41 @@ def apply_cascade(cfg: dict):
             (STATUS['DONE'],))
         ranked = cur.fetchall()
         unranked = []
-        if gate is not None:
-            cur.execute(f"SELECT name FROM {quoted_source} WHERE status != ?", (STATUS['DONE'],))
+        if skip_unfinished:
+            # RUNNING is deliberately excluded: a source worker may still be on that
+            # pair, and every worker calls apply_cascade at start, so skipping RUNNING
+            # would make the kept set depend on who ran when (fused mode races).
+            cur.execute(
+                f"SELECT name FROM {quoted_source} "
+                f"WHERE status IS NOT NULL AND status NOT IN (?, ?)",
+                (STATUS['DONE'], STATUS['RUNNING']))
             unranked = [row[0] for row in cur.fetchall()]
     finally:
         src.close()
     n_keep = math.ceil(fraction * len(ranked))
     skip_rank = {name for name, _ in ranked[n_keep:]}
     skip_depth = set()
+    ungated = 0
     if gate is not None:
         skip_depth = {name for name, depth in ranked[:n_keep]
                       if depth is not None and float(depth) < gate}
+        ungated = sum(1 for _, depth in ranked[:n_keep] if depth is None)
     skip_unranked = set(unranked)
     skip = skip_rank | skip_depth | skip_unranked
+
+    # A gate that silently gates nothing is a 2-3x cost blowout, not a no-op: on the
+    # H. pylori screen the top 20 % is 238,721 pairs (50.7 model h) against 76,212
+    # (22.6 h) gated. Say so loudly rather than in an info line nobody reads.
+    if gate is not None and not has_depth:
+        logging.warning(
+            f"couple.cascade.min_neffoverL = {gate:g} is set, but source table "
+            f"{source_table} has no neffoverL column: NO pair is gated by depth and all "
+            f"{n_keep} ranked pairs stay claimable. Re-run the source so it stores "
+            f"neffoverL, or remove the gate.")
+    elif gate is not None and ungated:
+        logging.warning(
+            f"couple.cascade.min_neffoverL = {gate:g}: {ungated} of {n_keep} kept pairs "
+            f"have NULL neffoverL in {source_table} and are NOT gated by depth.")
 
     table = quote_identifier(couple_table)
     conn = connect_db_rw(cfg)
@@ -710,8 +743,6 @@ def apply_cascade(cfg: dict):
                  f"{source_table} (top {fraction:g} by {rank_by}"
                  + (f", neffoverL >= {gate:g}" if gate is not None else "") + "); "
                  f"skipped by rank {len(skip_rank)}, by depth {len(skip_depth)}, "
-                 f"unranked {len(skip_unranked)}"
-                 + ("; source has no neffoverL column, nothing gated by depth"
-                    if gate is not None and not has_depth else "")
+                 f"unfinished-in-source {len(skip_unranked)}, ungated (NULL depth) {ungated}"
                  + f"; {len(changes)} rows changed")
     return len(ranked), kept, len(changes)
