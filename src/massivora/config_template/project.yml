@@ -127,6 +127,145 @@ couple:
 
   # Cascade: couple only the best pairs of a finished GaussDCA run; the rest
   # are marked SKIPPED. Pairs the GaussDCA run did not finish are still
+  # coupled, unless skip_unranked is set; pairs the GaussDCA run SKIPPED
+  # itself (its pre-gate, below) are never coupled.
+  # cascade:
+  #   source_db: gauss.sqlite3  # DB of the GaussDCA run (default: this project's DB)
+  #   source_table: couplings   # its couplings table (default: couple.db_table)
+  #   keep_fraction: 0.20       # share of the ranked GaussDCA pairs to couple, or
+  #   keep_count: null          # number of them; at most one of the two (neither:
+  #                             # every ranked pair, the block only gates / skips)
+  #   keep_denominator: ranked  # keep_fraction of: ranked (DONE source rows, the
+  #                             # default) or ranked_plus_skipped (DONE + SKIPPED)
+  #   rank_by: log_lr_raw       # or high_precision_hit (detector hits first)
+  #   min_neffoverL: null       # depth gate (see below)
+  #   skip_unranked: false      # also skip pairs the GaussDCA run never finished
+  #
+  # keep_fraction / keep_count: the ranked pairs are the source rows with
+  # status DONE, ordered by rank_by. keep_fraction keeps the top share of them
+  # (ceil), keep_count the top number; a block with neither keeps them all,
+  # so a block that only gates is `cascade: {source_db: ..., min_neffoverL: 0.1}`.
+  # keep_denominator: ranked_plus_skipped makes keep_fraction a share of the
+  # ranked rows plus the rows the source left SKIPPED, i.e. the same number of
+  # pairs as if the source had scored everything. It keeps a BUDGET, not a
+  # SET: see configuration B below before using it.
+  #
+  # min_neffoverL: kept pairs whose GaussDCA row has neffoverL (Beff / L of
+  # the concatenated alignment) below it are SKIPPED too. null (default) keeps
+  # today's behaviour. A source row with NULL neffoverL, or a source table
+  # without the column, is NOT gated; both are logged at WARNING, because a
+  # gate that gates nothing costs 2-3x the GPU time it was set to save.
+  # Below Beff / L = 0.1 the plmDCA detector is an artefact of the shallow
+  # alignment: on labelled he2021 negatives subsampled to that depth it fires
+  # on 6.0-6.7 % (its design FPR is 0.1 %), on labelled positives on 3 %
+  # (37 of 38 true hits vanish), and log_lr_raw ranks at chance (AUC 0.56-0.57);
+  # in situ it calls 12.7 % of random screen pairs below the gate against
+  # 0.52 % above it, at a PPI prior of ~1e-3. On the H. pylori screen 72 % of
+  # the top-16 % pairs sit there and take 61 % of the plmDCA hours.
+  # keep_fraction 0.20 with min_neffoverL 0.1 shows no detectable loss of
+  # labelled benchmark recall against the ungated top 16 % (plm top-5 %
+  # positives 91 -> 91 %, detector hits 84 -> 86 %; CIs admit up to ~10 points,
+  # and the benchmark holds only 13 of 4,545 pairs below the gate) at 1.6x less
+  # plmDCA time. The threshold is bracketed by the labelled bands to
+  # [0.05, 0.34]; 0.1 is the low end, i.e. the conservative choice.
+  # State the gate in Methods; apply the same criterion to reported GaussDCA
+  # calls.
+  #
+  # The same key in the GaussDCA stage's own config, without a source
+  # (`cascade: {min_neffoverL: 0.1}`), is the GaussDCA PRE-GATE: after the
+  # reweighting, a pair with Beff / L below it is not scored at all and is
+  # stored SKIPPED with its depth and no score (apply_cascade then has nothing
+  # to rank and does nothing). On the H. pylori screen that is 24 % of the
+  # pairs and 77 % of today's GaussDCA detector hits (the shallow stratum of
+  # the finding above); its accuracy cost is not measured on labels, since
+  # the benchmark has no pairs at that depth.
+  #
+  # The two H. pylori screen configurations (1,206,653 scored pairs):
+  #  A, headline -- GaussDCA on every pair, then for plmDCA
+  #     cascade: {source_db: gauss.sqlite3, keep_fraction: 0.20, min_neffoverL: 0.1}
+  #     = top 20 % by log_lr_raw (241,331 pairs), of which 77,225 have
+  #     Neff / L >= 0.1: the gated set.
+  #  B, pre-gate -- GaussDCA stage: cascade: {min_neffoverL: 0.1}; plmDCA stage:
+  #     cascade: {source_db: gauss.sqlite3, keep_count: 77225, min_neffoverL: 0.1}
+  #     selects exactly A's 77,225 pairs (verified on the screen DB: the gated
+  #     set is the ungated pairs above one score threshold, and the pre-gate
+  #     removes only ungated-below pairs). keep_fraction 0.20 would cut the
+  #     shrunken ranked set (917,537 DONE) at 183,508 pairs (2.4x A), and
+  #     keep_fraction 0.20 with keep_denominator ranked_plus_skipped keeps
+  #     241,331 pairs, all above the gate (3.1x A): a larger set, not A. Under
+  #     a pre-gate state the plmDCA cut as keep_count.
+  #
+  # skip_unranked: pairs the GaussDCA run never finished (FAILED; RUNNING rows
+  # are never skipped) are unranked, so by default they stay claimable at full
+  # cost. true marks them SKIPPED. This is a coverage decision, not a depth
+  # gate: on the H. pylori screen those 12,457 rows have median B 7,129, i.e.
+  # they are the deep pairs the gate exists to protect, and their hit loss is
+  # unmeasured. Prefer finishing the source run. Pairs the GaussDCA run
+  # SKIPPED (pre-gate or its own cascade) are a decision, not an unfinished
+  # result: they are never coupled, whatever skip_unranked says.
+
+  # Applies when one wants to split the calculation to multiple clusters
+  # portion: 1.0
+  # portion_start: 0.0
+
+concatenate:
+  db_table: couplings
+  # method for pairing sequences in concatenated alignment
+  method: best_hit
+  # when a pair is shared-source, what to do:
+  #   skip: log the pair and mark it FAILED (default)
+  #   fix:  remove those species and go on with the rest
+  shared-source_strategy: skip
+  reweighting:
+    enabled: true
+    threshold: 0.8
+  # downsample settings (optional)
+  downsample:
+    enabled: true
+    to: 30000
+  claim_batch_size: auto  # 'auto' or integer
+
+couple:
+  db_table: couplings
+  claim_batch_size: auto  # 'auto' or integer
+  memory_limit: 0.9
+  # Finished pair's CN score matrix
+  keep_coupling_matrix: false
+  coupling_matrix_keep_option: all  # 'all' or 'top'
+
+  method: plm
+
+  # plmDCA parameters
+  lambda_h: 0.01
+  lambda_J: 0.01
+  eps_conv: 3e-4   # CPU path: NLopt f/x tolerance
+  eps_g: 1e-3      # GPU path: stop a site on max |gradient| <= eps_g
+  maxit: 200
+  fp16_history: false  # GPU path: L-BFGS history in fp16 (approximation, 1.12x)
+  # Screen profile (plmDCA after a cascade, ranking only): fp16_history: true,
+  # maxit: 50 and concatenate.downsample.to: 10000 ran 1.7x faster on random
+  # H. pylori screen pairs and lost no detector hits on 120 screen pairs (the
+  # top contacts move more, so not for contact maps).
+  fast_approximation: false
+  site_batch: 24  # GPU: sites optimised in lockstep per pair (an upper bound)
+
+  # GaussDCA parameters
+  pseudocount: 0.8
+  gauss_threads: auto  # 'auto' or integer
+  gpu_sessions: 4  # concurrent pairs per GPU (plmDCA always runs one)
+
+  # GPU executors, both methods
+  gpu_memory_limit: 0.9  # share of each GPU's free memory the pairs in flight may hold
+  gpu_host_processes: auto  # processes loading alignments and analysing scores; 'auto' or integer (0: in the coordinator)
+  gpu_workers: 16  # pairs in flight; at least gpu_sessions x GPUs + gpu_host_processes
+
+  # Fused screen mode: skip the concatenate stage; the coupling stage then
+  # concatenates each pair in its host processes (gpu_host_processes) and, with
+  # keep_concatenated: false, couples it from memory without writing its zarr.
+  keep_concatenated: true
+
+  # Cascade: couple only the best pairs of a finished GaussDCA run; the rest
+  # are marked SKIPPED. Pairs the GaussDCA run did not finish are still
   # coupled, unless skip_unranked is set.
   # cascade:
   #   source_db: gauss.sqlite3  # DB of the GaussDCA run (default: this project's DB)
