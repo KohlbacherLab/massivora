@@ -226,6 +226,51 @@ couple:
   # unmeasured. Prefer finishing the source run. Pairs the GaussDCA run
   # SKIPPED (pre-gate or its own cascade) are a decision, not an unfinished
   # result: they are never coupled, whatever skip_unranked says.
+  #
+  # adaptive: a self-consistent hand-off threshold instead of keep_fraction /
+  # keep_count (setting both is an error). The plmDCA run releases gated
+  # GaussDCA pairs itself and learns from their results where to stop.
+  #   cascade: {source_db: gauss.sqlite3, min_neffoverL: 0.1,
+  #             adaptive: {model: costaware}}
+  # model: costaware (recommended for screens): stratified random convergence
+  # batches, a score s = P(top-5 % plmDCA call | GaussDCA rank, N, B, Neff/L) /
+  # expected GPU seconds, and a threshold t (share of the gated pairs with
+  # s >= s*) re-estimated after every check_every finished pairs; frozen once t
+  # changes by < freeze_rel_change on freeze_consecutive consecutive checks,
+  # then plmDCA runs on every pair with s >= s*, highest s first. Simulated on
+  # the H. pylori screen (917,537 gated pairs, held-out replicates): ~49 measured
+  # plmDCA-h (cost-model hours x ~1.21), top-call recall >= 0.95 in 200/200,
+  # freeze after ~1,650 pairs. Below min_population gated pairs the
+  # convergence batches would eat most of the set: small_population_mode base
+  # runs the batch mode instead (top_fraction hits, target_recall), full runs
+  # every gated pair. Keys (defaults):
+  #   adaptive:
+  #     model: costaware
+  #     start_fraction: 0.5       # t before the first estimate (t_0 of the rule)
+  #     check_every: 50           # finished pairs per estimate (= batch size)
+  #     freeze_rel_change: 0.01
+  #     freeze_consecutive: 3
+  #     z: 1.0                    # UCB of the missed top calls (mean + z sd)
+  #     target_recall: 0.95
+  #     top_fraction: 0.05        # top calls = plmDCA log_lr_raw in the top 5 %
+  #     strata: 20                # GaussDCA-rank strata of the random batches
+  #     tilt: 3.0                 # their weight for strata above rank tilt_above
+  #     tilt_above: 0.4
+  #     ridge: 1.0
+  #     min_population: 10000
+  #     small_population_mode: base   # or full
+  #     seed: 0
+  #     lead: null                # claimable convergence pairs kept released (null: check_every)
+  #     release_block: 1000       # claimable pairs kept released after the freeze
+  #     running_timeout: 3600     # s; older claims of released pairs are handed back
+  # State: cascade_adaptive, cascade_adaptive_obs, cascade_adaptive_log in the
+  # plmDCA DB (one log row per estimate). model: batch (default) is the batch
+  # loop: start_fraction, target_recall, explore_fraction, batch | batch_fraction,
+  # hit (detector | top_fraction), top_fraction, stable_batches, order, seed.
+  #
+  # claim_timeout: null  # s; claims older than this are handed back at start
+  #                      # and when a claim comes back empty (a job killed past
+  #                      # its SIGTERM grace leaves its pairs RUNNING)
 
   # Applies when one wants to split the calculation to multiple clusters
   # portion: 1.0

@@ -26,7 +26,8 @@ from massivora.alignment import (BinaryAlignment, SharedSourceError,
                                  check_shared_source_strategy,
                                  resolve_run_table_cache, resolve_shared_source)
 from massivora.config import load_project_and_system_config
-from massivora.db import (STATUS, adaptive_cascade_step, apply_cascade, compute_file_hash, connect_db_rw,
+from massivora.db import (STATUS, adaptive_cascade_step, adaptive_mode, apply_cascade, compute_file_hash,
+                          connect_db_rw, reclaim_stale_claims,
                           ensure_columns, get_db_path, get_hashed_file_path,
                           get_table_names, quote_identifier)
 from massivora.utils import (SHM_PREFIX, ShardWriter, compute_id_range,
@@ -122,6 +123,22 @@ class BaseCouplingExecutor(object):
 
         ensure_columns(self._config)
         apply_cascade(self._config)
+        # couple.cascade.adaptive with model: costaware re-estimates its threshold
+        # after every check_every finished pairs, so results are committed (and the
+        # threshold stepped) at least that often, not only when claims run dry.
+        mode = adaptive_mode(self._config)
+        self._adaptive_costaware = mode in ('costaware', 'full')
+        self._adaptive_check = (int(((coupling_cfg.get('cascade') or {}).get('adaptive') or {}).get('check_every') or 50)
+                                if self._adaptive_costaware else None)
+        # couple.claim_timeout (seconds, default off): claims older than this that
+        # never finished (a worker killed past its SIGTERM grace) are handed back
+        # at start and whenever a claim comes back empty.
+        ct = coupling_cfg.get('claim_timeout')
+        self._claim_timeout = float(ct) if ct is not None else None
+        if self._claim_timeout is not None:
+            if not self._claim_timeout > 0:
+                raise ValueError(f"couple.claim_timeout must be > 0 seconds, got {ct}")
+            self._reclaim_stale()
 
         # Maintain database connection for the lifetime of this executor
         self.db_conn = connect_db_rw(self._config)
@@ -193,8 +210,34 @@ class BaseCouplingExecutor(object):
 
     # -- DB helpers --
 
+    def _reclaim_stale(self):
+        conn = connect_db_rw(self._config)
+        try:
+            n = reclaim_stale_claims(conn.cursor(), quote_identifier(self.couple_table), self._claim_timeout)
+            conn.commit()
+        finally:
+            conn.close()
+        return n
+
+    def _adaptive_tick(self):
+        """model: costaware: step the threshold after results were committed (one
+        estimate per check_every new results; tops up the released pairs).
+        Returns the step's status, None if the mode is off."""
+        if not getattr(self, '_adaptive_costaware', False):
+            return None
+        self._adaptive_last = adaptive_cascade_step(self._config)['status']
+        return self._adaptive_last
+
+    def _commit_every(self, default):
+        if getattr(self, '_adaptive_costaware', False):
+            return max(1, min(int(default), int(self._adaptive_check)))
+        return int(default)
+
     def _claim_batch(self, job_id, batch_size, id_range=None):
         rows = self._claim_batch_once(job_id, batch_size, id_range)
+        if not rows and int(batch_size) > 0 and getattr(self, '_claim_timeout', None) is not None:
+            if self._reclaim_stale():
+                rows = self._claim_batch_once(job_id, batch_size, id_range)
         # couple.cascade.adaptive: an empty claim may mean the released batch is used
         # up; re-estimate the threshold and either release the next batch or stop.
         if not rows and int(batch_size) > 0 and ((self._config.get('couple') or {}).get('cascade') or {}).get('adaptive') is not None:
@@ -737,9 +780,11 @@ class BaseCouplingExecutor(object):
 
         last_commit = float(time.time())
         terminating = False
+        no_more_to_claim = False
+        commit_every_tasks = self._commit_every(commit_every_tasks)
 
         def flush(force=False):
-            nonlocal done_updates, fail_ids, skipped_ids, last_commit
+            nonlocal done_updates, fail_ids, skipped_ids, last_commit, no_more_to_claim
             if not done_updates and not fail_ids and not skipped_ids:
                 return 0
 
@@ -755,6 +800,8 @@ class BaseCouplingExecutor(object):
             fail_ids = []
             skipped_ids = []
             last_commit = float(time.time())
+            if n and not terminating and self._adaptive_tick() == 'released':
+                no_more_to_claim = False
             return n
 
         def _on_term(signum, frame):
@@ -1862,9 +1909,11 @@ class SessionGPUExecutor(BaseCouplingExecutor):
         for t in threads:
             t.start()
 
+        commit_every = self._commit_every(64)
+
         def flush(force=False):
             with lock:
-                if not force and len(done_updates) + len(fail_updates) + len(skipped) < 64:
+                if not force and len(done_updates) + len(fail_updates) + len(skipped) < commit_every:
                     return
                 # Scores behind these rows must be on disk before the rows are committed.
                 self._flush_scores()
@@ -1874,6 +1923,8 @@ class SessionGPUExecutor(BaseCouplingExecutor):
                 self._db_apply_results(d, f, s)
             if r:
                 self._db_unclaim(r)
+            if (d or f or s) and not halt.is_set():
+                self._adaptive_tick()
 
         try:
             while True:
@@ -1886,8 +1937,12 @@ class SessionGPUExecutor(BaseCouplingExecutor):
                 work.join()
                 with lock:
                     had_failures = bool(fail_updates)
+                self._adaptive_last = None
                 flush(force=True)
-                if halt.is_set() or not had_failures:
+                # model: costaware: the last commit may have released pairs
+                # (the freeze, or claims reclaimed after running_timeout)
+                more = self._adaptive_costaware and self._adaptive_last == 'released'
+                if halt.is_set() or not (had_failures or more):
                     break
             for _ in threads:
                 work.put(None)

@@ -27,6 +27,15 @@ exploration pairs of a bin stand in for its unseen pairs).
 
 Pure numpy; the simulator (perf/day/adaptive) and the DB driver
 (`massivora.db.adaptive_cascade_step`) share it.
+
+`model: costaware` (CostAwareThreshold, below the batch mode) is the
+fast-converging alternative: stratified random convergence batches, a cost-aware
+score s = P(top call | features known before plmDCA) / expected seconds, a
+threshold t (share of the population with s >= s*) re-estimated after every
+`check_every` completed plmDCA pairs and frozen once it changes by less than
+`freeze_rel_change` on `freeze_consecutive` consecutive checks; then plmDCA runs
+on every pair with s >= s*, highest s first. Below `min_population` gated pairs
+the driver falls back to the batch mode (`small_population_mode: base`).
 """
 import math
 
@@ -39,6 +48,12 @@ DEFAULTS = dict(start_fraction=0.5, target_recall=0.95, explore_fraction=0.05,
 
 
 def config(cfg=None):
+    model = (cfg or {}).get('model', 'batch')
+    if model == 'costaware':
+        return costaware_config(cfg)
+    if model not in ('batch', None):
+        raise ValueError(f"adaptive.model must be batch or costaware, got {model!r}")
+    cfg = {k: v for k, v in (cfg or {}).items() if k != 'model'}
     c = dict(DEFAULTS)
     c.update({k: v for k, v in (cfg or {}).items() if v is not None})
     if c['hit'] not in ('detector', 'top_fraction'):
@@ -296,3 +311,366 @@ def simulate(rank, llr, det, cost, cfg=None, max_batches=10_000):
         if st.converged():
             break
     return st
+
+
+# =============================================================================
+# Cost model of a plmDCA pair (seconds), used by both models
+# =============================================================================
+#
+# Headline-hours model of option A (data H100, fp16 history, maxeval 50):
+# uncapped t = 7.18e-7 N^2 + 3.79e-10 B N^2, times the measured/model ratio of the
+# B stratum (edges 150 / 2,000 / 5,000 / 10,000). The same constants as the
+# simulator (perf/day/adaptive/sim.py cost_s) the cost-aware policy was tuned
+# and tested with. N = alignment length, B = number of sequences (the GaussDCA
+# source row's `length` and `number`). It ranks pairs well (Spearman 0.96 against
+# measured wall time) but is about 14 % low in level; only the ordering matters.
+
+COST_N2 = 7.18e-7
+COST_BN2 = 3.79e-10
+COST_B_EDGES = (150, 2000, 5000, 10000)
+COST_B_RATIO = (1.190, 1.275, 1.285, 0.995, 0.801)
+
+
+def cost_s(N, B):
+    """Expected plmDCA seconds of a pair of length N with B sequences (vectorised)."""
+    N, B = np.asarray(N, float), np.asarray(B, float)
+    r = np.asarray(COST_B_RATIO)[np.searchsorted(COST_B_EDGES, B, side='right')]
+    return r * (COST_N2 * N ** 2 + COST_BN2 * B * N ** 2)
+
+
+# =============================================================================
+# model: costaware -- the fast-converging cost-aware hand-off threshold
+# =============================================================================
+#
+# Population: the gated GaussDCA pairs; per pair, from the source row only (all
+# known before plmDCA runs): GaussDCA rank r (position by log_lr_raw among all
+# ranked pairs, 0 = best), N, B, Neff/L and cost = cost_s(N, B).
+#
+# Convergence batches: stratified random pairs over `strata` equal-count rank
+# strata; each draw goes to the stratum with the largest weight / (pairs drawn
+# there + 1), weight `tilt` for strata starting above rank `tilt_above`, else 1.
+# The batches never depend on the estimate.
+#
+# Estimate (after every `check_every` completed pairs; ~0.5 s on 917k pairs):
+#   1. theta = Horvitz-Thompson (1 - top_fraction) quantile of the observed plmDCA
+#      log_lr_raw (each stratum's unobserved pairs are represented by its observed
+#      pairs, or by the nearest stratum's); y = 1[log_lr_raw >= theta].
+#   2. p = logistic(beta . x), x = [1, log r, hinges of log r at 0.02 / 0.06 /
+#      0.15 / 0.3 / 0.5, log cost, log Neff/L, log N, log B] standardised over the
+#      population; HT-weighted ridge (`ridge`, not on the intercept) logistic
+#      regression, Newton with line search (6 steps), warm-started from the
+#      previous estimate; Cov(beta) = sandwich H^-1 J H^-1.
+#   3. s = p / cost. Order the population by s. missed(f) = sum of p over the
+#      unreleased pairs past the f-th; sd(f)^2 = g' Cov g + sum p(1 - p) over the
+#      same pairs, g = sum p(1 - p) x (delta method); total = observed tops +
+#      sum of p over pairs in flight and unreleased pairs. s* = the score of the
+#      f-th pair for the smallest f with missed + z sd <= (1 - target_recall)
+#      total (on a 4,001-point grid, refined inside the crossing interval);
+#      t = f / n.
+# Freeze: |t_k - t_(k-1)| < freeze_rel_change x t_(k-1) (or no change), t_0 =
+# start_fraction, on freeze_consecutive consecutive estimates. Then beta, theta
+# and s* are fixed and plmDCA runs on every unreleased pair with s >= s*,
+# highest s first.
+#
+# This is the frozen finalist of perf/day/adaptive/fast/costaware (costaware.py,
+# finalist.json: z = 1, m = 3); tests/fixtures/costaware_prototype.py is a copy
+# of that prototype and tests/test_cascade_costaware.py checks parity. Held-out
+# test (reps 80-279): 49.4 measured plmDCA-h (40.9 h on the cost model), top-call
+# recall >= 0.95 in 200/200 reps. Below 10,000 gated pairs the convergence
+# batches eat most of the population and the batch mode is cheaper and safe, so
+# the driver falls back to it there (min_population, small_population_mode).
+
+COSTAWARE_DEFAULTS = dict(model='costaware', start_fraction=0.5, check_every=50, freeze_rel_change=0.01,
+                          freeze_consecutive=3, z=1.0, target_recall=0.95, top_fraction=0.05, strata=20,
+                          tilt=3.0, tilt_above=0.4, ridge=1.0, min_population=10000,
+                          small_population_mode='base', seed=0,
+                          # driver: claimable convergence pairs kept released ahead of the
+                          # estimate (None = check_every), pairs released per step after the
+                          # freeze, seconds after which a claimed pair is reclaimed
+                          lead=None, release_block=1000, running_timeout=3600.0)
+COSTAWARE_KNOTS = (0.02, 0.06, 0.15, 0.3, 0.5)
+COSTAWARE_NEWTON = 6
+COSTAWARE_GRID = 4001
+SMALL_POPULATION_MODES = ('base', 'full')
+
+
+def costaware_config(cfg=None):
+    c = dict(COSTAWARE_DEFAULTS)
+    c.update({k: v for k, v in (cfg or {}).items() if v is not None})
+    unknown = set(c) - set(COSTAWARE_DEFAULTS)
+    if unknown:
+        raise ValueError(f"adaptive (model costaware): unknown keys {sorted(unknown)}")
+    for k in ('start_fraction', 'freeze_rel_change'):
+        if not 0.0 < float(c[k]) <= 1.0:
+            raise ValueError(f"adaptive.{k} must be in (0, 1], got {c[k]}")
+    for k in ('target_recall', 'top_fraction'):
+        if not 0.0 < float(c[k]) < 1.0:
+            raise ValueError(f"adaptive.{k} must be in (0, 1), got {c[k]}")
+    if not 0.0 <= float(c['tilt_above']) <= 1.0:
+        raise ValueError(f"adaptive.tilt_above must be in [0, 1], got {c['tilt_above']}")
+    for k in ('z', 'ridge'):
+        if not float(c[k]) >= 0.0:
+            raise ValueError(f"adaptive.{k} must be >= 0, got {c[k]}")
+    for k in ('tilt', 'running_timeout'):
+        if not float(c[k]) > 0.0:
+            raise ValueError(f"adaptive.{k} must be > 0, got {c[k]}")
+    for k in ('check_every', 'freeze_consecutive', 'strata', 'release_block'):
+        if int(c[k]) != float(c[k]) or int(c[k]) < 1:
+            raise ValueError(f"adaptive.{k} must be an integer >= 1, got {c[k]}")
+    if int(c['min_population']) != float(c['min_population']) or int(c['min_population']) < 0:
+        raise ValueError(f"adaptive.min_population must be an integer >= 0, got {c['min_population']}")
+    if c['small_population_mode'] not in SMALL_POPULATION_MODES:
+        raise ValueError(f"adaptive.small_population_mode must be one of {SMALL_POPULATION_MODES}, "
+                         f"got {c['small_population_mode']!r}")
+    if c['lead'] is None:
+        c['lead'] = int(c['check_every'])
+    if int(c['lead']) != float(c['lead']) or int(c['lead']) < 1:
+        raise ValueError(f"adaptive.lead must be an integer >= 1, got {c['lead']}")
+    for k in ('check_every', 'freeze_consecutive', 'strata', 'release_block', 'min_population', 'lead', 'seed'):
+        c[k] = int(c[k])
+    for k in ('start_fraction', 'freeze_rel_change', 'target_recall', 'top_fraction', 'tilt_above', 'z', 'ridge',
+              'tilt', 'running_timeout'):
+        c[k] = float(c[k])
+    return c
+
+
+def costaware_design(rank, cost, neffoverL, N, B, knots=COSTAWARE_KNOTS):
+    """Standardised design matrix [1, log r, hinges, log cost, log Neff/L, log N, log B]."""
+    lr = np.log(np.maximum(np.asarray(rank, float), 1e-3))
+    cols = [lr] + [np.maximum(0.0, lr - k) for k in np.log(knots)]
+    cols.append(np.log(np.maximum(np.asarray(cost, float), 1e-12)))
+    cols.append(np.log(np.maximum(np.asarray(neffoverL, float), 1e-6)))
+    cols += [np.log(np.maximum(np.asarray(N, float), 1.0)), np.log(np.maximum(np.asarray(B, float), 1.0))]
+    X = np.column_stack(cols)
+    if np.isnan(X).any():               # a source row without Neff/L (no gate): the population mean
+        mu, sd = np.nanmean(X, 0), np.nanstd(X, 0) + 1e-12
+        Z = np.nan_to_num((X - mu) / sd, nan=0.0)
+    else:
+        mu, sd = X.mean(0), X.std(0) + 1e-12
+        Z = (X - mu) / sd
+    return np.column_stack([np.ones(len(lr)), Z])
+
+
+def _sigmoid(eta):
+    return 1.0 / (1.0 + np.exp(-np.clip(eta, -30, 30)))
+
+
+def _penalised_ll(X, y, w, beta, L):
+    eta = X @ beta
+    return float((w * (y * eta - np.logaddexp(0, eta))).sum() - 0.5 * beta @ L @ beta)
+
+
+def fit_ridge_logistic(X, y, w, beta, ridge, iters=COSTAWARE_NEWTON):
+    """Weighted ridge logistic regression (Newton with step halving, warm start
+    `beta`). Returns beta and its sandwich covariance H^-1 J H^-1 with
+    J = sum w^2 (y - p)^2 x x'."""
+    L = np.eye(X.shape[1]) * float(ridge)
+    L[0, 0] = 1e-6
+    beta = np.asarray(beta, float).copy()
+    cur = _penalised_ll(X, y, w, beta, L)
+    for _ in range(int(iters)):
+        p = _sigmoid(X @ beta)
+        H = X.T @ (X * (w * p * (1 - p))[:, None]) + L
+        g = X.T @ (w * (y - p)) - L @ beta
+        step = np.linalg.solve(H, g)
+        a = 1.0
+        while True:
+            nb = beta + a * step
+            new = _penalised_ll(X, y, w, nb, L)
+            if new >= cur - 1e-9 or a < 1e-3:
+                break
+            a /= 2
+        beta, cur = nb, new
+        if np.abs(a * step).max() < 1e-5:
+            break
+    p = _sigmoid(X @ beta)
+    H = X.T @ (X * (w * p * (1 - p))[:, None]) + L
+    Hinv = np.linalg.inv(H)
+    J = X.T @ (X * (w ** 2 * (y - p) ** 2)[:, None])
+    return beta, Hinv @ J @ Hinv
+
+
+class CostAwareThreshold:
+    """
+    The cost-aware hand-off threshold over a gated population of n pairs.
+
+    Stateless between calls apart from caches: `block()` draws the next
+    convergence pairs, `estimate()` turns the observed results into (t, s*), so
+    the DB driver rebuilds everything from its tables.
+    """
+
+    def __init__(self, rank, cost, neffoverL, N, B, cfg=None):
+        self.c = c = costaware_config(cfg)
+        self.rank = np.asarray(rank, float)
+        self.cost = np.asarray(cost, float)
+        self.n = n = len(self.rank)
+        self.X = costaware_design(self.rank, self.cost, neffoverL, N, B)
+        self.order_rank = np.argsort(self.rank, kind='stable')
+        pos = np.empty(n, int)
+        pos[self.order_rank] = np.arange(n)
+        self.nb = nb = max(1, min(c['strata'], n))
+        self.bin = (pos * nb) // max(n, 1)
+        lo = np.array([self.rank[self.order_rank[min(int(b * n / nb), n - 1)]] for b in range(nb)]) if n else \
+            np.zeros(nb)
+        self.alloc = np.where(lo < c['tilt_above'], c['tilt'], 1.0)
+        self.grid = np.unique(np.linspace(0, n - 1, COSTAWARE_GRID).astype(int)) if n else np.array([], int)
+
+    def initial_beta(self):
+        beta = np.zeros(self.X.shape[1])
+        q = self.c['top_fraction']
+        beta[0] = math.log(q / (1 - q))
+        return beta
+
+    # -- freeze rule --------------------------------------------------------------
+
+    def check(self, t_prev, t_new):
+        """(passes, relative change) of one convergence check."""
+        d = abs(float(t_new) - float(t_prev))
+        ok = d == 0.0 or d < self.c['freeze_rel_change'] * float(t_prev)
+        return bool(ok), (d / float(t_prev) if t_prev else (0.0 if d == 0 else math.inf))
+
+    # -- convergence batches ------------------------------------------------------
+
+    def block(self, released, explored, rng, k):
+        """k stratified random unreleased pairs (indices, in draw order).
+        `released`: pairs already handed to plmDCA (in flight or finished);
+        `explored`: the convergence pairs among them (the allocation counts them)."""
+        left = np.flatnonzero(~np.asarray(released, bool))
+        ex_b = np.bincount(self.bin[np.asarray(explored, bool)], minlength=self.nb).astype(float)
+        un_b = np.bincount(self.bin[left], minlength=self.nb)
+        out, taken = [], {}
+        for _ in range(min(int(k), len(left))):
+            live = np.flatnonzero(un_b > 0)
+            if not len(live):
+                break
+            b = live[np.argmax(self.alloc[live] / (ex_b[live] + 1.0))]
+            if b not in taken:
+                taken[b] = list(rng.permutation(left[self.bin[left] == b]))
+            out.append(int(taken[b].pop()))
+            ex_b[b] += 1
+            un_b[b] -= 1
+        return np.asarray(out, int)
+
+    # -- estimator ----------------------------------------------------------------
+
+    def ht_weights(self, obs, avail):
+        """HT weights: 1 per observed pair, plus each stratum's unobserved
+        (available) pairs spread over its observed pairs (over the nearest
+        stratum's if it has none)."""
+        u_b = np.bincount(self.bin[avail & ~obs], minlength=self.nb).astype(float)
+        e_b = np.bincount(self.bin[obs], minlength=self.nb).astype(float)
+        add = np.zeros(self.nb)
+        has = np.flatnonzero(e_b > 0)
+        for b in np.flatnonzero(u_b > 0):
+            if e_b[b] > 0:
+                add[b] += u_b[b] / e_b[b]
+            elif len(has):
+                bb = has[np.argmin(np.abs(has - b))]
+                add[bb] += u_b[b] / e_b[bb]
+        w = obs.astype(float)
+        w[obs] += add[self.bin[obs]]
+        return w
+
+    def scores(self, beta):
+        p = _sigmoid(self.X @ np.asarray(beta, float))
+        return p, p / self.cost
+
+    def estimate(self, obs_idx, llr, released=None, failed=None, beta_prev=None):
+        """
+        (t, s*) from the observed pairs `obs_idx` with plmDCA log_lr_raw `llr`.
+        `released`: pairs handed to plmDCA (default: the observed ones); those
+        not observed and not `failed` are in flight: they will run, so they are
+        never missed, and their p counts towards the total. `failed`: released
+        pairs that ended without a result (left out of the population).
+        `beta_prev`: the previous fit (warm start).
+        """
+        c, n = self.c, self.n
+        obs = np.zeros(n, bool)
+        obs[np.asarray(obs_idx, int)] = True
+        plm = np.full(n, np.nan)
+        plm[np.asarray(obs_idx, int)] = np.asarray(llr, float)
+        released = obs.copy() if released is None else (np.asarray(released, bool) | obs)
+        failed = np.zeros(n, bool) if failed is None else (np.asarray(failed, bool) & ~obs)
+        seen = np.flatnonzero(obs)
+        wall = self.ht_weights(obs, ~failed)
+        v, ww = plm[seen], wall[seen]
+        o = np.argsort(-v)
+        cw = np.cumsum(ww[o]) / ww.sum()
+        theta = float(v[o][min(int(np.searchsorted(cw, c['top_fraction'])), len(o) - 1)])
+        y = (plm[seen] >= theta).astype(float)
+        w = wall[seen] / wall[seen].mean()
+        beta0 = self.initial_beta() if beta_prev is None else np.asarray(beta_prev, float)
+        beta, cov = fit_ridge_logistic(self.X[seen], y, w, beta0, c['ridge'])
+        p, score = self.scores(beta)
+        un = ~released
+        inflight = released & ~obs & ~failed
+        found = float(y.sum())
+        total = found + float(p[inflight].sum()) + float(p[un].sum())
+        budget = (1.0 - c['target_recall']) * total
+        o = np.argsort(-score, kind='stable')
+        pu = np.where(un[o], p[o], 0.0)
+        vu = pu * (1 - pu)
+        m_suf = np.cumsum(pu[::-1])[::-1]
+        v_suf = np.cumsum(vu[::-1])[::-1]
+        G = np.cumsum((self.X[o] * vu[:, None])[::-1], axis=0)[::-1]
+
+        def ucb(ix):
+            Gi = G[ix]
+            return m_suf[ix] + c['z'] * np.sqrt(np.maximum(np.einsum('ij,jk,ik->i', Gi, cov, Gi) + v_suf[ix], 0))
+
+        grid = self.grid
+        okg = np.flatnonzero(ucb(grid) <= budget)          # a cut before f keeps positions 0..f-1
+        if not len(okg):
+            f = n
+        elif okg[0] == 0:
+            f = 0
+        else:
+            ix = np.arange(grid[okg[0] - 1], grid[okg[0]] + 1)
+            f = int(ix[np.flatnonzero(ucb(ix) <= budget)[0]])
+        s_star = float(score[o[f - 1]]) if f > 0 else math.inf
+        return dict(n_obs=int(len(seen)), n_inflight=int(inflight.sum()), n_failed=int(failed.sum()),
+                    t=f / n, f=int(f), s_star=s_star, theta=theta, found=found, total_hat=total,
+                    missed_hat=float(m_suf[f]) if f < n else 0.0, beta=[float(b) for b in beta])
+
+    def selection(self, beta, s_star):
+        """Mask of the pairs the frozen rule runs, and their order (highest s first)."""
+        _, score = self.scores(beta)
+        sel = score >= s_star
+        idx = np.flatnonzero(sel)
+        return sel, idx[np.argsort(-score[idx], kind='stable')]
+
+
+def simulate_costaware(rank, cost, neffoverL, N, B, llr, cfg=None):
+    """The cost-aware policy end to end against a table with full plmDCA results,
+    one convergence batch of check_every pairs at a time with no pairs in flight
+    (the prototype's setting; one random stream seeded `seed`). Returns
+    (run mask, history, frozen record or None)."""
+    st = CostAwareThreshold(rank, cost, neffoverL, N, B, cfg)
+    c = st.c
+    llr = np.asarray(llr, float)
+    rng = np.random.default_rng(c['seed'])
+    released = np.zeros(st.n, bool)
+    obs = []
+    t_prev, beta, streak, frozen, hist = c['start_fraction'], None, 0, None, []
+    while not released.all():
+        idx = st.block(released, released, rng, c['check_every'])
+        if not len(idx):
+            break
+        released[idx] = True
+        obs.extend(int(i) for i in idx)
+        seen = np.flatnonzero(released)
+        rec = st.estimate(seen, llr[seen], released, None, beta)
+        ok, rel = st.check(t_prev, rec['t'])
+        streak = streak + 1 if ok else 0
+        rec.update(t_prev=t_prev, rel_change=rel, check_ok=ok, streak=streak,
+                   frozen=streak >= c['freeze_consecutive'])
+        hist.append(rec)
+        t_prev, beta = rec['t'], rec['beta']
+        if rec['frozen']:
+            frozen = rec
+            break
+    rec = frozen or (hist[-1] if hist else None)
+    run = released.copy()
+    if rec is not None:
+        run |= st.selection(rec['beta'], rec['s_star'])[0]
+    return run, hist, frozen
