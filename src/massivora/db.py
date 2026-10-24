@@ -591,27 +591,81 @@ def create_job_db(cfg: dict):
     conn.close()
 
 
-
 # ORDER BY clauses `couple.cascade.rank_by` may choose from.
-# The 0.30 default keeps ~97 % of plmDCA's top-5 % calls on the he2021 benchmark
+# keep_fraction 0.30 keeps ~97 % of plmDCA's top-5 % calls on the he2021 benchmark
 # and H. pylori, at ~4.5x less screen compute; 0.16 keeps only ~90 % (8.3x).
 CASCADE_RANKS = {
     'log_lr_raw': 'log_lr_raw DESC',
     'high_precision_hit': 'high_precision_hit DESC, log_lr_raw DESC',
 }
 
+# `couple.cascade.keep_denominator`: what `keep_fraction` is a fraction of.
+CASCADE_DENOMINATORS = ('ranked', 'ranked_plus_skipped')
+
+
+def _cascade_keep_rule(cascade: dict):
+    """
+    Validate the keep rule of a `couple.cascade` block.
+
+    Returns (fraction, count, denominator): exactly one of fraction / count is
+    set, or neither (keep every ranked pair: the block only gates or skips).
+    """
+    has_fraction = cascade.get('keep_fraction') is not None
+    has_count = cascade.get('keep_count') is not None
+    if has_fraction and has_count:
+        raise ValueError("couple.cascade: set keep_fraction or keep_count, not both")
+    fraction = count = None
+    if has_fraction:
+        fraction = float(cascade['keep_fraction'])
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError(f"couple.cascade.keep_fraction must be in (0, 1], got {fraction}")
+    if has_count:
+        raw = cascade['keep_count']
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw != int(raw) or int(raw) < 1:
+            raise ValueError(f"couple.cascade.keep_count must be a positive integer, got {raw!r}")
+        count = int(raw)
+    denominator = cascade.get('keep_denominator')
+    if denominator is None:
+        denominator = 'ranked'
+    elif has_count:
+        raise ValueError("couple.cascade.keep_denominator only applies to keep_fraction, not keep_count")
+    elif denominator not in CASCADE_DENOMINATORS:
+        raise ValueError(f"couple.cascade.keep_denominator must be one of {CASCADE_DENOMINATORS}, "
+                         f"got {denominator!r}")
+    return fraction, count, denominator
+
 
 def apply_cascade(cfg: dict):
     """
     Restrict a coupling run to the best pairs of a finished GaussDCA run.
 
-    With `couple.cascade` set, only the `keep_fraction` best-ranked DONE pairs
-    of the source run stay claimable; every other pair the source scored is
-    marked SKIPPED. With `min_neffoverL` set, kept pairs whose source
-    `neffoverL` (Beff / L of the concatenated alignment) is below it are
-    marked SKIPPED as well: below Beff / L ~ 0.1 the detector fires on 6-7 %
-    of labelled negatives and 3 % of labelled positives (its design FPR is
-    0.1 %), so a call there is an artefact of the shallow alignment.
+    With `couple.cascade` set, only the best-ranked DONE pairs of the source
+    run stay claimable; every other pair the source scored is marked SKIPPED.
+    The keep rule is `keep_fraction` (a share) or `keep_count` (a number of
+    pairs), exactly one of the two; with neither, every ranked pair is kept
+    and the block only gates (`min_neffoverL`) or skips (`skip_unranked`).
+
+    `keep_fraction` is by default a share of the ranked (DONE) source rows.
+    With `keep_denominator: ranked_plus_skipped` it is a share of the ranked
+    rows plus the rows the source left SKIPPED, so the number of pairs kept
+    does not shrink when the source stage itself gates by depth (the
+    GaussDCA pre-gate marks pairs below `min_neffoverL` SKIPPED with no
+    score). NOTE: this reproduces the pair *budget* of an ungated source, not
+    the gated *set*: the gated set "top 20 % of all scored pairs, then
+    Neff / L >= 0.1" is the ungated pairs above one score threshold, and
+    under a pre-gate that is `keep_count` (the gated set's size) -- a fraction
+    of ranked + skipped keeps 0.2 of all pairs, all of them above the gate,
+    i.e. 3x the gated set on the H. pylori screen.
+
+    With `min_neffoverL` set, kept pairs whose source `neffoverL` (Beff / L
+    of the concatenated alignment) is below it are marked SKIPPED as well:
+    below Beff / L ~ 0.1 the detector fires on 6-7 % of labelled negatives and
+    3 % of labelled positives (its design FPR is 0.1 %), so a call there is
+    an artefact of the shallow alignment. A block that carries only
+    `min_neffoverL` (no keep rule) keeps everything above the gate. Without a
+    source run (no `source_db` / `source_table`: the block belongs to the
+    stage that applies the gate while scoring, i.e. the GaussDCA pre-gate)
+    there is nothing to rank and the call is a no-op.
 
     A source row with NULL `neffoverL`, or a source table without the column,
     is never gated; both are logged at WARNING with counts, because a gate
@@ -623,35 +677,41 @@ def apply_cascade(cfg: dict):
     screen those 12,457 FAILED rows have median B 7,129, i.e. they are the deep
     pairs the gate exists to protect -- so it is a separate key and off by
     default. RUNNING rows are never skipped: the source may still be working on
-    them, and every worker calls apply_cascade at start.
+    them, and every worker calls apply_cascade at start. Pairs the source
+    itself SKIPPED (its own cascade or depth gate declined them) are unranked
+    too, but they are a decision, not an unfinished result: they are always
+    SKIPPED here, whatever `skip_unranked` and the gate say, and they never
+    count towards `keep_fraction` of `ranked`.
 
     Only NOOPT and SKIPPED rows change, so running, finished and retried pairs
-    are left alone. Idempotent, and a larger `keep_fraction` or a lower gate
-    hands skipped pairs back, so every worker calls it at start.
+    are left alone. Idempotent, and a larger keep rule, a lower gate or a
+    source row that later finishes hands skipped pairs back, so every worker
+    calls it at start.
 
     Parameters
     ----------
     `cfg` — dict
         Configuration dict. `couple.cascade` keys: `source_db` (SQLite file of
         the GaussDCA run, relative to project_path; default this project's DB),
-        `source_table` (default `couple.db_table`), `keep_fraction` (default
-        0.30), `rank_by` (a key of `CASCADE_RANKS`, default `log_lr_raw`),
-        `min_neffoverL` (float, default None: no depth gate) and
-        `skip_unranked` (bool, default False: pairs the source never finished
-        stay claimable)
+        `source_table` (default `couple.db_table`), `keep_fraction` (float in
+        (0, 1]) or `keep_count` (positive int), at most one of them (default:
+        keep every ranked pair), `keep_denominator` (`ranked`, the default, or
+        `ranked_plus_skipped`; keep_fraction only), `rank_by` (a key of
+        `CASCADE_RANKS`, default `log_lr_raw`), `min_neffoverL` (float,
+        default None: no depth gate) and `skip_unranked` (bool, default False:
+        pairs the source never finished stay claimable)
 
     Returns
     -------
     `tuple` or `None`
-        (pairs ranked, pairs kept, rows changed), or None without a cascade;
-        "kept" counts the ranked pairs that stay claimable after the gate
+        (pairs ranked, pairs kept, rows changed), or None without a cascade or
+        without a source run to rank; "kept" counts the ranked pairs that stay
+        claimable after the gate
     """
     cascade = (cfg.get('couple') or {}).get('cascade')
     if not cascade:
         return None
-    fraction = float(cascade.get('keep_fraction', 0.30))
-    if not 0.0 < fraction <= 1.0:
-        raise ValueError(f"couple.cascade.keep_fraction must be in (0, 1], got {fraction}")
+    fraction, count, denominator = _cascade_keep_rule(cascade)
     rank_by = cascade.get('rank_by', 'log_lr_raw')
     if rank_by not in CASCADE_RANKS:
         raise ValueError(f"couple.cascade.rank_by must be one of {sorted(CASCADE_RANKS)}, got {rank_by!r}")
@@ -661,6 +721,9 @@ def apply_cascade(cfg: dict):
         if not gate >= 0.0:
             raise ValueError(f"couple.cascade.min_neffoverL must be >= 0 or null, got {gate}")
     skip_unfinished = bool(cascade.get('skip_unranked', False))
+    if fraction is None and count is None and gate is None and not skip_unfinished:
+        raise ValueError("couple.cascade does nothing: set keep_fraction or keep_count, "
+                         "min_neffoverL, or skip_unranked")
 
     couple_table = get_table_names(cfg)['couplings']
     source_table = cascade.get('source_table', couple_table)
@@ -669,6 +732,12 @@ def apply_cascade(cfg: dict):
         source_cfg['database'] = {**cfg['database'], 'filename': cascade['source_db']}
     if (get_db_config(source_cfg).get('filename') == get_db_config(cfg).get('filename')
             and source_table == couple_table):
+        if fraction is None and count is None:
+            # The block belongs to the stage that gates while scoring (the
+            # GaussDCA pre-gate reads min_neffoverL itself); nothing to rank here.
+            logging.info("couple.cascade names no source run (no source_db / source_table) "
+                         "and no keep rule: nothing to rank, the gate applies in the scoring stage")
+            return None
         raise ValueError("couple.cascade needs the GaussDCA run in another DB (source_db) "
                          "or another table (source_table)")
 
@@ -685,6 +754,9 @@ def apply_cascade(cfg: dict):
             f"ORDER BY {CASCADE_RANKS[rank_by]}, id",
             (STATUS['DONE'],))
         ranked = cur.fetchall()
+        # Rows the source declined (its own cascade or depth gate): never claimable
+        cur.execute(f"SELECT name FROM {quoted_source} WHERE status = ?", (STATUS['SKIPPED'],))
+        skip_source = {row[0] for row in cur.fetchall()}
         unranked = []
         if skip_unfinished:
             # RUNNING is deliberately excluded: a source worker may still be on that
@@ -692,12 +764,21 @@ def apply_cascade(cfg: dict):
             # would make the kept set depend on who ran when (fused mode races).
             cur.execute(
                 f"SELECT name FROM {quoted_source} "
-                f"WHERE status IS NOT NULL AND status NOT IN (?, ?)",
-                (STATUS['DONE'], STATUS['RUNNING']))
+                f"WHERE status IS NOT NULL AND status NOT IN (?, ?, ?)",
+                (STATUS['DONE'], STATUS['RUNNING'], STATUS['SKIPPED']))
             unranked = [row[0] for row in cur.fetchall()]
     finally:
         src.close()
-    n_keep = math.ceil(fraction * len(ranked))
+    if count is not None:
+        n_keep = min(count, len(ranked))
+        rule = f"top {count} pairs"
+    elif fraction is not None:
+        base = len(ranked) + (len(skip_source) if denominator == 'ranked_plus_skipped' else 0)
+        n_keep = min(len(ranked), math.ceil(fraction * base))
+        rule = f"top {fraction:g} of {denominator} ({base})"
+    else:
+        n_keep = len(ranked)
+        rule = "every ranked pair"
     skip_rank = {name for name, _ in ranked[n_keep:]}
     skip_depth = set()
     ungated = 0
@@ -706,7 +787,7 @@ def apply_cascade(cfg: dict):
                       if depth is not None and float(depth) < gate}
         ungated = sum(1 for _, depth in ranked[:n_keep] if depth is None)
     skip_unranked = set(unranked)
-    skip = skip_rank | skip_depth | skip_unranked
+    skip = skip_rank | skip_depth | skip_unranked | skip_source
 
     # A gate that silently gates nothing is a 2-3x cost blowout, not a no-op: on the
     # H. pylori screen the top 20 % is 238,721 pairs (50.7 model h) against 76,212
@@ -740,9 +821,9 @@ def apply_cascade(cfg: dict):
         conn.close()
     kept = n_keep - len(skip_depth)
     logging.info(f"cascade: keeping {kept} of {len(ranked)} GaussDCA pairs from "
-                 f"{source_table} (top {fraction:g} by {rank_by}"
+                 f"{source_table} ({rule} by {rank_by}"
                  + (f", neffoverL >= {gate:g}" if gate is not None else "") + "); "
                  f"skipped by rank {len(skip_rank)}, by depth {len(skip_depth)}, "
-                 f"unfinished-in-source {len(skip_unranked)}, ungated (NULL depth) {ungated}"
-                 + f"; {len(changes)} rows changed")
+                 f"unfinished-in-source {len(skip_unranked)}, skipped-in-source {len(skip_source)}, "
+                 f"ungated (NULL depth) {ungated}; {len(changes)} rows changed")
     return len(ranked), kept, len(changes)
