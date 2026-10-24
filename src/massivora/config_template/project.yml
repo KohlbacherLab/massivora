@@ -262,7 +262,10 @@ couple:
   #     seed: 0
   #     lead: null                # claimable convergence pairs kept released (null: check_every)
   #     release_block: 1000       # claimable pairs kept released after the freeze
-  #     running_timeout: 3600     # s; older claims of released pairs are handed back
+  #     running_timeout: 3600     # s; older claims of released pairs are handed back.
+  #                               # Keep it above the longest claim-to-result time
+  #                               # (claim depth x seconds per pair): a live claim
+  #                               # handed back may run twice (e2e, 600 s: 4 of 102)
   # State: cascade_adaptive, cascade_adaptive_obs, cascade_adaptive_log in the
   # plmDCA DB (one log row per estimate). model: batch (default) is the batch
   # loop: start_fraction, target_recall, explore_fraction, batch | batch_fraction,
