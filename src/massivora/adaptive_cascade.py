@@ -204,19 +204,22 @@ class AdaptiveCascade:
         nS, nM = len(seq), len(main)
         known = np.zeros(nS)
         known[:nM] = h[main]
-        onehot = np.zeros((nS, self.nb))
-        if len(order):
-            onehot[np.arange(nM, nS), self.bin[order]] = 1.0
         # suffix sums: hits / unseen pairs per bin at positions >= f
         suf_known = np.concatenate([np.cumsum(known[::-1])[::-1], [0.0]])
-        suf_U = np.vstack([np.cumsum(onehot[::-1], axis=0)[::-1], np.zeros((1, self.nb))])
         grid = np.unique(np.concatenate([np.linspace(0, nS, min(nS, 1000) + 1).astype(int),
                                          np.arange(max(nM - 2 * self.batch_size, 0),
                                                    min(nM + 2 * self.batch_size, nS) + 1)]))
-        missed = suf_known[grid][:, None] + suf_U[grid] @ P.T      # grid x draws
+        upos = np.arange(nM, nS)
+        ubin = self.bin[order] if len(order) else np.array([], int)
+        suf_U_grid = np.zeros((len(grid), self.nb))
+        for b in range(self.nb):
+            pb = upos[ubin == b]                        # sorted positions of bin b's unseen pairs
+            suf_U_grid[:, b] = len(pb) - np.searchsorted(pb, grid, side='left')
+        U_now = np.bincount(ubin, minlength=self.nb).astype(float)
+        missed = suf_known[grid][:, None] + suf_U_grid @ P.T      # grid x draws
         ucb = np.quantile(missed, float(c['ucb']), axis=1)
         found = float(h.sum())
-        total = found + float(suf_U[nM] @ pbar)
+        total = found + float(U_now @ pbar)
         budget = (1.0 - float(c['target_recall'])) * total
         ok = np.flatnonzero(ucb <= budget)
         t_star = int(grid[ok[0]]) if len(ok) else nS
