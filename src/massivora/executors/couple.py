@@ -1557,6 +1557,12 @@ def _host_init(cls, state):
         os._exit(0)
 
     threading.Thread(target=leave_with_coordinator, daemon=True).start()
+    # The coordinator handles SIGTERM / SIGINT (finish what is on the GPUs, hand
+    # the rest back) and then shuts this pool down. A signal sent to the whole
+    # process group (Ctrl-C, coreutils `timeout`) must not kill the pairs this
+    # process is loading or analysing first.
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, signal.SIG_IGN)
 
 
 class PairArrays(object):
@@ -1810,11 +1816,23 @@ class SessionGPUExecutor(BaseCouplingExecutor):
         halt = threading.Event()
         underestimated = threading.Event()
 
+        first_signal = []
+
         def on_signal(signum, frame):
-            halt.set()
             # A second signal gets the handler that was there before: it stops
-            # the job at once.
-            signal.signal(signum, previous_handlers.get(signum, signal.SIG_DFL))
+            # the job at once. Copies within a second are one signal: coreutils
+            # `timeout` (without --foreground) sends its signal to the job and
+            # again to its process group, and taking the copy as a second signal
+            # killed the job before it handed its claimed pairs back (they
+            # stayed RUNNING).
+            now = time.monotonic()
+            if first_signal:
+                if now - first_signal[0] > 1.0:
+                    signal.signal(signum, previous_handlers.get(signum, signal.SIG_DFL))
+                    os.kill(os.getpid(), signum)
+                return
+            first_signal.append(now)
+            halt.set()
             logging.warning(f"{self.GPU_LABEL}: received signal %d; finishing the pairs on the "
                             "GPUs and handing the rest back", signum)
 

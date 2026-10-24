@@ -1320,7 +1320,7 @@ def test_gpu_gaussdca_stops_cleanly_on_sigterm(tmp_path, couple, monkeypatch, ca
         if MSA[0, 0] == rows_before['A1-B1']['id']:
             signal.pthread_kill(threading.main_thread().ident, signal.SIGTERM)
             deadline = time.monotonic() + 5
-            while signal.getsignal(signal.SIGTERM) is not original:     # handled
+            while 'received signal' not in caplog.text:                  # handled
                 assert time.monotonic() < deadline
                 time.sleep(0.01)
         return _symmetric(MSA.shape[0], seed=int(MSA[0, 0])).astype(np.float32)
@@ -1337,6 +1337,42 @@ def test_gpu_gaussdca_stops_cleanly_on_sigterm(tmp_path, couple, monkeypatch, ca
         assert rows[name]['status'] == STATUS['NOOPT']
         assert rows[name]['job_id'] is None and rows[name]['claimed_at'] is None
     assert 'stopped on a signal' in caplog.text
+    assert signal.getsignal(signal.SIGTERM) is original
+
+
+def test_gpu_executor_takes_a_doubled_sigterm_as_one(tmp_path, couple, monkeypatch, caplog):
+    """coreutils `timeout` signals the job and its process group: the copy that
+    arrives right after the first SIGTERM must not kill the job before it hands
+    its claimed pairs back."""
+    import signal
+    import threading
+    import time
+    cfg = _couple_project(tmp_path, n_pairs=5, gpu_sessions=1, gpu_workers=1)
+    rows_before = _couplings(tmp_path)
+    original = signal.getsignal(signal.SIGTERM)
+
+    def score(MSA):
+        if MSA[0, 0] == rows_before['A1-B1']['id']:
+            for _ in range(2):
+                signal.pthread_kill(threading.main_thread().ident, signal.SIGTERM)
+                deadline = time.monotonic() + 5
+                while 'received signal' not in caplog.text:
+                    assert time.monotonic() < deadline
+                    time.sleep(0.01)
+        return _symmetric(MSA.shape[0], seed=int(MSA[0, 0])).astype(np.float32)
+
+    _fake_gauss_cuda(couple, monkeypatch, score=score)
+    executor = _fake_gpu_executor(couple, monkeypatch, cfg)
+
+    with caplog.at_level(logging.WARNING):
+        executor.run()
+
+    rows = _couplings(tmp_path)
+    assert rows['A0-B0']['status'] == rows['A1-B1']['status'] == STATUS['DONE']
+    for name in ('A2-B2', 'A3-B3', 'A4-B4'):
+        assert rows[name]['status'] == STATUS['NOOPT']
+        assert rows[name]['job_id'] is None and rows[name]['claimed_at'] is None
+    assert caplog.text.count('received signal') == 1
     assert signal.getsignal(signal.SIGTERM) is original
 
 
