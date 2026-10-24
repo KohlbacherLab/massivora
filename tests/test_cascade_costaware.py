@@ -289,7 +289,8 @@ def test_estimates_every_check_every_completed_pairs(project):
     log = _log(path)
     assert [r['k'] for r in log] == [0, 1, 2]
     assert [r['n_obs'] for r in log[1:]] == [50, 100]
-    assert log[1]['n_inflight'] == 100 and log[2]['n_inflight'] == 50
+    # in flight: finished but not in a chunk yet (70, then 20); the 30 nobody claimed are not
+    assert log[1]['n_inflight'] == 70 and log[2]['n_inflight'] == 20
     assert log[1]['t_prev'] == 0.5 and log[2]['t_prev'] == log[1]['t']
     # the 20 left over and 30 more: one more estimate
     _work(path, truth, limit=30)

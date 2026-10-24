@@ -1336,6 +1336,7 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
                         f"LEFT JOIN cascade_adaptive_obs o ON o.name = a.name ORDER BY a.seq")
             rel = cur.fetchall()
             rel_m = np.zeros(n, bool)
+            pool = np.zeros(n, bool)            # released, not claimed yet
             explored = np.zeros(n, bool)
             failed = np.zeros(n, bool)
             new_ok, new_bad, unclaimed, claimable = [], [], [], 0
@@ -1355,6 +1356,7 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
                         failed[i] = True
                 if status in (STATUS['NOOPT'], STATUS['PENDING']) and claimed is None:
                     claimable += 1
+                    pool[i] = True
                     if status == STATUS['NOOPT'] and role == 'explore':
                         unclaimed.append(i)
             cur.executemany("INSERT OR IGNORE INTO cascade_adaptive_obs (name, k) VALUES (?, -1)",
@@ -1381,7 +1383,11 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
                     obs.append(i)
                     llr_o.append(l)
                 t0 = time.perf_counter()
-                est = model.estimate(obs, llr_o, rel_m, failed, beta)
+                # in flight = claimed or finished but not in a chunk yet: they run whatever
+                # t is, so they are never missed. Released pairs nobody claimed yet are
+                # treated as unreleased (missed if below s*), which is what lets the freeze
+                # withdraw those below s*.
+                est = model.estimate(obs, llr_o, rel_m & ~pool, failed, beta)
                 est_s = time.perf_counter() - t0
                 ok, rel_change = model.check(t_prev, est['t'])
                 streak = streak + 1 if ok else 0
