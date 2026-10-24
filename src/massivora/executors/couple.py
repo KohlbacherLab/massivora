@@ -250,12 +250,24 @@ class BaseCouplingExecutor(object):
             return
         if status == 'inflight':
             self._adaptive_reported = key
+            own = 0
+            try:
+                own = self.db_conn.execute(
+                    f"SELECT COUNT(*) FROM {quote_identifier(self.couple_table)} WHERE job_id = ? AND status IN (?, ?)",
+                    (str(self.job_id), STATUS['RUNNING'], STATUS['RETRYING'])).fetchone()[0]
+            except Exception:
+                pass
+            others = int(step.get('claimed') or 0) - int(own)
+            if others <= 0:
+                logging.info(f"couple.cascade.adaptive: nothing new to claim; this worker finishes the {own} "
+                             f"pair(s) it holds")
+                return
             age = step.get('oldest_claim_s')
             rt = (((self._config.get('couple') or {}).get('cascade') or {}).get('adaptive') or {}).get(
                 'running_timeout', 3600)
-            logging.warning(f"couple.cascade.adaptive: nothing left to claim, but {step.get('claimed')} released "
-                            f"pair(s) are still claimed (oldest {age or 0:.0f} s ago) by other workers or by a "
-                            f"worker that died; the run is NOT complete. Dead claims are handed back after "
+            logging.warning(f"couple.cascade.adaptive: nothing left to claim, but {others} released pair(s) are "
+                            f"claimed by other workers or by a worker that died (oldest claim {age or 0:.0f} s "
+                            f"ago); until they finish the run is NOT complete. Dead claims are handed back after "
                             f"running_timeout ({float(rt):.0f} s; couple.claim_timeout if set) by the next step: "
                             f"start a worker again after that to finish them.")
         elif status in ('done', 'stopped'):

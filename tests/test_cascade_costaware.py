@@ -810,6 +810,14 @@ def test_executor_reports_claims_left_and_survives_a_failing_step(project, monke
         assert ex._adaptive_last == 'inflight' and 'NOT complete' in caplog.text
         assert not ex._adaptive_has_work()
         caplog.clear()
+        # the same claims held by this worker itself: no warning, it finishes them
+        c.execute("UPDATE couplings SET job_id = ? WHERE job_id = 'other'", (str(ex.job_id),))
+        c.commit()
+        ex._adaptive_reported = None
+        with caplog.at_level(logging.INFO):
+            assert ex._claim_batch('job', 100) == []
+        assert 'finishes the' in caplog.text and 'NOT complete' not in caplog.text
+        caplog.clear()
 
         def locked(cfg, _init=False):
             raise sqlite3.OperationalError('database is locked')
