@@ -711,6 +711,8 @@ def apply_cascade(cfg: dict):
     cascade = (cfg.get('couple') or {}).get('cascade')
     if not cascade:
         return None
+    if cascade.get('adaptive') is not None:
+        return _apply_adaptive_cascade(cfg)
     fraction, count, denominator = _cascade_keep_rule(cascade)
     rank_by = cascade.get('rank_by', 'log_lr_raw')
     if rank_by not in CASCADE_RANKS:
@@ -827,3 +829,226 @@ def apply_cascade(cfg: dict):
                  f"unfinished-in-source {len(skip_unranked)}, skipped-in-source {len(skip_source)}, "
                  f"ungated (NULL depth) {ungated}; {len(changes)} rows changed")
     return len(ranked), kept, len(changes)
+
+
+# -- couple.cascade.adaptive: the self-consistent hand-off threshold -------------
+#
+# The plmDCA run releases the gated GaussDCA pairs in batches (frontier in rank
+# order plus a stratified exploration draw below it), re-estimates after each
+# batch how many hits a tighter threshold would lose, and stops once the
+# threshold t* is reached and stable (massivora.adaptive_cascade). State lives in
+# two tables of the plmDCA DB, so every worker sees the same released set:
+#   cascade_adaptive      (seq, batch, name, role 'main' | 'explore')
+#   cascade_adaptive_log  (batch, estimate of the threshold after that batch, stop)
+# Every step runs under BEGIN IMMEDIATE (SQLite only).
+
+_ADAPTIVE_DDL = (
+    "CREATE TABLE IF NOT EXISTS cascade_adaptive (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "batch INTEGER NOT NULL, name TEXT NOT NULL UNIQUE, role TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS cascade_adaptive_log (batch INTEGER PRIMARY KEY, at REAL, "
+    "n_done INTEGER, n_results INTEGER, frontier INTEGER, t_star INTEGER, t_star_rank REAL, "
+    "found REAL, total_hat REAL, budget REAL, missed_ucb_now REAL, recall_hat REAL, theta REAL, "
+    "released INTEGER, stop INTEGER)",
+)
+
+
+def _adaptive_source(cfg, cascade):
+    """Ranked, gated population from the GaussDCA source: names, rank (position /
+    all ranked rows, 0 = best), expected plmDCA seconds, plus names to skip."""
+    import numpy as np
+    couple_table = get_table_names(cfg)['couplings']
+    source_table = cascade.get('source_table', couple_table)
+    source_cfg = dict(cfg)
+    if cascade.get('source_db'):
+        source_cfg['database'] = {**cfg['database'], 'filename': cascade['source_db']}
+    if (get_db_config(source_cfg).get('filename') == get_db_config(cfg).get('filename')
+            and source_table == couple_table):
+        raise ValueError("couple.cascade.adaptive needs the GaussDCA run in another DB "
+                         "(source_db) or another table (source_table)")
+    rank_by = cascade.get('rank_by', 'log_lr_raw')
+    if rank_by not in CASCADE_RANKS:
+        raise ValueError(f"couple.cascade.rank_by must be one of {sorted(CASCADE_RANKS)}, got {rank_by!r}")
+    gate = cascade.get('min_neffoverL')
+    src = connect_db_ro(source_cfg)
+    try:
+        cur = src.cursor()
+        q = quote_identifier(source_table)
+        cur.execute(f"SELECT * FROM {q} LIMIT 0")
+        cols = {d[0] for d in cur.description}
+        depth = 'neffoverL' if 'neffoverL' in cols else 'NULL'
+        cur.execute(f"SELECT name, {depth}, length, number FROM {q} WHERE status = ? "
+                    f"ORDER BY {CASCADE_RANKS[rank_by]}, id", (STATUS['DONE'],))
+        ranked = cur.fetchall()
+        cur.execute(f"SELECT name FROM {q} WHERE status = ?", (STATUS['SKIPPED'],))
+        skip = {r[0] for r in cur.fetchall()}
+        if cascade.get('skip_unranked', False):
+            cur.execute(f"SELECT name FROM {q} WHERE status IS NOT NULL AND status NOT IN (?, ?, ?)",
+                        (STATUS['DONE'], STATUS['RUNNING'], STATUS['SKIPPED']))
+            skip |= {r[0] for r in cur.fetchall()}
+    finally:
+        src.close()
+    if gate is not None and depth == 'NULL':
+        logging.warning("couple.cascade.adaptive: min_neffoverL is set but the source has no "
+                        "neffoverL column: nothing is gated")
+    n_all = max(len(ranked), 1)
+    names, rank, cost = [], [], []
+    for i, (name, d, N, B) in enumerate(ranked):
+        if gate is not None and d is not None and float(d) < float(gate):
+            skip.add(name)
+            continue
+        names.append(name)
+        rank.append((i + 0.5) / n_all)
+        N, B = float(N or 0), float(B or 0)
+        cost.append(7.18e-7 * N * N + 3.79e-10 * B * N * N)   # headline-hours cost model
+    return names, np.asarray(rank), np.asarray(cost), skip, len(ranked)
+
+
+def _adaptive_state(cur, names, rank, cost, acfg, couple_table):
+    """Rebuild the estimator from the released set and the plmDCA results."""
+    import numpy as np
+    from massivora.adaptive_cascade import AdaptiveCascade
+    st = AdaptiveCascade(rank, cost, acfg)
+    index = {n: i for i, n in enumerate(names)}
+    cur.execute("SELECT name, role FROM cascade_adaptive ORDER BY seq")
+    main, explore = [], []
+    for name, role in cur.fetchall():
+        i = index.get(name)
+        if i is not None:
+            (explore if role == 'explore' else main).append(i)
+    st.release(main, explore)
+    cur.execute(f"SELECT name, status, log_lr_raw, high_precision_hit FROM {quote_identifier(couple_table)} "
+                f"WHERE status IN (?, ?)", (STATUS['DONE'], STATUS['FAILED']))
+    idx, llr, hit = [], [], []
+    for name, status, l, h in cur.fetchall():
+        i = index.get(name)
+        if i is None or not st.done[i]:
+            continue
+        idx.append(i)
+        ok = status == STATUS['DONE'] and l is not None
+        llr.append(float(l) if ok else float('nan'))
+        hit.append(bool(h) if ok else False)
+    if idx:
+        st.observe(idx, llr, hit)
+    # observe() only sets results; replayed pairs without a result stay "released"
+    st.llr[~st.done] = np.nan
+    cur.execute("SELECT t_star, frontier, n_done FROM cascade_adaptive_log ORDER BY batch")
+    for t_star, frontier, n_done in cur.fetchall():
+        st.history.append(dict(t_star=t_star, frontier=frontier, n_done=n_done))
+    return st, len(idx)
+
+
+def _adaptive_cfg(cascade):
+    from massivora.adaptive_cascade import config
+    acfg = dict(cascade.get('adaptive') or {})
+    if cascade.get('keep_fraction') is not None or cascade.get('keep_count') is not None:
+        raise ValueError("couple.cascade.adaptive replaces keep_fraction / keep_count; set one or the other")
+    return config(acfg)
+
+
+def adaptive_cascade_step(cfg: dict, _init=False):
+    """
+    One step of `couple.cascade.adaptive`, called by a worker whose claim came back
+    empty. While released pairs are still claimable it does nothing ('wait').
+    Otherwise it re-estimates the threshold from the plmDCA results so far, logs
+    it, and either stops ('stopped': converged or nothing left) or releases the
+    next batch ('released'). Returns dict(status, released, estimate).
+    """
+    import time
+    import numpy as np
+    cascade = (cfg.get('couple') or {}).get('cascade') or {}
+    if cascade.get('adaptive') is None:
+        return dict(status='off', released=0)
+    acfg = _adaptive_cfg(cascade)
+    names, rank, cost, skip_src, n_ranked = _adaptive_source(cfg, cascade)
+    couple_table = get_table_names(cfg)['couplings']
+    table = quote_identifier(couple_table)
+    conn = connect_db_rw(cfg)
+    conn.isolation_level = None
+    try:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        for ddl in _ADAPTIVE_DDL:
+            cur.execute(ddl)
+        cur.execute("SELECT stop FROM cascade_adaptive_log ORDER BY batch DESC LIMIT 1")
+        last = cur.fetchone()
+        if last and last[0]:
+            cur.execute("COMMIT")
+            return dict(status='stopped', released=0)
+        cur.execute(f"SELECT COUNT(*) FROM {table} t JOIN cascade_adaptive a ON a.name = t.name "
+                    f"WHERE t.status IN (?, ?)", (STATUS['NOOPT'], STATUS['PENDING']))
+        if cur.fetchone()[0] and not _init:
+            cur.execute("COMMIT")
+            return dict(status='wait', released=0)
+        cur.execute("SELECT COUNT(*) FROM cascade_adaptive")
+        if _init and cur.fetchone()[0]:
+            cur.execute("COMMIT")
+            return dict(status='wait', released=0)
+        st, n_results = _adaptive_state(cur, names, rank, cost, acfg, couple_table)
+        cur.execute("SELECT COALESCE(MAX(batch), 0) FROM cascade_adaptive_log")
+        batch = int(cur.fetchone()[0]) + 1
+        est, stop = {}, 0
+        if st.done.any():
+            st.rng = np.random.default_rng([int(acfg['seed']), batch])
+            est = st.estimate()
+            stop = int(st.converged())
+        main, explore = (np.array([], int), np.array([], int)) if stop else st.next_batch()
+        if not stop and not len(main) and not len(explore):
+            stop = 1
+        rel = [(batch, names[i], 'main') for i in main] + [(batch, names[i], 'explore') for i in explore]
+        cur.executemany("INSERT OR IGNORE INTO cascade_adaptive (batch, name, role) VALUES (?, ?, ?)", rel)
+        cur.executemany(f"UPDATE {table} SET status = ? WHERE name = ? AND status = ?",
+                        [(STATUS['NOOPT'], n, STATUS['SKIPPED']) for _, n, _ in rel])
+        cur.execute("INSERT INTO cascade_adaptive_log VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (batch, time.time(), int(st.done.sum()), n_results, est.get('frontier'), est.get('t_star'),
+                     est.get('t_star_rank'), est.get('found'), est.get('total_hat'), est.get('budget'),
+                     est.get('missed_ucb_now'), est.get('recall_hat'), est.get('theta'), len(rel), stop))
+        cur.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+    logging.info(f"cascade.adaptive batch {batch}: {len(names)} gated pairs, {int(st.done.sum())} released, "
+                 f"{n_results} with results; t* = {est.get('t_star')} (rank {est.get('t_star_rank')}), "
+                 f"frontier {est.get('frontier')}, est. recall {est.get('recall_hat')}; "
+                 + ("STOP" if stop else f"released {len(main)} + {len(explore)} exploration"))
+    return dict(status='stopped' if stop else 'released', released=len(rel), estimate=est)
+
+
+def _apply_adaptive_cascade(cfg):
+    """apply_cascade for `couple.cascade.adaptive`: the first batch is released if
+    none is; every ranked pair outside the released set is SKIPPED."""
+    cascade = cfg['couple']['cascade']
+    _adaptive_cfg(cascade)
+    adaptive_cascade_step(cfg, _init=True)
+    names, rank, cost, skip_src, n_ranked = _adaptive_source(cfg, cascade)
+    table = quote_identifier(get_table_names(cfg)['couplings'])
+    conn = connect_db_rw(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM cascade_adaptive")
+        released = {r[0] for r in cur.fetchall()}
+        population = set(names)
+        cur.execute(f"SELECT id, name, status FROM {table} WHERE status IN (?, ?)",
+                    (STATUS['NOOPT'], STATUS['SKIPPED']))
+        changes = []
+        for pid, name, status in cur.fetchall():
+            if name in skip_src or (name in population and name not in released):
+                new = STATUS['SKIPPED']
+            elif name in released:
+                new = STATUS['NOOPT']
+            else:
+                new = status        # neither ranked nor gated: unfinished in source, left as is
+            if new != status:
+                changes.append((new, pid, status))
+        cur.executemany(f"UPDATE {table} SET status = ? WHERE id = ? AND status = ?", changes)
+        conn.commit()
+    finally:
+        conn.close()
+    kept = len(released & population)
+    logging.info(f"cascade.adaptive: {len(population)} gated of {n_ranked} ranked pairs; "
+                 f"{kept} released so far; {len(changes)} rows changed")
+    return n_ranked, kept, len(changes)

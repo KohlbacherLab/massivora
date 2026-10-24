@@ -26,7 +26,7 @@ from massivora.alignment import (BinaryAlignment, SharedSourceError,
                                  check_shared_source_strategy,
                                  resolve_run_table_cache, resolve_shared_source)
 from massivora.config import load_project_and_system_config
-from massivora.db import (STATUS, apply_cascade, compute_file_hash, connect_db_rw,
+from massivora.db import (STATUS, adaptive_cascade_step, apply_cascade, compute_file_hash, connect_db_rw,
                           ensure_columns, get_db_path, get_hashed_file_path,
                           get_table_names, quote_identifier)
 from massivora.utils import (SHM_PREFIX, ShardWriter, compute_id_range,
@@ -194,6 +194,20 @@ class BaseCouplingExecutor(object):
     # -- DB helpers --
 
     def _claim_batch(self, job_id, batch_size, id_range=None):
+        rows = self._claim_batch_once(job_id, batch_size, id_range)
+        # couple.cascade.adaptive: an empty claim may mean the released batch is used
+        # up; re-estimate the threshold and either release the next batch or stop.
+        if not rows and int(batch_size) > 0 and ((self._config.get('couple') or {}).get('cascade') or {}).get('adaptive') is not None:
+            while True:
+                step = adaptive_cascade_step(self._config)
+                if step['status'] != 'released':
+                    break
+                rows = self._claim_batch_once(job_id, batch_size, id_range)
+                if rows:
+                    break
+        return rows
+
+    def _claim_batch_once(self, job_id, batch_size, id_range=None):
         n = int(batch_size)
         if n <= 0:
             return []
