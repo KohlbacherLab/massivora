@@ -123,10 +123,10 @@ couple:
   eps_g: 1e-3      # GPU path: stop a site on max |gradient| <= eps_g
   maxit: 200
   fp16_history: false  # GPU path: L-BFGS history in fp16 (approximation, 1.12x)
-  # Screen profile (plmDCA after a cascade, ranking only): fp16_history: true,
-  # maxit: 50 and concatenate.downsample.to: 10000 ran 1.7x faster on random
-  # H. pylori screen pairs and lost no detector hits on 120 screen pairs (the
-  # top contacts move more, so not for contact maps).
+  # Screen profile (plmDCA after a cascade): fp16_history: true and maxit: 50,
+  # with no B cap below the default 30,000 (1.42x; on the labelled he2021 set
+  # 0 to +1 detector hits vs production; a 10k or 5k cap compresses deep true
+  # hits and is not recommended).
   fast_approximation: false
   site_batch: 24  # GPU: sites optimised in lockstep per pair (an upper bound)
 
@@ -149,6 +149,9 @@ couple:
   # are marked SKIPPED. Pairs the GaussDCA run did not finish are still
   # coupled, unless skip_unranked is set; pairs the GaussDCA run SKIPPED
   # itself (its pre-gate, below) are never coupled.
+  # Option A (proteome screens; with maxit 50 and fp16_history true above):
+  #   cascade: {source_db: gauss.sqlite3, keep_fraction: 0.20, min_neffoverL: 0.1}
+  # keep_fraction (or keep_count) is the top-k threshold of the hand-off.
   # cascade:
   #   source_db: gauss.sqlite3  # DB of the GaussDCA run (default: this project's DB)
   #   source_table: couplings   # its couplings table (default: couple.db_table)
@@ -262,10 +265,10 @@ couple:
   eps_g: 1e-3      # GPU path: stop a site on max |gradient| <= eps_g
   maxit: 200
   fp16_history: false  # GPU path: L-BFGS history in fp16 (approximation, 1.12x)
-  # Screen profile (plmDCA after a cascade, ranking only): fp16_history: true,
-  # maxit: 50 and concatenate.downsample.to: 10000 ran 1.7x faster on random
-  # H. pylori screen pairs and lost no detector hits on 120 screen pairs (the
-  # top contacts move more, so not for contact maps).
+  # Screen profile (plmDCA after a cascade): fp16_history: true and maxit: 50,
+  # with no B cap below the default 30,000 (1.42x; on the labelled he2021 set
+  # 0 to +1 detector hits vs production; a 10k or 5k cap compresses deep true
+  # hits and is not recommended).
   fast_approximation: false
   site_batch: 24  # GPU: sites optimised in lockstep per pair (an upper bound)
 
@@ -287,6 +290,9 @@ couple:
   # Cascade: couple only the best pairs of a finished GaussDCA run; the rest
   # are marked SKIPPED. Pairs the GaussDCA run did not finish are still
   # coupled, unless skip_unranked is set.
+  # Option A (proteome screens; with maxit 50 and fp16_history true above):
+  #   cascade: {source_db: gauss.sqlite3, keep_fraction: 0.20, min_neffoverL: 0.1}
+  # keep_fraction (or keep_count) is the top-k threshold of the hand-off.
   # cascade:
   #   source_db: gauss.sqlite3  # DB of the GaussDCA run (default: this project's DB)
   #   source_table: couplings   # its couplings table (default: couple.db_table)
