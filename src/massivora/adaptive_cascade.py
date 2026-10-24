@@ -35,7 +35,9 @@ threshold t (share of the population with s >= s*) re-estimated after every
 `check_every` completed plmDCA pairs and frozen once it changes by less than
 `freeze_rel_change` on `freeze_consecutive` consecutive checks; then plmDCA runs
 on every pair with s >= s*, highest s first. Below `min_population` gated pairs
-the driver falls back to the batch mode (`small_population_mode: base`).
+the driver falls back to the batch mode (`small_population_mode: base`), and a
+hit-structure guard switches to it when detector hits are much denser than on
+the screen.
 """
 import math
 
@@ -372,18 +374,38 @@ def cost_s(N, B):
 # and s* are fixed and plmDCA runs on every unreleased pair with s >= s*,
 # highest s first.
 #
+# Hit-structure guard: the rule targets top calls only. At every estimate before
+# the freeze, once guard_min_obs pairs are observed, r = HT detector hits / HT top
+# calls among the observed convergence pairs; r > guard_hits_per_top (screen:
+# 0.06-0.12 at the population level, at most 0.21 along 200 simulated
+# trajectories and 0.26 on 600 screen sub-populations of 7.5k-100k pairs;
+# he2021: 0.70, every trajectory > 0.58) switches the run to the batch mode
+# (base_k2), which continues from the convergence pairs as its exploration
+# sample.
+#
 # This is the frozen finalist of perf/day/adaptive/fast/costaware (costaware.py,
 # finalist.json: z = 1, m = 3); tests/fixtures/costaware_prototype.py is a copy
-# of that prototype and tests/test_cascade_costaware.py checks parity. Held-out
-# test (reps 80-279): 49.4 measured plmDCA-h (40.9 h on the cost model), top-call
-# recall >= 0.95 in 200/200 reps. Below 10,000 gated pairs the convergence
-# batches eat most of the population and the batch mode is cheaper and safe, so
-# the driver falls back to it there (min_population, small_population_mode).
+# of that prototype and tests/test_cascade_costaware.py checks parity.
+# Evidence (simulation on 3,903 measured truth rows imputed to the screen's
+# 917,537 gated pairs, perf/day/adaptive/fast/validate): about 49 measured
+# plmDCA-h (41 h on this cost model; 56 h under iid imputation) against 108 h for
+# the batch mode, conditional on the truth sample's almost top-free tail (rank >=
+# 0.4: 1 top call in 838 rows); 3-6 % of the top calls in that tail cost +8 to
+# +38 h with top recall >= 0.95 in only 84-90 % of runs. Per run, top-call recall
+# >= 0.95 holds in about 95-98 % (other batch seeds: 175/180; screen
+# sub-populations: 98/100 at every size), not with certainty. The policy's own
+# recall estimate (1 - missed / total at the freeze) is uncorrelated with the
+# true recall (r = 0.05) and must not be reported as a run's recall. Below
+# min_population gated pairs (50,000) the driver uses the batch mode
+# (small_population_mode): there the finalist meets both recalls in only
+# 92-96 % of runs (base 100 %) and saves at most about 5 measured hours.
 
 COSTAWARE_DEFAULTS = dict(model='costaware', start_fraction=0.5, check_every=50, freeze_rel_change=0.01,
                           freeze_consecutive=3, z=1.0, target_recall=0.95, top_fraction=0.05, strata=20,
-                          tilt=3.0, tilt_above=0.4, ridge=1.0, min_population=10000,
+                          tilt=3.0, tilt_above=0.4, ridge=1.0, min_population=50000,
                           small_population_mode='base', seed=0,
+                          # hit-structure guard (guard_hits_per_top 0 = off)
+                          guard_hits_per_top=0.3, guard_min_obs=500,
                           # driver: claimable convergence pairs kept released ahead of the
                           # estimate (None = check_every), pairs released per step after the
                           # freeze, seconds after which a claimed pair is reclaimed
@@ -392,6 +414,12 @@ COSTAWARE_KNOTS = (0.02, 0.06, 0.15, 0.3, 0.5)
 COSTAWARE_NEWTON = 6
 COSTAWARE_GRID = 4001
 SMALL_POPULATION_MODES = ('base', 'full')
+# keys that define the rule: a run refuses to continue when one of them changed
+# (lead, release_block and running_timeout are operational and may change; a
+# change of min_population / small_population_mode is caught by the mode check)
+COSTAWARE_RULE_KEYS = ('start_fraction', 'check_every', 'freeze_rel_change', 'freeze_consecutive', 'z',
+                       'target_recall', 'top_fraction', 'strata', 'tilt', 'tilt_above', 'ridge', 'seed',
+                       'guard_hits_per_top', 'guard_min_obs')
 
 
 def costaware_config(cfg=None):
@@ -408,10 +436,10 @@ def costaware_config(cfg=None):
             raise ValueError(f"adaptive.{k} must be in (0, 1), got {c[k]}")
     if not 0.0 <= float(c['tilt_above']) <= 1.0:
         raise ValueError(f"adaptive.tilt_above must be in [0, 1], got {c['tilt_above']}")
-    for k in ('z', 'ridge'):
+    for k in ('z', 'guard_hits_per_top'):
         if not float(c[k]) >= 0.0:
             raise ValueError(f"adaptive.{k} must be >= 0, got {c[k]}")
-    for k in ('tilt', 'running_timeout'):
+    for k in ('tilt', 'running_timeout', 'ridge'):
         if not float(c[k]) > 0.0:
             raise ValueError(f"adaptive.{k} must be > 0, got {c[k]}")
     for k in ('check_every', 'freeze_consecutive', 'strata', 'release_block'):
@@ -426,10 +454,13 @@ def costaware_config(cfg=None):
         c['lead'] = int(c['check_every'])
     if int(c['lead']) != float(c['lead']) or int(c['lead']) < 1:
         raise ValueError(f"adaptive.lead must be an integer >= 1, got {c['lead']}")
-    for k in ('check_every', 'freeze_consecutive', 'strata', 'release_block', 'min_population', 'lead', 'seed'):
+    if int(c['guard_min_obs']) != float(c['guard_min_obs']) or int(c['guard_min_obs']) < 0:
+        raise ValueError(f"adaptive.guard_min_obs must be an integer >= 0, got {c['guard_min_obs']}")
+    for k in ('check_every', 'freeze_consecutive', 'strata', 'release_block', 'min_population', 'lead', 'seed',
+              'guard_min_obs'):
         c[k] = int(c[k])
     for k in ('start_fraction', 'freeze_rel_change', 'target_recall', 'top_fraction', 'tilt_above', 'z', 'ridge',
-              'tilt', 'running_timeout'):
+              'tilt', 'running_timeout', 'guard_hits_per_top'):
         c[k] = float(c[k])
     return c
 
@@ -632,6 +663,19 @@ class CostAwareThreshold:
                     t=f / n, f=int(f), s_star=s_star, theta=theta, found=found, total_hat=total,
                     missed_hat=float(m_suf[f]) if f < n else 0.0, beta=[float(b) for b in beta])
 
+    def hit_density(self, obs_idx, llr, hit, theta, failed=None):
+        """The guard statistic: HT-weighted detector hits / HT-weighted top calls
+        (llr >= theta) among the observed pairs (inf if no top call was seen)."""
+        n = self.n
+        obs = np.zeros(n, bool)
+        obs[np.asarray(obs_idx, int)] = True
+        failed = np.zeros(n, bool) if failed is None else (np.asarray(failed, bool) & ~obs)
+        w = self.ht_weights(obs, ~failed)
+        ix = np.asarray(obs_idx, int)
+        tops = float((w[ix] * (np.asarray(llr, float) >= float(theta))).sum())
+        hits = float((w[ix] * np.asarray(hit, bool)).sum())
+        return hits / tops if tops > 0 else (0.0 if hits == 0 else math.inf)
+
     def selection(self, beta, s_star):
         """Mask of the pairs the frozen rule runs, and their order (highest s first)."""
         _, score = self.scores(beta)
@@ -640,10 +684,13 @@ class CostAwareThreshold:
         return sel, idx[np.argsort(-score[idx], kind='stable')]
 
 
-def simulate_costaware(rank, cost, neffoverL, N, B, llr, cfg=None):
+def simulate_costaware(rank, cost, neffoverL, N, B, llr, cfg=None, streams='single'):
     """The cost-aware policy end to end against a table with full plmDCA results,
-    one convergence batch of check_every pairs at a time with no pairs in flight
-    (the prototype's setting; one random stream seeded `seed`). Returns
+    one convergence batch of check_every pairs at a time with no pairs in flight.
+    streams 'single': one random stream seeded `seed` (the prototype's setting);
+    'block': block j (1, 2, ...) draws from default_rng([seed, j]) and the
+    observations are passed in release order, as the DB driver does, so a
+    synchronous driver run reproduces it exactly. Returns
     (run mask, history, frozen record or None)."""
     st = CostAwareThreshold(rank, cost, neffoverL, N, B, cfg)
     c = st.c
@@ -652,13 +699,17 @@ def simulate_costaware(rank, cost, neffoverL, N, B, llr, cfg=None):
     released = np.zeros(st.n, bool)
     obs = []
     t_prev, beta, streak, frozen, hist = c['start_fraction'], None, 0, None, []
+    j = 0
     while not released.all():
+        j += 1
+        if streams == 'block':
+            rng = np.random.default_rng([c['seed'], j])
         idx = st.block(released, released, rng, c['check_every'])
         if not len(idx):
             break
         released[idx] = True
         obs.extend(int(i) for i in idx)
-        seen = np.flatnonzero(released)
+        seen = np.asarray(obs) if streams == 'block' else np.flatnonzero(released)
         rec = st.estimate(seen, llr[seen], released, None, beta)
         ok, rel = st.check(t_prev, rec['t'])
         streak = streak + 1 if ok else 0

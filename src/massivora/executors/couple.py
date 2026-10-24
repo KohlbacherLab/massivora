@@ -219,14 +219,64 @@ class BaseCouplingExecutor(object):
             conn.close()
         return n
 
+    # step statuses after which there is something to claim
+    _ADAPTIVE_WORK = ('released', 'claimable')
+
+    def _adaptive_step(self):
+        """One couple.cascade.adaptive step. In the cost-aware mode a failing step
+        (e.g. 'database is locked' past the busy timeout, or a changed population)
+        is logged and returns None instead of ending the worker: results already
+        committed stay, the next step retries, and the claimed pairs are finished
+        or handed back as usual."""
+        if not getattr(self, '_adaptive_costaware', False):
+            return adaptive_cascade_step(self._config)
+        try:
+            step = adaptive_cascade_step(self._config)
+        except Exception:
+            logging.exception("couple.cascade.adaptive: the threshold step failed; committed results are kept "
+                              "and the next step retries")
+            self._adaptive_last = 'error'
+            return None
+        self._adaptive_last = step['status']
+        self._adaptive_report(step)
+        return step
+
+    def _adaptive_report(self, step):
+        """Say once why there is nothing to claim: the selection is complete, or
+        released pairs are still claimed (by other workers, or by a dead one)."""
+        status = step.get('status')
+        key = (status, step.get('claimed'))
+        if key == getattr(self, '_adaptive_reported', None):
+            return
+        if status == 'inflight':
+            self._adaptive_reported = key
+            age = step.get('oldest_claim_s')
+            rt = (((self._config.get('couple') or {}).get('cascade') or {}).get('adaptive') or {}).get(
+                'running_timeout', 3600)
+            logging.warning(f"couple.cascade.adaptive: nothing left to claim, but {step.get('claimed')} released "
+                            f"pair(s) are still claimed (oldest {age or 0:.0f} s ago) by other workers or by a "
+                            f"worker that died; the run is NOT complete. Dead claims are handed back after "
+                            f"running_timeout ({float(rt):.0f} s; couple.claim_timeout if set) by the next step: "
+                            f"start a worker again after that to finish them.")
+        elif status in ('done', 'stopped'):
+            self._adaptive_reported = key
+            logging.info(f"couple.cascade.adaptive: selection complete ({step.get('mode', '')} {status}): every "
+                         f"released pair has finished")
+
     def _adaptive_tick(self):
         """model: costaware: step the threshold after results were committed (one
         estimate per check_every new results; tops up the released pairs).
-        Returns the step's status, None if the mode is off."""
+        Returns the step's status ('error' if it failed), None if the mode is off."""
         if not getattr(self, '_adaptive_costaware', False):
             return None
-        self._adaptive_last = adaptive_cascade_step(self._config)['status']
+        self._adaptive_step()
         return self._adaptive_last
+
+    def _adaptive_has_work(self):
+        """The last cost-aware step left pairs to claim (released, reclaimed, or
+        released by another worker)."""
+        return bool(getattr(self, '_adaptive_costaware', False)
+                    and getattr(self, '_adaptive_last', None) in self._ADAPTIVE_WORK)
 
     def _commit_every(self, default):
         if getattr(self, '_adaptive_costaware', False):
@@ -240,11 +290,17 @@ class BaseCouplingExecutor(object):
                 rows = self._claim_batch_once(job_id, batch_size, id_range)
         # couple.cascade.adaptive: an empty claim may mean the released batch is used
         # up; re-estimate the threshold and either release the next batch or stop.
+        # A step that leaves pairs claimable without releasing new ones (stale claims
+        # handed back, another worker's release; the batch mode's 'wait') is claimed
+        # again too, a few times at most (pairs outside id_range stay unclaimable).
         if not rows and int(batch_size) > 0 and ((self._config.get('couple') or {}).get('cascade') or {}).get('adaptive') is not None:
-            while True:
-                step = adaptive_cascade_step(self._config)
-                if step['status'] != 'released':
+            retries = 0
+            while retries < 4:
+                step = self._adaptive_step()
+                if step is None or step['status'] not in self._ADAPTIVE_WORK + ('wait',):
                     break
+                if step['status'] != 'released':
+                    retries += 1
                 rows = self._claim_batch_once(job_id, batch_size, id_range)
                 if rows:
                     break
@@ -284,16 +340,24 @@ class BaseCouplingExecutor(object):
                 params['start_id'] = start_id
                 params['end_id'] = end_id
 
+            # couple.cascade.adaptive, model costaware: claim in release order (the
+            # frozen selection runs highest s first); pairs it never released last.
+            if getattr(self, '_adaptive_costaware', False):
+                source, p, order = (f"{table} t LEFT JOIN cascade_adaptive a ON a.name = t.name", "t.",
+                                    "(a.seq IS NULL), a.seq, t.id")
+                where_range_sql = where_range_sql.replace(" id ", " t.id ")
+            else:
+                source, p, order = table, "", "id"
             # For couple job, status null is unclaimable
             cursor.execute(
                 f"""
                 WITH to_claim AS (
-                    SELECT id, status AS prev_status
-                    FROM {table}
-                    WHERE status IN (:noopt, :pending)
-                    AND claimed_at IS NULL
+                    SELECT {p}id AS id, {p}status AS prev_status
+                    FROM {source}
+                    WHERE {p}status IN (:noopt, :pending)
+                    AND {p}claimed_at IS NULL
                     {where_range_sql}
-                    ORDER BY id
+                    ORDER BY {order}
                     LIMIT :n
                 )
                 UPDATE {table}
@@ -800,8 +864,10 @@ class BaseCouplingExecutor(object):
             fail_ids = []
             skipped_ids = []
             last_commit = float(time.time())
-            if n and not terminating and self._adaptive_tick() == 'released':
-                no_more_to_claim = False
+            if n and not terminating:
+                self._adaptive_tick()
+                if self._adaptive_has_work():
+                    no_more_to_claim = False
             return n
 
         def _on_term(signum, frame):
@@ -1957,9 +2023,10 @@ class SessionGPUExecutor(BaseCouplingExecutor):
                     had_failures = bool(fail_updates)
                 self._adaptive_last = None
                 flush(force=True)
-                # model: costaware: the last commit may have released pairs
-                # (the freeze, or claims reclaimed after running_timeout)
-                more = self._adaptive_costaware and self._adaptive_last == 'released'
+                # model: costaware: the last commit may have left pairs to claim
+                # (the freeze, claims reclaimed after running_timeout, another
+                # worker's release)
+                more = self._adaptive_has_work()
                 if halt.is_set() or not (had_failures or more):
                     break
             for _ in threads:

@@ -1,6 +1,8 @@
 """couple.cascade.adaptive, model: costaware -- the fast-converging cost-aware hand-off threshold."""
 import importlib.util
 import json
+import logging
+import multiprocessing
 import os
 import sqlite3
 import time
@@ -134,12 +136,14 @@ def test_missing_depth_takes_the_population_mean():
 
 def test_config_validation():
     assert costaware_config(dict(model='costaware'))['lead'] == 50
-    assert config(dict(model='costaware'))['min_population'] == 10000
+    assert config(dict(model='costaware'))['min_population'] == 50000
+    assert config(dict(model='costaware'))['guard_hits_per_top'] == 0.3
     assert config(dict(model='costaware'))['small_population_mode'] == 'base'
     for bad in (dict(keep_fraction=0.3), dict(batch=40), dict(explore_fraction=0.1), dict(start_fraction=0),
                 dict(target_recall=1.0), dict(freeze_consecutive=0), dict(check_every=2.5), dict(z=-1),
                 dict(small_population_mode='B_x05'), dict(min_population=-1), dict(tilt_above=1.5),
-                dict(strata=0), dict(freeze_rel_change=0)):
+                dict(strata=0), dict(freeze_rel_change=0), dict(ridge=0), dict(guard_hits_per_top=-0.1),
+                dict(guard_min_obs=2.5)):
         with pytest.raises(ValueError):
             costaware_config(dict(model='costaware', **bad))
     with pytest.raises(ValueError):
@@ -204,14 +208,15 @@ def _db(path):
     return sqlite3.connect(path / 'plm.sqlite3')
 
 
-def _work(path, truth, limit=None, now=None):
+def _work(path, truth, limit=None, now=None, hits=None):
     """Stand-in for plmDCA: claim and finish claimable pairs with their known result."""
     c = _db(path)
     q = "SELECT name FROM couplings WHERE status IN (?, ?) AND claimed_at IS NULL ORDER BY id"
     rows = [r[0] for r in c.execute(q, (STATUS['NOOPT'], STATUS['PENDING'])).fetchall()]
     rows = rows if limit is None else rows[:limit]
-    c.executemany("UPDATE couplings SET status = ?, log_lr_raw = ?, claimed_at = NULL WHERE name = ?",
-                  [(STATUS['DONE'], truth[n], n) for n in rows])
+    hits = hits or {}
+    c.executemany("UPDATE couplings SET status = ?, log_lr_raw = ?, high_precision_hit = ?, claimed_at = NULL "
+                  "WHERE name = ?", [(STATUS['DONE'], truth[n], int(n in hits), n) for n in rows])
     c.commit()
     c.close()
     return rows
@@ -272,7 +277,8 @@ def test_starts_at_half_with_a_stratified_block(project):
     assert per[tilted].mean() > 2 * per[~tilted].mean()
     # idempotent: a second worker start and a step with pairs still claimable release nothing
     assert apply_cascade(cfg)[1] == 50
-    assert adaptive_cascade_step(cfg)['status'] == 'wait'
+    step = adaptive_cascade_step(cfg)
+    assert step['status'] == 'claimable' and step['released'] == 0 and step['claimable'] == 50
 
 
 def test_estimates_every_check_every_completed_pairs(project):
@@ -316,6 +322,9 @@ def test_freezes_after_three_small_changes_then_stays_fixed(project):
     assert not any(all(ok[i:i + 3]) for i in range(len(ok) - 3))
     assert [r['streak'] for r in est][-3:] == [1, 2, 3]
     assert all(r['n_obs'] == 50 * r['k'] for r in est)
+    # no detector hits: the guard statistic is 0 and never switches the run
+    assert all(r['hit_density'] == 0 for r in est) and not any(r['switched'] for r in log)
+    assert log[0]['pop_hash'] and log[0]['cfg_hash']
     # synchronous worker: no pairs in flight at each estimate -> the estimator replays the log exactly
     pop, model = _model(path, cfg)
     c = _db(path)
@@ -531,3 +540,283 @@ def test_rejects_keep_rule_and_unknown_keys(project):
     cfg = _cfg(path, explore_fraction=0.05)
     with pytest.raises(ValueError):
         apply_cascade(cfg)
+
+
+def test_synchronous_driver_reproduces_the_block_stream_simulation(project):
+    """The DB driver with a synchronous worker is simulate_costaware with the
+    driver's per-block random streams, pair for pair; simulate_costaware with one
+    stream is the prototype (test_prototype_parity)."""
+    path, truth = project
+    cfg = _cfg(path)
+    apply_cascade(cfg)
+    _run_to_freeze(path, truth, cfg)
+    pop, model = _model(path, cfg)
+    llr = np.array([truth[n] for n in pop['names']])
+    c = costaware_config(cfg['couple']['cascade']['adaptive'])
+    run, hist, frozen = simulate_costaware(pop['rank'], pop['cost'], pop['neffoverL'], pop['N'], pop['B'], llr, c,
+                                           streams='block')
+    est = _log(path)[1:]
+    assert len(est) == len(hist) and frozen is not None and est[-1]['frozen']
+    assert [r['t'] for r in est] == [h['t'] for h in hist]
+    assert np.allclose([r['s_star'] for r in est], [h['s_star'] for h in hist], rtol=1e-12)
+    assert np.allclose(json.loads(est[-1]['beta']), frozen['beta'], rtol=1e-12, atol=1e-15)
+    conv = np.isin(pop['names'], [n for _, _, n, r in _released(path) if r == 'explore'])
+    sel, _ = model.selection(json.loads(est[-1]['beta']), est[-1]['s_star'])
+    assert np.array_equal(conv | sel, run)
+
+
+def test_step_status_counts_pairs_made_claimable_again(project):
+    """A step that only hands stale claims back says so ('claimable'), before and
+    after the freeze; with nothing to claim but live claims it is 'inflight'."""
+    path, truth = project
+    cfg = _cfg(path, running_timeout=600, release_block=100000)
+    apply_cascade(cfg)
+    c = _db(path)
+    dead = ("UPDATE couplings SET status = ?, claimed_at = ?, job_id = 'w' WHERE status = ? "
+            "AND claimed_at IS NULL AND name IN (SELECT name FROM cascade_adaptive)")
+    c.execute(dead, (STATUS['RUNNING'], time.time() - 700, STATUS['NOOPT']))
+    c.commit()
+    step = adaptive_cascade_step(cfg)
+    assert step['status'] == 'claimable' and step['released'] == 0
+    assert step['reclaimed'] == 50 and step['claimable'] == 50
+    _run_to_freeze(path, truth, cfg)                 # the whole selection is released at the freeze
+    c.execute(dead, (STATUS['RUNNING'], time.time() - 700, STATUS['NOOPT']))
+    c.commit()
+    step = adaptive_cascade_step(cfg)
+    assert step['frozen'] and step['status'] == 'claimable' and step['claimable'] > 0 and step['released'] == 0
+    c.execute(dead, (STATUS['RUNNING'], time.time() - 5, STATUS['NOOPT']))       # live claims
+    c.commit()
+    step = adaptive_cascade_step(cfg)
+    assert step['status'] == 'inflight' and step['claimed'] > 0 and step['claimable'] == 0
+    assert 0 <= step['oldest_claim_s'] < 600
+    c.execute("UPDATE couplings SET claimed_at = ? WHERE status = ?", (time.time() - 700, STATUS['RUNNING']))
+    c.commit()
+    assert adaptive_cascade_step(cfg)['status'] == 'claimable'
+    _work(path, truth)
+    assert adaptive_cascade_step(cfg)['status'] == 'done'
+
+
+def test_refuses_a_changed_population_or_rule(project):
+    path, truth = project
+    cfg = _cfg(path)
+    apply_cascade(cfg)
+    _work(path, truth)
+    adaptive_cascade_step(cfg)
+    # operational keys may change between steps
+    adaptive_cascade_step(_cfg(path, lead=80, release_block=500, running_timeout=1800))
+    for bad in (dict(seed=4), dict(z=1.645), dict(check_every=40), dict(tilt=2.0), dict(guard_hits_per_top=0)):
+        with pytest.raises(ValueError, match='configuration'):
+            adaptive_cascade_step(_cfg(path, **bad))
+    # the GaussDCA source gains a ranked, gated row: every rank behind it shifts
+    g = sqlite3.connect(path / 'gauss.sqlite3')
+    g.execute("INSERT INTO couplings (name, pid1, pid2, status, log_lr_raw, neffoverL, length, number) "
+              "VALUES ('q00001', 'A', 'B', ?, 1e6, 1.0, 100, 100)", (STATUS['DONE'],))
+    g.commit()
+    g.close()
+    _clear_caches()
+    with pytest.raises(ValueError, match='population changed'):
+        adaptive_cascade_step(cfg)
+    with pytest.raises(ValueError, match='population changed'):
+        apply_cascade(cfg)
+
+
+def test_worker_start_leaves_a_pair_plmdca_skipped_alone(project):
+    path, truth = project
+    cfg = _cfg(path)
+    apply_cascade(cfg)
+    c = _db(path)
+    name = _released(path)[0][2]
+    c.execute("UPDATE couplings SET status = ? WHERE name = ?", (STATUS['SKIPPED'], name))
+    c.commit()
+    apply_cascade(cfg)                                  # a worker start does not hand it back
+    assert c.execute("SELECT status FROM couplings WHERE name = ?", (name,)).fetchone()[0] == STATUS['SKIPPED']
+    _work(path, truth)
+    adaptive_cascade_step(cfg)
+    assert dict(c.execute("SELECT name, k FROM cascade_adaptive_obs WHERE k = -1")) == {name: -1}
+
+
+def test_guard_switches_a_dense_hit_run_to_the_batch_mode(project):
+    path, truth = project
+    cfg = _cfg(path)
+    gated = [n for n in truth if _gated(int(n[1:]))]
+    q = np.quantile([truth[n] for n in gated], 0.95)
+    rng = np.random.default_rng(0)
+    # detector hits: most top calls and as many again spread over every rank (a labelled benchmark set)
+    hits = {n for n in gated if truth[n] >= q and rng.random() < 0.8} | set(rng.choice(gated, 1000, replace=False))
+    apply_cascade(cfg)
+    modes = []
+    for _ in range(400):
+        _work(path, truth, hits=hits)
+        step = adaptive_cascade_step(cfg)
+        modes.append(step['mode'])
+        if step['status'] == 'stopped':
+            break
+    assert step['status'] == 'stopped'
+    log = _log(path)
+    sw = [r for r in log if r['switched']]
+    assert len(sw) == 1 and sw[0]['switched'] == 'base' and sw[0]['n_obs'] >= 500 and sw[0]['hit_density'] > 0.3
+    assert sw[0] is log[-1] and not any(r['frozen'] for r in log)        # the cost-aware log ends there
+    assert all(r['n_obs'] < 500 for r in log[1:-1])                      # the first estimate allowed to switch
+    assert modes[-1] == 'guard-base' and 'costaware' in modes
+    c = _db(path)
+    assert c.execute("SELECT COUNT(*) FROM cascade_adaptive_guard_log").fetchone()[0] >= 2
+    rel = _released(path)
+    assert {r[3] for r in rel} == {'explore', 'main'}
+    assert sum(r[3] == 'explore' for r in rel) >= sw[0]['n_obs']       # kept as the exploration sample
+    st = dict(c.execute("SELECT name, status FROM couplings"))
+    assert all(st[n] == STATUS['DONE'] for _, _, n, _ in rel)
+    run = {n for n in gated if st[n] == STATUS['DONE']}
+    top = {n for n in gated if truth[n] >= q}
+    assert len(run) < len(gated) and len(top & run) / len(top) >= 0.9
+    # a worker start on the switched run keeps the batch mode
+    _clear_caches()
+    apply_cascade(cfg)
+    assert adaptive_cascade_step(cfg)['mode'] == 'guard-base'
+
+
+def _concurrent_worker(path, truth, cfg, seed, out):
+    import random
+    rnd = random.Random(seed)
+    try:
+        idle = 0
+        while idle < 400:
+            c = sqlite3.connect(path / 'plm.sqlite3', timeout=60)
+            rows = [r[0] for r in c.execute(
+                "UPDATE couplings SET status = ?, claimed_at = ? WHERE id IN (SELECT t.id FROM couplings t "
+                "JOIN cascade_adaptive a ON a.name = t.name WHERE t.status = ? AND t.claimed_at IS NULL "
+                "ORDER BY a.seq LIMIT ?) RETURNING name",
+                (STATUS['RUNNING'], time.time(), STATUS['NOOPT'], rnd.randint(5, 60))).fetchall()]
+            c.commit()
+            time.sleep(rnd.random() * 0.005)
+            c.executemany("UPDATE couplings SET status = ?, log_lr_raw = ?, claimed_at = NULL WHERE name = ?",
+                          [(STATUS['DONE'], truth[n], n) for n in rows])
+            c.commit()
+            c.close()
+            status = adaptive_cascade_step(cfg)['status']
+            if rows or status in ('released', 'claimable'):
+                idle = 0
+            elif status == 'done':
+                break
+            else:
+                idle += 1
+                time.sleep(0.005)
+        out.put(('ok', seed, status))
+    except Exception as e:                      # pragma: no cover - reported to the parent
+        out.put(('error', seed, repr(e)))
+
+
+def test_concurrent_workers_step_and_claim_safely(project):
+    """Three processes claiming, finishing and stepping at the same time: every
+    estimate gets exactly check_every results, one freeze, nothing released is
+    left unfinished, and what ran is the convergence pairs plus the selection."""
+    if 'fork' not in multiprocessing.get_all_start_methods():
+        pytest.skip('needs fork')
+    path, truth = project
+    cfg = _cfg(path, release_block=300)
+    apply_cascade(cfg)
+    _clear_caches()
+    ctx = multiprocessing.get_context('fork')
+    out = ctx.Queue()
+    procs = [ctx.Process(target=_concurrent_worker, args=(path, truth, cfg, s, out)) for s in range(3)]
+    for p in procs:
+        p.start()
+    res = [out.get(timeout=600) for _ in procs]
+    for p in procs:
+        p.join(timeout=60)
+    assert all(r[0] == 'ok' and r[2] == 'done' for r in res), res
+    log = _log(path)
+    est = log[1:]
+    assert [r['k'] for r in est] == list(range(1, len(est) + 1))
+    c = _db(path)
+    assert set(dict(c.execute("SELECT k, COUNT(*) FROM cascade_adaptive_obs WHERE k > 0 GROUP BY k")).values()) == {50}
+    fr = [r for r in est if r['frozen']]
+    assert len(fr) == 1 and fr[0] is est[-1]
+    pop, model = _model(path, cfg)
+    sel, _ = model.selection(json.loads(fr[0]['beta']), fr[0]['s_star'])
+    st = dict(c.execute("SELECT name, status FROM couplings"))
+    rel = _released(path)
+    assert all(st[n] == STATUS['DONE'] for _, _, n, _ in rel)
+    conv = {n for _, _, n, r in rel if r == 'explore'}
+    done = {n for n, s_ in st.items() if s_ == STATUS['DONE']}
+    assert done == conv | {pop['names'][i] for i in np.flatnonzero(sel)}
+
+
+# -- the executor on the cost-aware path ---------------------------------------------
+
+def _executor(path, couple=None, **adaptive):
+    from massivora.executors.couple import BaseCouplingExecutor
+    cfg = _cfg(path, **adaptive)
+    cfg['couple'].update(couple or {})
+    cfg = {**cfg, 'paths': {'monomers': 'msa', 'couplings': 'ecs'}, 'concatenate': {'downsample': {}}}
+    return cfg, BaseCouplingExecutor(cfg)
+
+
+def test_executor_claims_in_release_order_and_commits_every_check(project):
+    path, truth = project
+    cfg, ex = _executor(path, lead=200)
+    try:
+        assert ex._adaptive_costaware and ex._commit_every(64) == 50 and ex._commit_every(10) == 10
+        seq = [n for _, _, n, _ in _released(path)]
+        assert len(seq) == 200 and seq[:60] != sorted(seq)[:60]           # release order is not id order
+        assert {r['name'] for r in ex._claim_batch('job', 60)} == set(seq[:60])
+    finally:
+        ex.close_db_connection()
+
+
+def test_executor_claims_pairs_a_step_hands_back(project):
+    """Stale claims handed back by a step (running_timeout) or by couple.claim_timeout
+    are claimed by the worker whose claim came back empty."""
+    path, truth = project
+    dead = ("UPDATE couplings SET status = ?, claimed_at = ?, job_id = 'dead' WHERE status = ? "
+            "AND name IN (SELECT name FROM cascade_adaptive)")
+    cfg, ex = _executor(path, running_timeout=600)
+    try:
+        c = _db(path)
+        c.execute(dead, (STATUS['RUNNING'], time.time() - 700, STATUS['NOOPT']))
+        c.commit()
+        rows = ex._claim_batch('job', 100)
+        assert len(rows) == 50 and ex._adaptive_last == 'claimable' and ex._adaptive_has_work()
+    finally:
+        ex.close_db_connection()
+    # couple.claim_timeout: the executor hands claims back itself (the step's
+    # running_timeout of an hour would not)
+    cfg, ex = _executor(path, couple={'claim_timeout': 3600}, running_timeout=3600)
+    try:
+        c.execute("UPDATE couplings SET status = ?, claimed_at = ?, job_id = 'dead' WHERE status IN (?, ?) "
+                  "AND name IN (SELECT name FROM cascade_adaptive)",
+                  (STATUS['RUNNING'], time.time() - 120, STATUS['NOOPT'], STATUS['RUNNING']))
+        c.commit()
+        n_rel = len(_released(path))
+        ex._claim_timeout = 60.0
+        assert len(ex._claim_batch('job', 100000)) == n_rel
+    finally:
+        ex.close_db_connection()
+
+
+def test_executor_reports_claims_left_and_survives_a_failing_step(project, monkeypatch, caplog):
+    import massivora.executors.couple as cp
+    path, truth = project
+    cfg = _cfg(path, release_block=100000)
+    apply_cascade(cfg)
+    _run_to_freeze(path, truth, cfg)
+    c = _db(path)
+    c.execute("UPDATE couplings SET status = ?, claimed_at = ?, job_id = 'other' WHERE status = ? AND claimed_at "
+              "IS NULL AND name IN (SELECT name FROM cascade_adaptive)", (STATUS['RUNNING'], time.time(), STATUS['NOOPT']))
+    c.commit()
+    cfg, ex = _executor(path, release_block=100000)
+    try:
+        with caplog.at_level(logging.INFO):
+            assert ex._claim_batch('job', 100) == []
+        assert ex._adaptive_last == 'inflight' and 'NOT complete' in caplog.text
+        assert not ex._adaptive_has_work()
+        caplog.clear()
+
+        def locked(cfg, _init=False):
+            raise sqlite3.OperationalError('database is locked')
+        monkeypatch.setattr(cp, 'adaptive_cascade_step', locked)
+        with caplog.at_level(logging.ERROR):
+            assert ex._adaptive_tick() == 'error'
+            assert ex._claim_batch('job', 100) == []
+        assert 'threshold step failed' in caplog.text
+    finally:
+        ex.close_db_connection()

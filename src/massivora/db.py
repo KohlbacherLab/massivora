@@ -842,14 +842,20 @@ def apply_cascade(cfg: dict):
 #   cascade_adaptive_log  (batch, estimate of the threshold after that batch, stop)
 # Every step runs under BEGIN IMMEDIATE (SQLite only).
 
-_ADAPTIVE_DDL = (
-    "CREATE TABLE IF NOT EXISTS cascade_adaptive (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
-    "batch INTEGER NOT NULL, name TEXT NOT NULL UNIQUE, role TEXT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS cascade_adaptive_log (batch INTEGER PRIMARY KEY, at REAL, "
-    "n_done INTEGER, n_results INTEGER, frontier INTEGER, t_star INTEGER, t_star_rank REAL, "
-    "found REAL, total_hat REAL, budget REAL, missed_ucb_now REAL, recall_hat REAL, theta REAL, "
-    "released INTEGER, stop INTEGER)",
-)
+def _adaptive_ddl(log='cascade_adaptive_log'):
+    return (
+        "CREATE TABLE IF NOT EXISTS cascade_adaptive (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "batch INTEGER NOT NULL, name TEXT NOT NULL UNIQUE, role TEXT NOT NULL)",
+        f"CREATE TABLE IF NOT EXISTS {log} (batch INTEGER PRIMARY KEY, at REAL, "
+        "n_done INTEGER, n_results INTEGER, frontier INTEGER, t_star INTEGER, t_star_rank REAL, "
+        "found REAL, total_hat REAL, budget REAL, missed_ucb_now REAL, recall_hat REAL, theta REAL, "
+        "released INTEGER, stop INTEGER)",
+    )
+
+
+_ADAPTIVE_DDL = _adaptive_ddl()
+# the batch-mode log of a cost-aware run that the hit-structure guard switched to it
+_GUARD_LOG = 'cascade_adaptive_guard_log'
 
 
 def _adaptive_population(cfg, cascade):
@@ -905,8 +911,14 @@ def _adaptive_population(cfg, cascade):
         N.append(float(n_ or 0))
         B.append(float(b_ or 0))
     N, B = np.asarray(N), np.asarray(B)
-    return dict(names=names, rank=np.asarray(rank), cost=cost_s(N, B), neffoverL=np.asarray(nl), N=N, B=B,
-                skip=skip, n_ranked=len(ranked), has_depth=depth != 'NULL')
+    rank, nl = np.asarray(rank), np.asarray(nl)
+    # fingerprint of the population (names in rank order, rank, depth features): a
+    # cost-aware run refuses to continue when the source changed under it
+    h = hashlib.sha1('\n'.join(names).encode())
+    for a in (rank, nl, N, B):
+        h.update(np.ascontiguousarray(a, dtype=np.float64).tobytes())
+    return dict(names=names, rank=rank, cost=cost_s(N, B), neffoverL=nl, N=N, B=B,
+                skip=skip, n_ranked=len(ranked), has_depth=depth != 'NULL', hash=h.hexdigest())
 
 
 def _adaptive_source(cfg, cascade):
@@ -941,7 +953,7 @@ def _adaptive_population_cached(cfg, cascade):
     return hit
 
 
-def _adaptive_state(cur, names, rank, cost, acfg, couple_table):
+def _adaptive_state(cur, names, rank, cost, acfg, couple_table, log='cascade_adaptive_log'):
     """Rebuild the estimator from the released set and the plmDCA results."""
     import numpy as np
     from massivora.adaptive_cascade import AdaptiveCascade
@@ -969,7 +981,7 @@ def _adaptive_state(cur, names, rank, cost, acfg, couple_table):
         st.observe(idx, llr, hit)
     # observe() only sets results; replayed pairs without a result stay "released"
     st.llr[~st.done] = np.nan
-    cur.execute("SELECT t_star, frontier, n_done FROM cascade_adaptive_log ORDER BY batch")
+    cur.execute(f"SELECT t_star, frontier, n_done FROM {log} ORDER BY batch")
     for t_star, frontier, n_done in cur.fetchall():
         st.history.append(dict(t_star=t_star, frontier=frontier, n_done=n_done))
     return st, len(idx)
@@ -1018,7 +1030,8 @@ def adaptive_cascade_step(cfg: dict, _init=False):
     releases the next batch ('released'). Returns dict(status, released, estimate).
 
     `model: costaware`: see _adaptive_costaware_step; below `min_population`
-    gated pairs it runs the batch mode ('base') or every gated pair ('full').
+    gated pairs it runs the batch mode ('base') or every gated pair ('full'), and
+    after the hit-structure guard fired the batch mode ('guard-base').
     """
     cascade = (cfg.get('couple') or {}).get('cascade') or {}
     if cascade.get('adaptive') is None:
@@ -1026,15 +1039,22 @@ def adaptive_cascade_step(cfg: dict, _init=False):
     acfg = _adaptive_cfg(cascade)
     if acfg.get('model') == 'costaware':
         pop = _adaptive_population_cached(cfg, cascade)
+        src = (pop['names'], pop['rank'], pop['cost'], pop['skip'], pop['n_ranked'])
         if len(pop['names']) < acfg['min_population'] and acfg['small_population_mode'] == 'base':
-            src = (pop['names'], pop['rank'], pop['cost'], pop['skip'], pop['n_ranked'])
             return dict(_adaptive_batch_step(cfg, _base_fallback_cfg(acfg), src, _init), mode='base')
         full = len(pop['names']) < acfg['min_population']
-        return _adaptive_costaware_step(cfg, acfg, pop, full=full)
+        step = _adaptive_costaware_step(cfg, acfg, pop, full=full)
+        if step['status'] != 'switched':
+            return step
+        # the hit-structure guard switched the run: the batch mode (base_k2) from the
+        # convergence pairs on, with its own log; 'wait' there means claimable pairs
+        step = _adaptive_batch_step(cfg, _base_fallback_cfg(acfg), src, log=_GUARD_LOG)
+        return dict(step, mode='guard-base', frozen=False,
+                    status='claimable' if step['status'] == 'wait' else step['status'])
     return _adaptive_batch_step(cfg, acfg, _adaptive_source(cfg, cascade), _init)
 
 
-def _adaptive_batch_step(cfg, acfg, src, _init=False):
+def _adaptive_batch_step(cfg, acfg, src, _init=False, log='cascade_adaptive_log'):
     import time
     import numpy as np
     names, rank, cost, skip_src, n_ranked = src
@@ -1045,13 +1065,13 @@ def _adaptive_batch_step(cfg, acfg, src, _init=False):
     try:
         cur = conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
-        for ddl in _ADAPTIVE_DDL:
+        for ddl in _adaptive_ddl(log):
             cur.execute(ddl)
-        cur.execute("SELECT * FROM cascade_adaptive_log LIMIT 0")
+        cur.execute(f"SELECT * FROM {log} LIMIT 0")
         if 'stop' not in {d[0] for d in cur.description}:
             raise ValueError("couple.cascade.adaptive: this DB holds a run of the cost-aware mode; "
                              "the batch mode needs a fresh plmDCA DB")
-        cur.execute("SELECT stop FROM cascade_adaptive_log ORDER BY batch DESC LIMIT 1")
+        cur.execute(f"SELECT stop FROM {log} ORDER BY batch DESC LIMIT 1")
         last = cur.fetchone()
         if last and last[0]:
             cur.execute("COMMIT")
@@ -1065,8 +1085,8 @@ def _adaptive_batch_step(cfg, acfg, src, _init=False):
         if _init and cur.fetchone()[0]:
             cur.execute("COMMIT")
             return dict(status='wait', released=0)
-        st, n_results = _adaptive_state(cur, names, rank, cost, acfg, couple_table)
-        cur.execute("SELECT COALESCE(MAX(batch), 0) FROM cascade_adaptive_log")
+        st, n_results = _adaptive_state(cur, names, rank, cost, acfg, couple_table, log)
+        cur.execute(f"SELECT COALESCE(MAX(batch), 0) FROM {log}")
         batch = int(cur.fetchone()[0]) + 1
         est, stop = {}, 0
         if st.done.any():
@@ -1080,7 +1100,7 @@ def _adaptive_batch_step(cfg, acfg, src, _init=False):
         cur.executemany("INSERT OR IGNORE INTO cascade_adaptive (batch, name, role) VALUES (?, ?, ?)", rel)
         cur.executemany(f"UPDATE {table} SET status = ? WHERE name = ? AND status = ?",
                         [(STATUS['NOOPT'], n, STATUS['SKIPPED']) for _, n, _ in rel])
-        cur.execute("INSERT INTO cascade_adaptive_log VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        cur.execute(f"INSERT INTO {log} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (batch, time.time(), int(st.done.sum()), n_results, est.get('frontier'), est.get('t_star'),
                      est.get('t_star_rank'), est.get('found'), est.get('total_hat'), est.get('budget'),
                      est.get('missed_ucb_now'), est.get('recall_hat'), est.get('theta'), len(rel), stop))
@@ -1102,7 +1122,11 @@ def _adaptive_batch_step(cfg, acfg, src, _init=False):
 
 def _apply_adaptive_cascade(cfg):
     """apply_cascade for `couple.cascade.adaptive`: the first batch is released if
-    none is; every ranked pair outside the released set is SKIPPED."""
+    none is; every ranked pair outside the released set is SKIPPED. The released
+    set and the statuses are read and changed in one BEGIN IMMEDIATE transaction,
+    so a release or withdrawal another worker commits meanwhile is never undone.
+    A released pair is set back from SKIPPED to NOOPT only by a release; one the
+    plmDCA stage itself skipped stays SKIPPED."""
     cascade = cfg['couple']['cascade']
     acfg = _adaptive_cfg(cascade)
     adaptive_cascade_step(cfg, _init=True)
@@ -1113,8 +1137,10 @@ def _apply_adaptive_cascade(cfg):
         names, rank, cost, skip_src, n_ranked = _adaptive_source(cfg, cascade)
     table = quote_identifier(get_table_names(cfg)['couplings'])
     conn = connect_db_rw(cfg)
+    conn.isolation_level = None
     try:
         cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
         cur.execute("SELECT name FROM cascade_adaptive")
         released = {r[0] for r in cur.fetchall()}
         population = set(names)
@@ -1124,14 +1150,18 @@ def _apply_adaptive_cascade(cfg):
         for pid, name, status in cur.fetchall():
             if name in skip_src or (name in population and name not in released):
                 new = STATUS['SKIPPED']
-            elif name in released:
-                new = STATUS['NOOPT']
             else:
-                new = status        # neither ranked nor gated: unfinished in source, left as is
+                new = status        # released (NOOPT, or skipped by plmDCA), or neither ranked nor gated
             if new != status:
                 changes.append((new, pid, status))
         cur.executemany(f"UPDATE {table} SET status = ? WHERE id = ? AND status = ?", changes)
-        conn.commit()
+        cur.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
     finally:
         conn.close()
     kept = len(released & population)
@@ -1167,27 +1197,44 @@ def reclaim_stale_claims(cur, table, timeout, released_only=False):
 # massivora.adaptive_cascade.CostAwareThreshold, driven from the plmDCA DB:
 #   cascade_adaptive      (seq, batch = block, name, role): role 'explore' for the
 #                         stratified random convergence pairs, 'final' for the
-#                         pairs released after the freeze
+#                         pairs released after the freeze; executors claim in seq
+#                         order, so the frozen selection runs highest s first
 #   cascade_adaptive_obs  (name, k): the estimate whose check_every results
 #                         included the pair (-1: finished without a result)
-#   cascade_adaptive_log  one row per estimate k (k = 0: the start), with the
-#                         pairs observed / released / in flight, t, s*, the
-#                         relative change, the consecutive passes, frozen, theta
-#                         and beta; the frozen row also carries the release
-#                         pointer (final_next) into the frozen s order
+#   cascade_adaptive_log  one row per estimate k (k = 0: the start, with the
+#                         population and rule fingerprints), with the pairs
+#                         observed / released / in flight, t, s*, the relative
+#                         change, the consecutive passes, frozen, theta, beta and
+#                         the guard statistic; the frozen row also carries the
+#                         release pointer (final_next) into the frozen s order
 # Each step runs under BEGIN IMMEDIATE and is safe from any worker at any time:
-#   1. claims older than running_timeout are reclaimed (they count as in flight
+#   1. the population (names, ranks, depth features) and the rule's keys must
+#      match the k = 0 fingerprints, else the step refuses (ValueError);
+#   2. claims older than running_timeout are reclaimed (they count as in flight
 #      until then);
-#   2. new results are taken in release order in chunks of exactly check_every;
+#   3. new results are taken in release order in chunks of exactly check_every;
 #      one estimate per chunk, warm-started from the previous estimate's beta
 #      (from the log), logged;
-#   3. on freeze, unclaimed convergence pairs with s < s* are withdrawn and the
+#   4. hit-structure guard: once guard_min_obs results are in, an estimate whose
+#      HT detector hits per HT top call exceed guard_hits_per_top switches the
+#      run to the batch mode (base_k2, log _GUARD_LOG), which continues from the
+#      convergence pairs as its exploration sample;
+#   5. on freeze, unclaimed convergence pairs with s < s* are withdrawn and the
 #      pairs with s >= s* are released, highest s first, release_block at a time;
-#   4. otherwise blocks of check_every stratified random pairs are released
+#   6. otherwise blocks of check_every stratified random pairs are released
 #      until `lead` released pairs are claimable (pairs in flight count as
 #      processed: never drawn again, counted in the stratum allocation).
 # A frozen state is read back from the log (beta, s*, pointer), never recomputed
 # from new data, so a restarted worker carries on with the same selection.
+# Executors claim eagerly, so pairs in flight are bounded by each executor's
+# pipeline (about 200 per GPU worker), not by `lead`, and the withdrawal at the
+# freeze usually finds few unclaimed convergence pairs.
+#
+# Status of a step: 'released' (new pairs made claimable), 'claimable' (none
+# released, but released pairs are claimable -- e.g. reclaimed stale claims, or
+# another worker's release), 'inflight' (nothing to claim or release, but
+# released pairs are still claimed by some worker, live or dead), 'done'
+# (everything released has finished and nothing is left to release), 'wait'.
 
 _COSTAWARE_DDL = (
     "CREATE TABLE IF NOT EXISTS cascade_adaptive (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -1197,12 +1244,15 @@ _COSTAWARE_DDL = (
     "n_pop INTEGER, n_obs INTEGER, n_released INTEGER, n_inflight INTEGER, n_failed INTEGER, t REAL, "
     "t_prev REAL, rel_change REAL, check_ok INTEGER, streak INTEGER, frozen INTEGER, s_star REAL, "
     "theta REAL, found REAL, total_hat REAL, missed_hat REAL, beta TEXT, est_s REAL, released INTEGER, "
-    "withdrawn INTEGER, reclaimed INTEGER, n_selected INTEGER, final_next INTEGER, reason TEXT)",
+    "withdrawn INTEGER, reclaimed INTEGER, n_selected INTEGER, final_next INTEGER, reason TEXT, "
+    "pop_hash TEXT, cfg_hash TEXT, hit_density REAL, switched TEXT)",
 )
 _COSTAWARE_LOG_COLS = ('k', 'at', 'mode', 'n_pop', 'n_obs', 'n_released', 'n_inflight', 'n_failed', 't', 't_prev',
                        'rel_change', 'check_ok', 'streak', 'frozen', 's_star', 'theta', 'found', 'total_hat',
                        'missed_hat', 'beta', 'est_s', 'released', 'withdrawn', 'reclaimed', 'n_selected',
-                       'final_next', 'reason')
+                       'final_next', 'reason', 'pop_hash', 'cfg_hash', 'hit_density', 'switched')
+# columns added after the first cost-aware runs (ALTER TABLE on an older DB)
+_COSTAWARE_LOG_ADDED = (('pop_hash', 'TEXT'), ('cfg_hash', 'TEXT'), ('hit_density', 'REAL'), ('switched', 'TEXT'))
 
 _COSTAWARE_CACHE = {}
 
@@ -1220,6 +1270,12 @@ def _costaware_model(pop, c):
         hit = _COSTAWARE_CACHE[key] = dict(pop=pop, model=model, index={n: i for i, n in enumerate(pop['names'])},
                                            order={})
     return hit
+
+
+def _costaware_cfg_hash(c):
+    import json
+    from massivora.adaptive_cascade import COSTAWARE_RULE_KEYS
+    return hashlib.sha1(json.dumps({k: c[k] for k in COSTAWARE_RULE_KEYS}, sort_keys=True).encode()).hexdigest()
 
 
 def _costaware_log(cur, row):
@@ -1241,6 +1297,14 @@ def _costaware_claimable(cur, table):
     return int(cur.fetchone()[0])
 
 
+def _costaware_claimed(cur, table):
+    """(released pairs claimed by some worker and not finished, oldest claim time)."""
+    cur.execute(f"SELECT COUNT(*), MIN(t.claimed_at) FROM cascade_adaptive a JOIN {table} t ON t.name = a.name "
+                f"WHERE t.status IN (?, ?) AND t.claimed_at IS NOT NULL", (STATUS['RUNNING'], STATUS['RETRYING']))
+    n, oldest = cur.fetchone()
+    return int(n or 0), oldest
+
+
 def _costaware_release(cur, table, rows):
     """Insert (batch, name, role) rows into cascade_adaptive and make them claimable."""
     cur.executemany("INSERT OR IGNORE INTO cascade_adaptive (batch, name, role) VALUES (?, ?, ?)", rows)
@@ -1253,7 +1317,6 @@ def _costaware_release_final(cur, table, ca, frozen, c):
     """Release the next pairs of the frozen selection (highest s first) until
     release_block released pairs are claimable. Returns (released, exhausted)."""
     import json
-    import numpy as np
     model, names = ca['model'], ca['pop']['names']
     okey = (frozen['beta'], frozen['s_star'], frozen['mode'])
     order = ca['order'].get(okey)
@@ -1285,12 +1348,35 @@ def _costaware_release_final(cur, table, ca, frozen, c):
     return len(new), ptr >= len(order)
 
 
+def _costaware_check_run(cur, last0, pop, c, mode):
+    """The k = 0 row's fingerprints against the current population and rule; a
+    DB from before the fingerprints gets them now."""
+    pop_hash, cfg_hash = pop.get('hash'), _costaware_cfg_hash(c)
+    if last0['mode'] != mode:
+        raise ValueError(f"couple.cascade.adaptive: this DB holds a {last0['mode']} run, the configuration "
+                         f"now asks for {mode} (min_population / small_population_mode changed?)")
+    if last0['pop_hash'] is None and last0['cfg_hash'] is None:
+        cur.execute("UPDATE cascade_adaptive_log SET pop_hash = ?, cfg_hash = ? WHERE k = 0", (pop_hash, cfg_hash))
+        logging.info("cascade.adaptive (costaware): recorded the population and rule fingerprints of this run")
+        return
+    if last0['pop_hash'] != pop_hash:
+        raise ValueError(f"couple.cascade.adaptive: the gated GaussDCA population changed since this run started "
+                         f"({last0['n_pop']} pairs then, {len(pop['names'])} now, or other names, ranks or depth "
+                         f"features): the frozen order and the released set would no longer match. Finish the "
+                         f"GaussDCA source before the plmDCA stage starts, or start a fresh plmDCA DB")
+    if last0['cfg_hash'] != cfg_hash:
+        raise ValueError("couple.cascade.adaptive: the cost-aware rule's configuration (seed, check_every, z, "
+                         "tilt, strata, guard, ...) changed since this run started; one run must keep one rule. "
+                         "Restore the configuration or start a fresh plmDCA DB")
+
+
 def _adaptive_costaware_step(cfg, c, pop, full=False):
     """
     One step of `couple.cascade.adaptive` with `model: costaware` (see the
     comment above). `full`: the small-population fallback that runs every gated
     pair (frozen at the start, in rank order). Returns dict(status = released |
-    wait | frozen | done, released, estimates, t, frozen, mode).
+    claimable | inflight | done | wait | switched, released, estimates, t, frozen,
+    mode, claimable, claimed, oldest_claim_s).
     """
     import json
     import time
@@ -1299,7 +1385,8 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
     n = len(names)
     mode = 'full' if full else 'costaware'
     if n == 0:
-        return dict(status='done', released=0, estimates=0, t=None, frozen=True, mode=mode)
+        return dict(status='done', released=0, estimates=0, t=None, frozen=True, mode=mode, claimable=0, claimed=0,
+                    oldest_claim_s=None)
     if not full and not pop.get('has_depth', True):
         raise ValueError("couple.cascade.adaptive (model costaware) needs the source's neffoverL column")
     ca = _costaware_model(pop, c)
@@ -1307,31 +1394,41 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
     table = quote_identifier(get_table_names(cfg)['couplings'])
     conn = connect_db_rw(cfg)
     conn.isolation_level = None
-    n_est, released, withdrawn, frozen_now, est, exhausted = 0, 0, 0, False, None, False
+    n_est, released, withdrawn, frozen_now, est, exhausted, switched = 0, 0, 0, False, None, False, False
+    reclaimed = 0
+    guard = float(c['guard_hits_per_top']) > 0 and not full
     try:
         cur = conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
         for ddl in _COSTAWARE_DDL:
             cur.execute(ddl)
         cur.execute("SELECT * FROM cascade_adaptive_log LIMIT 0")
-        if 'frozen' not in {d[0] for d in cur.description}:
+        cols = {d[0] for d in cur.description}
+        if 'frozen' not in cols:
             raise ValueError("couple.cascade.adaptive: this DB holds a run of the batch mode; "
                              "model: costaware needs a fresh plmDCA DB")
+        for col, typ in _COSTAWARE_LOG_ADDED:
+            if col not in cols:
+                cur.execute(f"ALTER TABLE cascade_adaptive_log ADD COLUMN {col} {typ}")
         last = _costaware_last(cur)
         if last is None:                                            # k = 0: the start
             last = dict(k=0, at=time.time(), mode=mode, n_pop=n, n_obs=0, n_released=0, t=c['start_fraction'],
                         streak=0, frozen=int(full), beta=None, released=0, final_next=0,
                         s_star=-math.inf if full else None, n_selected=n if full else None,
-                        reason='small population: every gated pair' if full else 'start')
+                        reason='small population: every gated pair' if full else 'start',
+                        pop_hash=pop.get('hash'), cfg_hash=_costaware_cfg_hash(c))
             _costaware_log(cur, last)
-        elif last['mode'] != mode:
-            raise ValueError(f"couple.cascade.adaptive: this DB holds a {last['mode']} run, the configuration "
-                             f"now asks for {mode} (min_population / small_population_mode changed?)")
+        else:
+            cur.execute(f"SELECT {', '.join(_COSTAWARE_LOG_COLS)} FROM cascade_adaptive_log WHERE k = 0")
+            _costaware_check_run(cur, dict(zip(_COSTAWARE_LOG_COLS, cur.fetchone())), pop, c, mode)
+        if last.get('switched'):
+            cur.execute("COMMIT")
+            return dict(status='switched', released=0, estimates=0, t=float(last['t']), frozen=False, mode=mode)
         reclaimed = reclaim_stale_claims(cur, table, c['running_timeout'], released_only=True)
 
         if not last['frozen']:
             # released pairs, their state and the results not used yet
-            cur.execute(f"SELECT a.name, a.role, t.status, t.log_lr_raw, t.claimed_at, o.k "
+            cur.execute(f"SELECT a.name, a.role, t.status, t.log_lr_raw, t.claimed_at, o.k, t.high_precision_hit "
                         f"FROM cascade_adaptive a LEFT JOIN {table} t ON t.name = a.name "
                         f"LEFT JOIN cascade_adaptive_obs o ON o.name = a.name ORDER BY a.seq")
             rel = cur.fetchall()
@@ -1340,7 +1437,7 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
             explored = np.zeros(n, bool)
             failed = np.zeros(n, bool)
             new_ok, new_bad, unclaimed, claimable = [], [], [], 0
-            for name, role, status, llr, claimed, k in rel:
+            for name, role, status, llr, claimed, k, hit in rel:
                 i = index.get(name)
                 if i is None:
                     continue
@@ -1350,7 +1447,7 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
                     failed[i] = True
                 elif k is None:
                     if status == STATUS['DONE'] and llr is not None:
-                        new_ok.append((i, name, float(llr)))
+                        new_ok.append((i, name, float(llr), bool(hit)))
                     elif status in (STATUS['DONE'], STATUS['FAILED'], STATUS['SKIPPED'], None):
                         new_bad.append(name)
                         failed[i] = True
@@ -1361,44 +1458,51 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
                         unclaimed.append(i)
             cur.executemany("INSERT OR IGNORE INTO cascade_adaptive_obs (name, k) VALUES (?, -1)",
                             [(nm,) for nm in new_bad])
-            cur.execute(f"SELECT o.name, t.log_lr_raw FROM cascade_adaptive_obs o JOIN {table} t ON t.name = o.name "
-                        f"WHERE o.k > 0 ORDER BY o.k, o.rowid")
-            obs, llr_o = [], []
-            for name, llr in cur.fetchall():
+            cur.execute(f"SELECT o.name, t.log_lr_raw, t.high_precision_hit FROM cascade_adaptive_obs o "
+                        f"JOIN {table} t ON t.name = o.name WHERE o.k > 0 ORDER BY o.k, o.rowid")
+            obs, llr_o, hit_o = [], [], []
+            for name, llr, hit in cur.fetchall():
                 i = index.get(name)
                 if i is not None and llr is not None:
                     obs.append(i)
                     llr_o.append(float(llr))
+                    hit_o.append(bool(hit))
 
             # one estimate per check_every new results
             B = c['check_every']
             k, t_prev, streak = int(last['k']), float(last['t']), int(last['streak'] or 0)
             beta = json.loads(last['beta']) if last['beta'] else None
-            while len(new_ok) >= B and not frozen_now:
+            while len(new_ok) >= B and not frozen_now and not switched:
                 chunk, new_ok = new_ok[:B], new_ok[B:]
                 k += 1
                 cur.executemany("INSERT INTO cascade_adaptive_obs (name, k) VALUES (?, ?)",
-                                [(nm, k) for _, nm, _ in chunk])
-                for i, _, l in chunk:
+                                [(nm, k) for _, nm, _, _ in chunk])
+                for i, _, l, h in chunk:
                     obs.append(i)
                     llr_o.append(l)
+                    hit_o.append(h)
                 t0 = time.perf_counter()
                 # in flight = claimed or finished but not in a chunk yet: they run whatever
                 # t is, so they are never missed. Released pairs nobody claimed yet are
                 # treated as unreleased (missed if below s*), which is what lets the freeze
                 # withdraw those below s*.
                 est = model.estimate(obs, llr_o, rel_m & ~pool, failed, beta)
+                density = model.hit_density(obs, llr_o, hit_o, est['theta'], failed)
                 est_s = time.perf_counter() - t0
                 ok, rel_change = model.check(t_prev, est['t'])
                 streak = streak + 1 if ok else 0
-                frozen_now = streak >= c['freeze_consecutive']
+                switched = guard and len(obs) >= c['guard_min_obs'] and density > c['guard_hits_per_top']
+                frozen_now = streak >= c['freeze_consecutive'] and not switched
                 row = dict(k=k, at=time.time(), mode=mode, n_pop=n, n_obs=est['n_obs'], n_released=int(rel_m.sum()),
                            n_inflight=est['n_inflight'], n_failed=est['n_failed'], t=est['t'], t_prev=t_prev,
                            rel_change=rel_change, check_ok=int(ok), streak=streak, frozen=int(frozen_now),
                            s_star=est['s_star'], theta=est['theta'], found=est['found'], total_hat=est['total_hat'],
                            missed_hat=est['missed_hat'], beta=json.dumps(est['beta']), est_s=est_s,
-                           reclaimed=reclaimed, released=0, final_next=0,
+                           reclaimed=reclaimed, released=0, final_next=0, hit_density=density,
                            reason='converged' if frozen_now else None)
+                if switched:
+                    row.update(switched='base', reason=f"guard: {density:.3f} detector hits per top call > "
+                                                       f"{c['guard_hits_per_top']:g} (not screen-like): batch mode")
                 if frozen_now:
                     sel = model.selection(est['beta'], est['s_star'])[0]
                     out = [names[i] for i in unclaimed if not sel[i]]
@@ -1414,7 +1518,7 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
                 _costaware_log(cur, row)
                 t_prev, beta = est['t'], est['beta']
                 n_est += 1
-            if not frozen_now:
+            if not frozen_now and not switched:
                 # convergence blocks until `lead` released pairs are claimable
                 cur.execute("SELECT COALESCE(MAX(batch), 0) FROM cascade_adaptive")
                 block = int(cur.fetchone()[0])
@@ -1436,6 +1540,8 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
         if last['frozen']:
             released_f, exhausted = _costaware_release_final(cur, table, ca, last, c)
             released += released_f
+        n_claimable = _costaware_claimable(cur, table)
+        n_claimed, oldest = _costaware_claimed(cur, table)
         cur.execute("COMMIT")
     except BaseException:
         try:
@@ -1446,11 +1552,26 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
     finally:
         conn.close()
     frozen = bool(last['frozen'])
+    if switched:
+        logging.warning(f"cascade.adaptive (costaware): {last['reason']} -- estimate k = {last['k']}, "
+                        f"{last['n_obs']} observed; the run continues as the batch mode (base_k2) from the "
+                        f"convergence pairs")
+        return dict(status='switched', released=0, estimates=n_est, t=float(last['t']), frozen=False, mode=mode,
+                    estimate=est)
     if n_est or released or withdrawn:
         logging.info(f"cascade.adaptive (costaware): {n} gated pairs; {n_est} estimate(s), last k = {last['k']}: "
                      f"t = {float(last['t']):.4f}, s* = {last['s_star']}, {last['n_obs']} observed; "
                      + (f"FROZEN: released {released} (pairs with s >= s*, highest s first), withdrew {withdrawn}"
                         if frozen else f"released {released} convergence pairs"))
-    status = 'released' if released else ('done' if exhausted else ('frozen' if frozen else 'wait'))
+    if released:
+        status = 'released'
+    elif n_claimable:
+        status = 'claimable'
+    elif n_claimed:
+        status = 'inflight'
+    elif exhausted:
+        status = 'done'
+    else:
+        status = 'wait'
     return dict(status=status, released=released, estimates=n_est, t=float(last['t']), frozen=frozen, mode=mode,
-                estimate=est)
+                estimate=est, claimable=n_claimable, claimed=n_claimed, reclaimed=reclaimed, oldest_claim_s=(time.time() - oldest) if oldest is not None else None)

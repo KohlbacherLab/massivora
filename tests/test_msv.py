@@ -1376,6 +1376,75 @@ def test_gpu_executor_takes_a_doubled_sigterm_as_one(tmp_path, couple, monkeypat
     assert signal.getsignal(signal.SIGTERM) is original
 
 
+def test_gpu_executor_runs_a_costaware_cascade_to_the_end(tmp_path, couple, monkeypatch):
+    """couple.cascade.adaptive (model costaware) through the GPU executor: commits
+    every check_every results, steps after each commit, releases the frozen
+    selection block by block and claims a dead worker's pair once running_timeout
+    hands it back -- all in one run, nothing released left unfinished."""
+    import json
+    import time
+    import massivora.db as mdb
+    from massivora.adaptive_cascade import CostAwareThreshold, costaware_config
+    n = 120
+    adaptive = dict(model='costaware', min_population=0, check_every=5, freeze_consecutive=1, freeze_rel_change=1.0,
+                    z=0.0, target_recall=0.999, strata=4, lead=10, release_block=7, running_timeout=1.0,
+                    guard_hits_per_top=0, seed=1)
+    cascade = {'source_db': 'gauss.sqlite3', 'min_neffoverL': 0.1, 'adaptive': adaptive}
+    cfg = _couple_project(tmp_path, n_pairs=n, gpu_sessions=1, gpu_workers=2, cascade=cascade)
+    create_job_db({**cfg, 'database': {'backend': 'sqlite', 'filename': 'gauss.sqlite3'}})
+    rng = np.random.default_rng(0)
+    g = sqlite3.connect(tmp_path / 'gauss.sqlite3')
+    g.executemany("INSERT INTO couplings (name, pid1, pid2, status, log_lr_raw, neffoverL, length, number) "
+                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                  [(f'A{i}-B{i}', f'A{i}', f'B{i}', STATUS['DONE'], float(n - i), float(rng.uniform(0.2, 3)),
+                    int(rng.integers(50, 900)), int(rng.integers(40, 5000))) for i in range(n)])
+    g.commit()
+    g.close()
+    truth = {f'A{i}-B{i}': float(-np.log((i + 0.5) / n) + rng.normal(0, 0.7)) for i in range(n)}
+
+    def score(MSA):
+        time.sleep(0.01)
+        return _symmetric(MSA.shape[0], seed=int(MSA[0, 0])).astype(np.float32)
+
+    _fake_gauss_cuda(couple, monkeypatch, score=score)
+    executor = _fake_gpu_executor(couple, monkeypatch, cfg)
+    assert executor._adaptive_costaware and executor._commit_every(64) == 5
+    apply = executor._db_apply_results
+    names = {r['id']: r['name'] for r in _couplings(tmp_path).values()}
+
+    def with_truth(done, fail, skipped=()):           # the stand-in scores carry no plmDCA log_lr_raw
+        for x in done:
+            x['log_lr_raw'] = truth[names[x['id']]]
+        return apply(done, fail, skipped)
+
+    monkeypatch.setattr(executor, '_db_apply_results', with_truth)
+    conn = sqlite3.connect(tmp_path / 'job.db')
+    dead = conn.execute("SELECT name FROM cascade_adaptive ORDER BY seq DESC LIMIT 1").fetchone()[0]
+    conn.execute("UPDATE couplings SET status = ?, claimed_at = ?, job_id = 'dead' WHERE name = ?",
+                 (STATUS['RUNNING'], time.time() - 0.9, dead))     # stale 0.1 s into the run
+    conn.commit()
+
+    executor.run()
+
+    rows = _couplings(tmp_path)
+    released = [r for r in conn.execute("SELECT seq, name, role FROM cascade_adaptive ORDER BY seq")]
+    assert rows[dead]['status'] == STATUS['DONE']
+    assert all(rows[nm]['status'] == STATUS['DONE'] and rows[nm]['claimed_at'] is None for _, nm, _ in released)
+    log = [dict(zip([d[0] for d in conn.execute("SELECT * FROM cascade_adaptive_log").description], r))
+           for r in conn.execute("SELECT * FROM cascade_adaptive_log ORDER BY k")]
+    fr = [r for r in log if r['frozen']]
+    assert len(fr) == 1 and fr[0]['n_obs'] == 5 * fr[0]['k']
+    pop = mdb._adaptive_population(cfg, cfg['couple']['cascade'])
+    model = CostAwareThreshold(pop['rank'], pop['cost'], pop['neffoverL'], pop['N'], pop['B'],
+                               costaware_config(adaptive))
+    sel, _ = model.selection(json.loads(fr[0]['beta']), fr[0]['s_star'])
+    want = {pop['names'][i] for i in np.flatnonzero(sel)} | {nm for _, nm, r in released if r == 'explore'}
+    assert {nm for nm, r in rows.items() if r['status'] == STATUS['DONE']} == want
+    if len(want) - sum(r == 'explore' for _, _, r in released) > 7:
+        assert sum(r == 'final' for _, _, r in released) > 7         # more than one release block
+    conn.close()
+
+
 # ---------------------------------------------------------------------------
 # massiveilance: recovering a dead job from the shard it already wrote
 # ---------------------------------------------------------------------------

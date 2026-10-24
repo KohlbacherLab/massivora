@@ -238,12 +238,22 @@ couple:
   # s >= s*) re-estimated after every check_every finished pairs; frozen once t
   # changes by < freeze_rel_change on freeze_consecutive consecutive checks,
   # then plmDCA runs on every pair with s >= s*, highest s first. Simulated on
-  # the H. pylori screen (917,537 gated pairs, held-out replicates): ~49 measured
-  # plmDCA-h (cost-model hours x ~1.21), top-call recall >= 0.95 in 200/200,
-  # freeze after ~1,650 pairs. Below min_population gated pairs the
-  # convergence batches would eat most of the set: small_population_mode base
-  # runs the batch mode instead (top_fraction hits, target_recall), full runs
-  # every gated pair. Keys (defaults):
+  # the H. pylori screen (917,537 gated pairs; 3,903 measured truth rows imputed):
+  # ~49 measured plmDCA-h (56 h under iid imputation; cost-model hours x ~1.21)
+  # against ~108 h for the batch mode, freeze after ~1,650 pairs -- provided the
+  # GaussDCA tail (rank >= 0.4) holds almost no top calls, as in the truth
+  # sample; 3-6 % of the top calls there would cost +8 to +38 h. Top-call recall
+  # >= 0.95 holds in about 95-98 % of runs, not always. The log's found /
+  # total_hat is NOT a run's recall (uncorrelated with it in simulation).
+  # Below min_population gated pairs the convergence batches eat much of the set
+  # and the finalist meets both recalls in only 92-96 % of runs for at most
+  # ~5 h of savings: small_population_mode base runs the batch mode instead
+  # (top_fraction hits, target_recall), full runs every gated pair. The
+  # hit-structure guard switches a run to the batch mode when the convergence
+  # pairs show many more detector hits per top call than the screen (dense,
+  # spread-out hits, e.g. a labelled benchmark set). A run refuses to continue
+  # when the gated GaussDCA population or a rule key changed since it started.
+  # Keys (defaults):
   #   adaptive:
   #     model: costaware
   #     start_fraction: 0.5       # t before the first estimate (t_0 of the rule)
@@ -257,15 +267,21 @@ couple:
   #     tilt: 3.0                 # their weight for strata above rank tilt_above
   #     tilt_above: 0.4
   #     ridge: 1.0
-  #     min_population: 10000
+  #     min_population: 50000     # gated pairs; below: small_population_mode
   #     small_population_mode: base   # or full
+  #     guard_hits_per_top: 0.3   # HT detector hits per top call (screen <= 0.26; 0: off)
+  #     guard_min_obs: 500        # results before the guard is checked
   #     seed: 0
   #     lead: null                # claimable convergence pairs kept released (null: check_every)
   #     release_block: 1000       # claimable pairs kept released after the freeze
   #     running_timeout: 3600     # s; older claims of released pairs are handed back.
   #                               # Keep it above the longest claim-to-result time
   #                               # (claim depth x seconds per pair): a live claim
-  #                               # handed back may run twice (e2e, 600 s: 4 of 102)
+  #                               # handed back may run twice (e2e at 600 s: 3 live
+  #                               # claims handed back, 4 pairs scored twice)
+  # A worker with nothing left to claim logs whether the selection is complete
+  # or released pairs are still claimed (by others, or by a dead worker: those
+  # are handed back after running_timeout, so start a worker again later).
   # State: cascade_adaptive, cascade_adaptive_obs, cascade_adaptive_log in the
   # plmDCA DB (one log row per estimate). model: batch (default) is the batch
   # loop: start_fraction, target_recall, explore_fraction, batch | batch_fraction,
