@@ -468,7 +468,7 @@ def _coupling_result_info(output_dir, couple_table, row, location, calibrator):
         from massivora.analyzer import ComplexAnalyzer
         analyzer = ComplexAnalyzer(score, saved_columns=record['saved_columns'],
                                    chainA_length=record['lengthes'][0], EC_threshold=0)
-        calibrated = calibrator.Calibrate(analyzer, float(n_eff))
+        calibrated = calibrator.Calibrate(analyzer, float(n_eff), n_sequences=number)
     except Exception as e:
         logging.warning(f"massiveilance on {WORKER_NAME}: cannot calibrate '{row['name']}' "
                         f"from its score record: {e}")

@@ -30,7 +30,7 @@ from massivora.db import (STATUS, adaptive_cascade_step, adaptive_mode, apply_ca
                           connect_db_rw, reclaim_stale_claims,
                           ensure_columns, get_db_path, get_hashed_file_path,
                           get_table_names, quote_identifier)
-from massivora.utils import (SHM_PREFIX, ShardWriter, compute_id_range,
+from massivora.utils import (DOWNSAMPLE_SEED, SHM_PREFIX, ShardWriter, compute_id_range, downsample_rng,
                              gpu_is_available, massivora_pkg_dir,
                              saved_columns_to_bitmask, setup_logging,
                              visible_gpu_devices, worker_id)
@@ -73,6 +73,8 @@ class BaseCouplingExecutor(object):
         down_cfg = config.get('concatenate').get('downsample')
         self.downsample = bool(down_cfg.get('enabled', False))
         self.downsample_to = int(down_cfg.get('to', 30000))
+        # Seed of the B-cap draw; with the pair's name it fixes the rows kept
+        self.downsample_seed = int(down_cfg.get('seed', DOWNSAMPLE_SEED))
         self.reweighting_threshold = float(
             config.get('concatenate').get('reweighting_threshold', 0.8))
         # What concatenate() does with a pair that glues a sequence to itself
@@ -188,7 +190,9 @@ class BaseCouplingExecutor(object):
         resolve_shared_source(concatenated, self.shared_source_strategy, pair_name,
                               cache=getattr(self, 'shared_source_cache', None))
         if downsample:
-            concatenated.Downsample_Randomly(to=downsample_to)
+            seed = getattr(self, 'downsample_seed', DOWNSAMPLE_SEED)
+            concatenated.Downsample_Randomly(to=downsample_to,
+                                             seed=downsample_rng(seed, pair_name))
         concatenated.Mask_Gap_Columns(self._config.get('align').get('col_gap_threshold', 0.5))
         return concatenated
 
@@ -1186,7 +1190,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor, BuiltinPLMCalibrator):
         analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
                                        chainA_length=params['lengthes'][0],
                                        EC_threshold=0)
-        calibrated = self.Calibrate(analyzer, params["Beff"])
+        calibrated = self.Calibrate(analyzer, params["Beff"], n_sequences=params["B"])
 
         result = {
             'id': params["pair_id"],
@@ -2277,7 +2281,7 @@ class PLMCouplingExecutorGPU(SessionGPUExecutor, BuiltinPLMCalibrator):
         analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
                                    chainA_length=params['lengthes'][0],
                                    EC_threshold=0)
-        calibrated = self.Calibrate(analyzer, params["Beff"])
+        calibrated = self.Calibrate(analyzer, params["Beff"], n_sequences=params["B"])
         return {
             'id': params['pair_id'],
             'effnumber': params['Beff'],

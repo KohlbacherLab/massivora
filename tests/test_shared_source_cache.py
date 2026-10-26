@@ -196,8 +196,7 @@ def test_pair_modified_after_concatenation_uses_its_rows(merge):
     np.testing.assert_array_equal(pair._shared_rows(), _row_check(pair))
 
     pair = _pair_from(shared=(2, 4, 6, 8, 10, 12, 14, 16))
-    np.random.seed(0)
-    pair.Downsample_Randomly(to=25)
+    pair.Downsample_Randomly(to=25, seed=0)
     assert pair._pair_source is None
     np.testing.assert_array_equal(pair._shared_rows(), _row_check(pair))
     assert pair.Is_Shared_Source(threshold=1e-9) == bool(_row_check(pair).any())

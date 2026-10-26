@@ -751,6 +751,11 @@ class BaseCalibrator(object):
 
     RANKER = None
     DETECTOR = None
+    #: Fewest alignment rows (B) a pair needs to be scored; None = no minimum.
+    #: Below it `Calibrate(..., n_sequences=B)` returns the score-less result
+    #: whatever the matrix holds. Set on the plmDCA calibrator only: GaussDCA's
+    #: screen scores (the cascade's ranking) were computed without it.
+    MIN_SEQUENCES = None
 
     def __init__(self, pi=None):
         if pi is not None:
@@ -819,7 +824,17 @@ class BaseCalibrator(object):
         """
         return False if coverage < self.LOW_CUT else True
 
-    def Calibrate(self, analyzer, N_eff):
+    def _scoreless(self, coverage):
+        """The defined result of a pair that has no score (see `Calibrate`)."""
+        return {
+            "log_lr_raw": float('nan'),
+            "pcontact": float('nan'),
+            "confidence_flag": False,
+            "high_precision_hit": False,
+            "neffoverL": coverage,
+        }
+
+    def Calibrate(self, analyzer, N_eff, n_sequences=None):
         """Score one pair.
 
         Parameters
@@ -829,6 +844,9 @@ class BaseCalibrator(object):
             holds the inter-protein block restricted to the retained columns.
         `N_eff` — float
             Effective (reweighted) sequence count of the concatenated alignment.
+        `n_sequences` — int (optional)
+            The alignment's row count B. With `MIN_SEQUENCES` set (plmDCA),
+            B < MIN_SEQUENCES gives the score-less result below.
 
         Returns
         -------
@@ -865,12 +883,24 @@ class BaseCalibrator(object):
         rather than failed. The reason is *not* stored: a degenerate pair is a
         DONE row with a NULL score, indistinguishable in the DB from any other
         NULL-score DONE row.
+
+        An alignment of B < `MIN_SEQUENCES` rows (plmDCA: B <= 3) gets the same
+        score-less result even when its matrix can be normalised. On such an
+        alignment (Beff 1-2) the GPU optimiser's round-off decides whether the
+        block is exactly 0 (score-less) or a near-constant ~1e-6 that
+        normalises into log_lr_raw ~14 (a top rank): 15 of 40 real B <= 3
+        screen pairs did the latter, so the outcome depended on the hardware.
         """
         if self.RANKER is None or self.DETECTOR is None:
             raise NotImplementedError(
                 f"{type(self).__name__} defines no RANKER/DETECTOR constants")
         L = int(analyzer.raw_couplings.shape[0])
         coverage = float(N_eff) / float(L)
+        if (self.MIN_SEQUENCES is not None and n_sequences is not None
+                and int(n_sequences) < self.MIN_SEQUENCES):
+            logging.warning(f"degenerate alignment (B {int(n_sequences)} < {self.MIN_SEQUENCES}, "
+                            f"Beff {float(N_eff):.3g}, L {L}): finished without a score")
+            return self._scoreless(coverage)
         # Both models normalise the same coupling matrix, so either call can hit the
         # degenerate case; catch them together.
         try:
@@ -879,13 +909,7 @@ class BaseCalibrator(object):
         except DegenerateCouplingsError as e:
             logging.warning(f"{e}; degenerate alignment (Beff {float(N_eff):.3g}, L {L}): "
                             "finished without a score")
-            return {
-                "log_lr_raw": float('nan'),
-                "pcontact": float('nan'),
-                "confidence_flag": False,
-                "high_precision_hit": False,
-                "neffoverL": coverage,
-            }
+            return self._scoreless(coverage)
         # logit(P at prior q) = log_lr + logit(q), so log_lr is the prevalence-free
         # part.  The cap applies because with 3984 labelled negatives no
         # likelihood ratio finer than 1/3984 can be demonstrated; only pcontact
@@ -907,6 +931,9 @@ class BuiltinPLMCalibrator(BaseCalibrator):
     """
 
     LOW_CUT = 0.8734290196703057
+    #: B <= 3 is score-less (see `Calibrate`); no gated pair of the screen has
+    #: B < 15, so no calibration, reference or benchmark score changes.
+    MIN_SEQUENCES = 4
 
     RANKER = {
         "features": ("frac_above_0", "max_cn_sq", "conc_entropy_10"),

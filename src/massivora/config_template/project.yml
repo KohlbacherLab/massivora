@@ -104,6 +104,10 @@ concatenate:
   downsample:
     enabled: true
     to: 30000
+    # seed of the draw (>= 0); with the pair's name it fixes the rows a pair
+    # with B > to keeps, so reruns reproduce. Only pairs concatenated here are
+    # downsampled: a stored pair alignment is used as stored.
+    seed: 0
   claim_batch_size: auto  # 'auto' or integer
 
 couple:
@@ -318,6 +322,10 @@ concatenate:
   downsample:
     enabled: true
     to: 30000
+    # seed of the draw (>= 0); with the pair's name it fixes the rows a pair
+    # with B > to keeps, so reruns reproduce. Only pairs concatenated here are
+    # downsampled: a stored pair alignment is used as stored.
+    seed: 0
   claim_batch_size: auto  # 'auto' or integer
 
 couple:

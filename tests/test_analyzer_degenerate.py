@@ -165,3 +165,116 @@ def test_recovery_of_a_dead_job_on_a_degenerate_pair(tmp_path, monkeypatch):
     assert (row['score_file_id'], row['score_offset'], row['score_len']) == location
     assert row['log_lr_raw'] is None and row['pcontact'] is None
     assert (row['job_id'], row['claimed_at']) == (None, None)
+
+
+# -- B <= 3 is score-less for plmDCA whatever the matrix holds ------------------
+#
+# On a real B <= 3 screen pair (Beff 1-2) the GPU optimiser's round-off decides
+# between an exactly-zero block (score-less above) and a near-constant ~1.5e-6
+# block, which normalises to all-equal values and log_lr_raw ~14, a top rank:
+# 15 of 40 real pairs did the latter (perf/benchmarks/p0). The rule on B makes
+# the outcome independent of the hardware.
+
+def _near_constant(value=1.4901161e-06):
+    """The block a B = 1 pair (O25243_HELPY-O25262_HELPY) got from the GPU."""
+    return np.full((L1 + L2, L1 + L2), value, dtype=np.float16)
+
+
+def test_near_constant_matrix_scores_high_without_the_rule():
+    """The hazard the rule removes: no exception, a finite top-rank score."""
+    result = BuiltinPLMCalibrator().Calibrate(_analyzer(_near_constant()), 1.0)
+    assert math.isfinite(result['log_lr_raw']) and result['log_lr_raw'] > 10
+
+
+@pytest.mark.parametrize('B', [1, 2, 3])
+@pytest.mark.parametrize('make', [_ordinary, _near_constant, _zeros])
+def test_plm_b_up_to_3_is_scoreless_whatever_the_matrix(B, make, caplog):
+    with caplog.at_level(logging.WARNING):
+        result = BuiltinPLMCalibrator().Calibrate(_analyzer(make()), 1.0, n_sequences=B)
+    assert math.isnan(result['log_lr_raw']) and math.isnan(result['pcontact'])
+    assert result['high_precision_hit'] is False and result['confidence_flag'] is False
+    assert result['neffoverL'] == pytest.approx(1.0 / (L1 + L2))
+    assert 'degenerate alignment' in caplog.text
+
+
+def test_plm_b_4_and_unknown_b_are_scored_as_before():
+    cal = BuiltinPLMCalibrator()
+    before = cal.Calibrate(_analyzer(_ordinary()), 100.0)
+    for B in (4, 30000, None):
+        assert cal.Calibrate(_analyzer(_ordinary()), 100.0, n_sequences=B) == before
+
+
+def test_gauss_ignores_b_so_the_screen_ranking_is_unchanged():
+    """GaussDCA's screen scores, the cascade's ranking, were computed without
+    the rule; the GaussDCA calibrator must keep scoring B <= 3 pairs."""
+    cal = BuiltinGaussCalibrator()
+    assert cal.MIN_SEQUENCES is None
+    before = cal.Calibrate(_analyzer(_ordinary()), 100.0)
+    assert math.isfinite(before['log_lr_raw'])
+    assert cal.Calibrate(_analyzer(_ordinary()), 100.0, n_sequences=2) == before
+
+
+@pytest.mark.parametrize('B, scored', [(1, False), (3, False), (4, True)])
+def test_collect_score_applies_the_rule_on_the_pairs_b(tmp_path, B, scored):
+    """Through the GPU plmDCA executor's `collect_score` and its DB write: a
+    near-constant score of a B <= 3 pair ends DONE with a NULL score."""
+    from test_msv import _couple_project, _couplings
+    from massivora.executors.couple import PLMCouplingExecutorGPU
+
+    cfg = _couple_project(tmp_path, n_pairs=0)
+    conn = sqlite3.connect(tmp_path / 'job.db')
+    conn.executemany('INSERT INTO alignments (pid, length) VALUES (?, ?)', [('A0', L1), ('B0', L2)])
+    conn.execute("INSERT INTO couplings (name, pid1, pid2, status) VALUES ('A0-B0', 'A0', 'B0', ?)",
+                 (STATUS['RUNNING'],))
+    conn.commit()
+    pair_id = conn.execute("SELECT id FROM couplings WHERE name = 'A0-B0'").fetchone()[0]
+    conn.close()
+
+    executor = PLMCouplingExecutorGPU(cfg)
+    try:
+        params = {'pair_id': pair_id, 'name': 'A0-B0', 'B': B, 'N': L1 + L2, 'Beff': 1.0,
+                  'file_hash': None, 'saved_columns': SAVED, 'lengthes': [L1, L2],
+                  'bitmask': saved_columns_to_bitmask(SAVED, [L1, L2])}
+        result = executor.collect_score(_near_constant(), dict(params))
+        executor._db_apply_results([result], [])
+        executor.db_conn.commit()
+    finally:
+        executor.close_db_connection()
+
+    row = _couplings(tmp_path)['A0-B0']
+    assert row['status'] == STATUS['DONE'] and row['number'] == B
+    assert (row['log_lr_raw'] is not None) is scored
+
+
+def test_recovery_applies_the_rule_with_the_stored_alignments_b(tmp_path, monkeypatch):
+    """`fix_zombie_tasks` recalibrates from the shard; with the stored pair
+    alignment it knows B and gives the same score-less row as the executor."""
+    pytest.importorskip('ost', exc_type=ImportError)
+    import importlib
+    import sys
+    importlib.import_module('massivora.massiveilance')
+    massiveilance = sys.modules['massivora.massiveilance']
+    from test_msv import _couple_project, _couplings
+    from test_shared_source import _monomer
+    from massivora.db import get_hashed_file_path
+    from massivora.utils import ShardWriter
+
+    cfg = _couple_project(tmp_path, n_pairs=0)
+    one_row = _monomer(np.ones((1, L1 + L2), dtype=np.int8), [])
+    one_row.saved_columns, one_row.lengthes = SAVED, [L1, L2]
+    one_row.To_Zarr(get_hashed_file_path('A0-B0', None, str(tmp_path / 'ecs'))[0], overwrite=True)
+    with ShardWriter(str(tmp_path / 'ecs'), 'couplings') as writer:
+        writer.append('A0-B0', _near_constant(), saved_columns_to_bitmask(SAVED, [L1, L2]))
+    conn = sqlite3.connect(tmp_path / 'job.db')
+    conn.executemany('INSERT INTO alignments (pid, length) VALUES (?, ?)', [('A0', L1), ('B0', L2)])
+    conn.execute(
+        'INSERT INTO couplings (name, pid1, pid2, status, job_id, claimed_at, effnumber) '
+        "VALUES ('A0-B0', 'A0', 'B0', ?, '999999', 1758000000.0, 1.0)", (STATUS['RUNNING'],))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(massiveilance, '_slurm_queuing_job_ids', lambda: [])
+
+    assert massiveilance.fix_zombie_tasks(cfg, 'couple') == 1
+    row = _couplings(tmp_path)['A0-B0']
+    assert row['status'] == STATUS['DONE'] and row['number'] == 1
+    assert row['log_lr_raw'] is None and row['pcontact'] is None

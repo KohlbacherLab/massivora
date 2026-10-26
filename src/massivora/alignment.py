@@ -21,6 +21,15 @@ from massivora.utils import (get_cuda_module, gpu_is_available,
 
 logger = logging.getLogger(__name__)
 
+
+def _downsample_rows(n_rows, to, seed=None):
+    """Row indices of a downsampling draw: row 0 (the query) and `to` - 1 of
+    rows 1..n_rows-1 drawn without replacement, ascending. `seed` is an int, a
+    sequence of ints, a `numpy.random.Generator` or None (unseeded)."""
+    rng = seed if isinstance(seed, np.random.Generator) else np.random.default_rng(seed)
+    drawn = np.sort(rng.choice(n_rows - 1, size=to - 1, replace=False) + 1)
+    return np.insert(drawn, 0, 0)
+
 # What the concatenation stages do with a shared-source pair
 SHARED_SOURCE_STRATEGIES = ('skip', 'fix')
 # Residue codes are 0..21 once lower case is folded onto upper case
@@ -968,20 +977,23 @@ class TextAlignment(MultipleSeqAlignment):
         logger.debug(f"Removed {len(drop)} shared-source sequences; {len(self)} left")
         return int(len(drop))
 
-    def Downsample_Randomly(self, to):
+    def Downsample_Randomly(self, to, seed=None):
         """
-        Downsample the alignment randomly to a lower size
+        Downsample the alignment randomly to a lower size: the query row and
+        `to` - 1 others drawn without replacement, kept in their original order
 
         Parameters
         ----------
         `to` — int
             The number of sequences to downsample to
+        `seed` — int, sequence of ints or `numpy.random.Generator` (optional)
+            Seed of the draw; the pipeline passes `utils.downsample_rng(seed,
+            pair name)`. None draws unseeded (not reproducible).
         """
         if to >= self.sequenceCount:
             logger.error(f"Downsampling to {to} is not possible, as the alignment has only {self.sequenceCount} sequences")
             return
-        chosen_indices = np.random.choice(range(1, self.sequenceCount), to-1, replace=False)
-        chosen_indices = np.insert(chosen_indices, 0, 0)
+        chosen_indices = _downsample_rows(self.sequenceCount, to, seed)
         chosen_records = [self._records[i] for i in chosen_indices]
         super().__init__(chosen_records)
         self._update_info()
@@ -1488,12 +1500,13 @@ class BinaryAlignment(object):
         self._pair_source = None                # runs of the reduced columns differ
         logger.info(f'Alignment reduced: {n_cols} -> {self.matrix.shape[1]} columns')
 
-    def Downsample_Randomly(self, to):
+    def Downsample_Randomly(self, to, seed=None):
+        """The query row and `to` - 1 others drawn without replacement, in their
+        original order; `seed` as in `TextAlignment.Downsample_Randomly`."""
         if to >= self.matrix.shape[0]:
             logger.error(f"Downsampling to {to} is not possible, as the alignment has only {self.matrix.shape[0]} sequences")
             return
-        chosen_indices = np.random.choice(range(1, self.matrix.shape[0]), to-1, replace=False)
-        chosen_indices = np.insert(chosen_indices, 0, 0)  # Ensure the first row is included
+        chosen_indices = _downsample_rows(self.matrix.shape[0], to, seed)
         self.matrix = self.matrix[chosen_indices]
         self._pair_source = None
 

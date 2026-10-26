@@ -16,7 +16,7 @@ from massivora.config import load_project_and_system_config
 from massivora.db import (STATUS, compute_file_hash, connect_db_rw,
                           get_hashed_file_path, get_table_names,
                           quote_identifier)
-from massivora.utils import (gpu_is_available, setup_logging,
+from massivora.utils import (DOWNSAMPLE_SEED, downsample_rng, gpu_is_available, setup_logging,
                              visible_gpu_devices, worker_id)
 
 
@@ -75,9 +75,14 @@ def _claim_batch(cfg, job_id, batch_size, table_name='couplings'):
 def _run_concatenate(task, monomers_path, output_dir, downsample=False,
                      downsample_to=30000, reweight=True, reweighting_threshold=0.8,
                      col_gap_threshold=0.5, n_threads=0, gpu_reweight=None,
-                     shared_source_strategy='skip', shared_source_cache=None):
+                     shared_source_strategy='skip', shared_source_cache=None,
+                     downsample_seed=DOWNSAMPLE_SEED):
     """
     Concatenate one pair of monomer alignments and write it to the output tree.
+
+    A pair with more than `downsample_to` rows keeps a draw seeded by
+    `downsample_seed` and its name (`utils.downsample_rng`), so it is the same
+    in every run.
 
     Reweighting runs in this process on `n_threads` threads, unless
     `gpu_reweight` is given: that callable hands the matrix to the GPU pool and
@@ -119,7 +124,8 @@ def _run_concatenate(task, monomers_path, output_dir, downsample=False,
             return {'name': name, 'status': STATUS['FAILED']}
 
         if downsample:
-            concatenated_align.Downsample_Randomly(to=downsample_to)
+            concatenated_align.Downsample_Randomly(to=downsample_to,
+                                                   seed=downsample_rng(downsample_seed, name))
         B, N = concatenated_align.matrix.shape
         if B == 0:
             logging.error(f"Pair '{name}' shares no species between {pid1} and {pid2}")
@@ -503,6 +509,7 @@ if __name__ == '__main__':
     down_cfg = concat_cfg.get('downsample') or {}
     downsample = bool(down_cfg.get('enabled', False))
     downsample_to = int(down_cfg.get('to', 30000))
+    downsample_seed = int(down_cfg.get('seed', DOWNSAMPLE_SEED))
     reweighting_cfg = concat_cfg.get('reweighting') or {}
     reweighting_enabled = bool(reweighting_cfg.get('enabled', True))
     reweighting_threshold = float(reweighting_cfg.get('threshold', 0.8))
@@ -558,6 +565,7 @@ if __name__ == '__main__':
     concat_opts = dict(
         downsample=downsample,
         downsample_to=downsample_to,
+        downsample_seed=downsample_seed,
         reweight=reweighting_enabled,
         reweighting_threshold=reweighting_threshold,
         col_gap_threshold=col_gap_threshold,
