@@ -15,9 +15,11 @@ from massivora.adaptive_cascade import (CostAwareThreshold, config, cost_s, cost
                                         simulate_costaware)
 from massivora.db import STATUS, adaptive_cascade_step, adaptive_mode, apply_cascade, create_job_db
 
+# the frozen finalist (the prototype's rule: s >= s*, cut_multiplier 1); the default
+# cut_multiplier 1.8 is tested explicitly
 FINALIST = dict(model='costaware', z=1.0, freeze_consecutive=3, freeze_rel_change=0.01, check_every=50,
                 start_fraction=0.5, target_recall=0.95, top_fraction=0.05, strata=20, tilt=3.0, tilt_above=0.4,
-                ridge=1.0)
+                ridge=1.0, cut_multiplier=1.0)
 
 
 def _population(n, seed=0):
@@ -148,10 +150,109 @@ def test_config_validation():
             costaware_config(dict(model='costaware', **bad))
     with pytest.raises(ValueError):
         config(dict(model='fast'))
+    # the frozen cut's multiplier: default 1.8, a finite number >= 1
+    assert costaware_config(dict(model='costaware'))['cut_multiplier'] == 1.8
+    assert costaware_config(dict(model='costaware', cut_multiplier=1))['cut_multiplier'] == 1.0
+    assert costaware_config(dict(model='costaware', cut_multiplier='2.5'))['cut_multiplier'] == 2.5
+    for bad in (0.99, 0, -1, float('nan'), float('inf'), True, 'x'):
+        with pytest.raises(ValueError):
+            costaware_config(dict(model='costaware', cut_multiplier=bad))
     # the batch mode keeps its keys and defaults
     c = config(dict(batch=40, explore_fraction=0.1))
     assert c['batch'] == 40 and c['stable_batches'] == 2 and 'model' not in c
     assert config(dict(model='batch', batch=30))['batch'] == 30
+
+
+def _frozen_estimate(n=12000, seed=8, m=1.8):
+    rank, N, B, nl, llr = _population(n, seed)
+    st = CostAwareThreshold(rank, cost_s(N, B), nl, N, B, dict(FINALIST, cut_multiplier=m))
+    obs = np.random.default_rng(seed).choice(n, 1500, replace=False)
+    return st, st.estimate(obs, llr[obs])
+
+
+def test_cut_multiplier_one_is_the_s_star_rule():
+    """m = 1 is the frozen rule bit for bit: every pair with s >= s*, in the
+    same order, whether the frozen t is passed or not; it is the configured
+    default only through cut_multiplier: 1."""
+    st, e = _frozen_estimate(m=1.0)
+    _, score = st.scores(e['beta'])
+    want = score >= e['s_star']
+    idx = np.flatnonzero(want)
+    for sel, order in (st.selection(e['beta'], e['s_star']), st.selection(e['beta'], e['s_star'], e['t']),
+                       _frozen_estimate(m=1.8)[0].selection(e['beta'], e['s_star'], e['t'], m=1)):
+        assert np.array_equal(sel, want)
+        assert np.array_equal(order, idx[np.argsort(-score[idx], kind='stable')])
+    assert int(want.sum()) == e['f'] == round(e['t'] * st.n)          # no ties at s* here
+    assert st.n_cut(e['t']) is None
+
+
+def test_cut_multiplier_takes_m_t_n_pairs_in_s_order():
+    st, e = _frozen_estimate(m=1.8)
+    n = st.n
+    _, score = st.scores(e['beta'])
+    k = min(n, round(1.8 * e['t'] * n))
+    assert 0 < e['t'] < 0.5 and k < n
+    sel, order = st.selection(e['beta'], e['s_star'], e['t'])
+    assert st.n_cut(e['t']) == k and int(sel.sum()) == k == len(order)
+    assert np.array_equal(order, np.argsort(-score, kind='stable')[:k])          # highest s first
+    assert np.all(np.diff(score[order]) <= 0) and score[sel].min() >= score[~sel].max()
+    assert sel[score >= e['s_star']].all()                    # a superset of the m = 1 selection
+    # the frozen t is needed for m != 1
+    with pytest.raises(ValueError, match='frozen t'):
+        st.selection(e['beta'], e['s_star'])
+    # m large enough: every gated pair
+    big = 1.0 / e['t'] + 1
+    sel, order = st.selection(e['beta'], e['s_star'], e['t'], m=big)
+    assert sel.all() and sorted(order) == list(range(n)) and st.n_cut(e['t'], big) == n
+
+
+def test_cut_multiplier_cut_contains_the_s_star_ties():
+    """Pairs tied at s* make the s >= s* set larger than t n; a cut multiplier
+    just above 1 still runs every one of them (the cut never runs fewer pairs
+    than cut_multiplier 1)."""
+    rank, N, B, nl, llr = (np.repeat(a, 4) for a in _population(3000, 8))     # every score four times
+    st = CostAwareThreshold(rank, cost_s(N, B), nl, N, B, dict(FINALIST, cut_multiplier=1.0001))
+    beta = st.initial_beta()
+    _, score = st.scores(beta)
+    o = np.argsort(-score, kind='stable')
+    j = int(np.flatnonzero(score[o][1:400] == score[o][:399])[0])           # o[j] ties with o[j + 1]
+    s_star, t = float(score[o[j]]), (j + 1) / st.n
+    ties = int((score >= s_star).sum())
+    assert ties > j + 1 == st.n_cut(t)
+    sel, order = st.selection(beta, s_star, t)
+    assert np.array_equal(sel, score >= s_star) and len(order) == ties
+    assert np.array_equal(order, o[:ties])
+    sel, order = st.selection(beta, s_star, t, m=1.8)
+    assert len(order) == max(ties, round(1.8 * t * st.n)) and sel[score >= s_star].all()
+
+
+@pytest.mark.parametrize('m', [1.0, 1.8])
+def test_simulation_runs_the_convergence_pairs_and_the_m_cut(m):
+    rank, N, B, nl, llr = _population(12000, 2)
+    cost = cost_s(N, B)
+    cfg = dict(FINALIST, seed=2, cut_multiplier=m)
+    run, hist, frozen = simulate_costaware(rank, cost, nl, N, B, llr, cfg)
+    run1, hist1, frozen1 = simulate_costaware(rank, cost, nl, N, B, llr, dict(cfg, cut_multiplier=1.0))
+    assert frozen is not None and hist == hist1                   # the multiplier never changes the estimates
+    st = CostAwareThreshold(rank, cost, nl, N, B, cfg)
+    _, score = st.scores(frozen['beta'])
+    conv = run1 & ~(score >= frozen['s_star'])
+    k = round(m * frozen['t'] * st.n)
+    top = np.zeros(st.n, bool)
+    top[np.argsort(-score, kind='stable')[:k]] = True
+    assert np.array_equal(run, (run1 | top) if m > 1 else run1)
+    assert not (conv & ~run).any() and run.sum() >= run1.sum()
+
+
+def test_fingerprint_changes_with_the_cut_multiplier():
+    import hashlib
+    from massivora.adaptive_cascade import COSTAWARE_RULE_KEYS
+    hs = {m: mdb._costaware_cfg_hash(costaware_config(dict(FINALIST, cut_multiplier=m))) for m in (1.0, 1.8, 2.0)}
+    assert len(set(hs.values())) == 3
+    # cut_multiplier 1: the fingerprint of a run started before the key existed
+    c = costaware_config(dict(FINALIST))
+    old = {k: c[k] for k in COSTAWARE_RULE_KEYS if k != 'cut_multiplier'}
+    assert hs[1.0] == hashlib.sha1(json.dumps(old, sort_keys=True).encode()).hexdigest()
 
 
 # -- DB driver -----------------------------------------------------------------------
@@ -305,9 +406,10 @@ def test_estimates_every_check_every_completed_pairs(project):
     assert adaptive_cascade_step(cfg)['estimates'] == 0
 
 
-def test_freezes_after_three_small_changes_then_stays_fixed(project):
+@pytest.mark.parametrize('m', [1.0, 1.8])
+def test_freezes_after_three_small_changes_then_stays_fixed(project, m):
     path, truth = project
-    cfg = _cfg(path)
+    cfg = _cfg(path, cut_multiplier=m)
     apply_cascade(cfg)
     step = _run_to_freeze(path, truth, cfg)
     log = _log(path)
@@ -349,21 +451,29 @@ def test_freezes_after_three_small_changes_then_stays_fixed(project):
     assert s['status'] == 'done'
     log2 = _log(path)
     assert len(log2) == len(log) and log2[-1]['t'] == frozen['t'] and log2[-1]['s_star'] == frozen['s_star']
-    # what ran: the convergence pairs plus every pair with s >= s*
-    sel, _ = model.selection(json.loads(frozen['beta']), frozen['s_star'])
+    # what ran: the convergence pairs plus the selection (m = 1: every pair with s >= s*;
+    # else the first round(m t n) pairs of the s order); the log records the cut
+    sel, order = model.selection(json.loads(frozen['beta']), frozen['s_star'], frozen['t'])
+    _, score = model.scores(json.loads(frozen['beta']))
     st = dict(c.execute("SELECT name, status FROM couplings"))
     done = {n for n, s_ in st.items() if s_ == STATUS['DONE']}
     rel = _released(path)
     conv = {n for _, _, n, r in rel if r == 'explore'}
     want = {pop['names'][i] for i in np.flatnonzero(sel)} | conv
     assert done == want
+    n = len(pop['names'])
     assert frozen['n_selected'] == int(sel.sum())
+    assert frozen['n_selected'] == (int((score >= frozen['s_star']).sum()) if m == 1 else round(m * frozen['t'] * n))
+    assert frozen['cut_multiplier'] == m and log[0]['cut_multiplier'] == m
+    assert frozen['s_cut'] == score[order[-1]] == score[sel].min()
+    assert (frozen['s_cut'] == frozen['s_star']) == (m == 1)
     assert len(done) < len(pop['names'])
 
 
-def test_release_after_freeze_is_highest_score_first(project):
+@pytest.mark.parametrize('m', [1.0, 1.8])
+def test_release_after_freeze_is_highest_score_first(project, m):
     path, truth = project
-    cfg = _cfg(path, release_block=97)
+    cfg = _cfg(path, release_block=97, cut_multiplier=m)
     apply_cascade(cfg)
     _run_to_freeze(path, truth, cfg)
     frozen = [r for r in _log(path) if r['frozen']][0]
@@ -382,12 +492,13 @@ def test_release_after_freeze_is_highest_score_first(project):
     s = score[[ix[n] for n in final]]
     assert len(final) > 97 and np.all(np.diff(s) <= 0)          # released in descending s
     assert all(len(b) <= 97 for b in blocks)
-    assert s.min() >= frozen['s_star']
+    assert s.min() >= frozen['s_cut'] and (s.min() >= frozen['s_star']) == (m == 1)
 
 
-def test_withdraws_unclaimed_convergence_pairs_below_s_star_at_freeze(project):
+@pytest.mark.parametrize('m', [1.0, 1.8])
+def test_withdraws_unclaimed_convergence_pairs_below_s_star_at_freeze(project, m):
     path, truth = project
-    cfg = _cfg(path, lead=400)
+    cfg = _cfg(path, lead=400, cut_multiplier=m)
     apply_cascade(cfg)
     for _ in range(400):
         _work(path, truth, limit=60)             # 60 of >= 400 claimable: many stay unclaimed
@@ -398,7 +509,7 @@ def test_withdraws_unclaimed_convergence_pairs_below_s_star_at_freeze(project):
     fr = [r for r in _log(path) if r['frozen']][0]
     assert fr['withdrawn'] > 0
     pop, model = _model(path, cfg)
-    sel, _ = model.selection(json.loads(fr['beta']), fr['s_star'])
+    sel, _ = model.selection(json.loads(fr['beta']), fr['s_star'], fr['t'])
     st = dict(_db(path).execute("SELECT name, status FROM couplings"))
     for _, _, n, role in _released(path):
         if role == 'explore' and st[n] == STATUS['NOOPT']:
@@ -412,7 +523,7 @@ def test_restart_reproduces_the_run(tmp_path):
     a.mkdir(), b.mkdir()
     truth = _make_project(a)
     _make_project(b)
-    cfg_a, cfg_b = _cfg(a), _cfg(b)
+    cfg_a, cfg_b = _cfg(a, cut_multiplier=1.8), _cfg(b, cut_multiplier=1.8)
     apply_cascade(cfg_a)
     _clear_caches()
     apply_cascade(cfg_b)
@@ -426,7 +537,8 @@ def test_restart_reproduces_the_run(tmp_path):
     _clear_caches()
     _run_to_freeze(b, truth, cfg_b, between=restart)
     la, lb = _log(a), _log(b)
-    keys = ('k', 'n_obs', 't', 's_star', 'theta', 'beta', 'streak', 'frozen', 'withdrawn', 'n_selected')
+    keys = ('k', 'n_obs', 't', 's_star', 'theta', 'beta', 'streak', 'frozen', 'withdrawn', 'n_selected',
+            'cut_multiplier', 's_cut')
     assert [[r[k] for k in keys] for r in la] == [[r[k] for k in keys] for r in lb]
     # after the freeze: restart between every step; the frozen state is read back, never recomputed
     for _ in range(100):
@@ -542,12 +654,13 @@ def test_rejects_keep_rule_and_unknown_keys(project):
         apply_cascade(cfg)
 
 
-def test_synchronous_driver_reproduces_the_block_stream_simulation(project):
+@pytest.mark.parametrize('m', [1.0, 1.8])
+def test_synchronous_driver_reproduces_the_block_stream_simulation(project, m):
     """The DB driver with a synchronous worker is simulate_costaware with the
     driver's per-block random streams, pair for pair; simulate_costaware with one
     stream is the prototype (test_prototype_parity)."""
     path, truth = project
-    cfg = _cfg(path)
+    cfg = _cfg(path, cut_multiplier=m)
     apply_cascade(cfg)
     _run_to_freeze(path, truth, cfg)
     pop, model = _model(path, cfg)
@@ -561,7 +674,7 @@ def test_synchronous_driver_reproduces_the_block_stream_simulation(project):
     assert np.allclose([r['s_star'] for r in est], [h['s_star'] for h in hist], rtol=1e-12)
     assert np.allclose(json.loads(est[-1]['beta']), frozen['beta'], rtol=1e-12, atol=1e-15)
     conv = np.isin(pop['names'], [n for _, _, n, r in _released(path) if r == 'explore'])
-    sel, _ = model.selection(json.loads(est[-1]['beta']), est[-1]['s_star'])
+    sel, _ = model.selection(json.loads(est[-1]['beta']), est[-1]['s_star'], est[-1]['t'])
     assert np.array_equal(conv | sel, run)
 
 
@@ -604,7 +717,8 @@ def test_refuses_a_changed_population_or_rule(project):
     adaptive_cascade_step(cfg)
     # operational keys may change between steps
     adaptive_cascade_step(_cfg(path, lead=80, release_block=500, running_timeout=1800))
-    for bad in (dict(seed=4), dict(z=1.645), dict(check_every=40), dict(tilt=2.0), dict(guard_hits_per_top=0)):
+    for bad in (dict(seed=4), dict(z=1.645), dict(check_every=40), dict(tilt=2.0), dict(guard_hits_per_top=0),
+                dict(cut_multiplier=1.8)):
         with pytest.raises(ValueError, match='configuration'):
             adaptive_cascade_step(_cfg(path, **bad))
     # the GaussDCA source gains a ranked, gated row: every rank behind it shifts
@@ -732,7 +846,7 @@ def test_concurrent_workers_step_and_claim_safely(project):
     fr = [r for r in est if r['frozen']]
     assert len(fr) == 1 and fr[0] is est[-1]
     pop, model = _model(path, cfg)
-    sel, _ = model.selection(json.loads(fr[0]['beta']), fr[0]['s_star'])
+    sel, _ = model.selection(json.loads(fr[0]['beta']), fr[0]['s_star'], fr[0]['t'])
     st = dict(c.execute("SELECT name, status FROM couplings"))
     rel = _released(path)
     assert all(st[n] == STATUS['DONE'] for _, _, n, _ in rel)

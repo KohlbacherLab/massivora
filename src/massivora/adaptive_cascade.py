@@ -34,7 +34,8 @@ score s = P(top call | features known before plmDCA) / expected seconds, a
 threshold t (share of the population with s >= s*) re-estimated after every
 `check_every` completed plmDCA pairs and frozen once it changes by less than
 `freeze_rel_change` on `freeze_consecutive` consecutive checks; then plmDCA runs
-on every pair with s >= s*, highest s first. Below `min_population` gated pairs
+on the cut_multiplier x t x n highest-s pairs, highest s first (cut_multiplier 1:
+every pair with s >= s*). Below `min_population` gated pairs
 the driver falls back to the batch mode (`small_population_mode: base`), and a
 hit-structure guard switches to it when detector hits are much denser than on
 the screen.
@@ -370,9 +371,20 @@ def cost_s(N, B):
 #      total (on a 4,001-point grid, refined inside the crossing interval);
 #      t = f / n.
 # Freeze: |t_k - t_(k-1)| < freeze_rel_change x t_(k-1) (or no change), t_0 =
-# start_fraction, on freeze_consecutive consecutive estimates. Then beta, theta
-# and s* are fixed and plmDCA runs on every unreleased pair with s >= s*,
-# highest s first.
+# start_fraction, on freeze_consecutive consecutive estimates. Then beta, theta,
+# s* and t are fixed and plmDCA runs on the first min(n, round(cut_multiplier x
+# t x n)) pairs of the frozen s order (stable argsort of -s; pairs already run
+# count towards them; never fewer than the pairs with s >= s*), highest s first;
+# cut_multiplier 1 keeps the rule as frozen, every pair with s >= s*.
+#
+# cut_multiplier (default 1.8): on the complete real 403-protein sub-interactome
+# (60,253 gated pairs) the frozen cut (cut_multiplier 1) kept 0.962 of the top
+# calls but only 0.819 of the detector hits; the share t that meets the top-call
+# target is too small for the hits. In 200 replays of this driver with the
+# complete reference as oracle, cut_multiplier 1.8 meets both recalls >= 0.95 in
+# 198/200 (1.7: 190, 2.0: 200) at 6.66 cost-model h against 3.22 h (1);
+# full-screen simulation (held-out reps 80-279): about 116 measured h against
+# 49 h (1) and 108 h for the batch mode (perf/day/verify/multiplier).
 #
 # Hit-structure guard: the rule targets top calls only. At every estimate before
 # the freeze, once guard_min_obs pairs are observed, r = HT detector hits / HT top
@@ -384,10 +396,12 @@ def cost_s(N, B):
 # sample.
 #
 # This is the frozen finalist of perf/day/adaptive/fast/costaware (costaware.py,
-# finalist.json: z = 1, m = 3); tests/fixtures/costaware_prototype.py is a copy
-# of that prototype and tests/test_cascade_costaware.py checks parity.
-# Evidence (simulation on 3,903 measured truth rows imputed to the screen's
-# 917,537 gated pairs, perf/day/adaptive/fast/validate): about 49 measured
+# finalist.json: z = 1, m = freeze_consecutive = 3, i.e. cut_multiplier 1);
+# tests/fixtures/costaware_prototype.py is a copy of that prototype and
+# tests/test_cascade_costaware.py checks parity.
+# Evidence for cut_multiplier 1 (simulation on 3,903 measured truth rows imputed
+# to the screen's 917,537 gated pairs, perf/day/adaptive/fast/validate; the
+# default 1.8 costs about 116 measured h there, see above): about 49 measured
 # plmDCA-h (41 h on this cost model; 56 h under iid imputation) against 108 h for
 # the batch mode, conditional on the truth sample's almost top-free tail (rank >=
 # 0.4: 1 top call in 838 rows); 3-6 % of the top calls in that tail cost +8 to
@@ -409,17 +423,21 @@ COSTAWARE_DEFAULTS = dict(model='costaware', start_fraction=0.5, check_every=50,
                           # driver: claimable convergence pairs kept released ahead of the
                           # estimate (None = check_every), pairs released per step after the
                           # freeze, seconds after which a claimed pair is reclaimed
-                          lead=None, release_block=1000, running_timeout=3600.0)
+                          lead=None, release_block=1000, running_timeout=3600.0,
+                          # the frozen cut runs the cut_multiplier x t x n highest-s pairs (1: s >= s*)
+                          cut_multiplier=1.8)
 COSTAWARE_KNOTS = (0.02, 0.06, 0.15, 0.3, 0.5)
 COSTAWARE_NEWTON = 6
 COSTAWARE_GRID = 4001
 SMALL_POPULATION_MODES = ('base', 'full')
 # keys that define the rule: a run refuses to continue when one of them changed
 # (lead, release_block and running_timeout are operational and may change; a
-# change of min_population / small_population_mode is caught by the mode check)
+# change of min_population / small_population_mode is caught by the mode check;
+# cut_multiplier enters the fingerprint only when it is not 1, so runs started
+# before the key existed keep their fingerprint with cut_multiplier: 1)
 COSTAWARE_RULE_KEYS = ('start_fraction', 'check_every', 'freeze_rel_change', 'freeze_consecutive', 'z',
                        'target_recall', 'top_fraction', 'strata', 'tilt', 'tilt_above', 'ridge', 'seed',
-                       'guard_hits_per_top', 'guard_min_obs')
+                       'guard_hits_per_top', 'guard_min_obs', 'cut_multiplier')
 
 
 def costaware_config(cfg=None):
@@ -442,6 +460,9 @@ def costaware_config(cfg=None):
     for k in ('tilt', 'running_timeout', 'ridge'):
         if not float(c[k]) > 0.0:
             raise ValueError(f"adaptive.{k} must be > 0, got {c[k]}")
+    if isinstance(c['cut_multiplier'], bool) or not float(c['cut_multiplier']) >= 1.0 \
+            or not math.isfinite(float(c['cut_multiplier'])):
+        raise ValueError(f"adaptive.cut_multiplier must be a finite number >= 1, got {c['cut_multiplier']}")
     for k in ('check_every', 'freeze_consecutive', 'strata', 'release_block'):
         if int(c[k]) != float(c[k]) or int(c[k]) < 1:
             raise ValueError(f"adaptive.{k} must be an integer >= 1, got {c[k]}")
@@ -460,7 +481,7 @@ def costaware_config(cfg=None):
               'guard_min_obs'):
         c[k] = int(c[k])
     for k in ('start_fraction', 'freeze_rel_change', 'target_recall', 'top_fraction', 'tilt_above', 'z', 'ridge',
-              'tilt', 'running_timeout', 'guard_hits_per_top'):
+              'tilt', 'running_timeout', 'guard_hits_per_top', 'cut_multiplier'):
         c[k] = float(c[k])
     return c
 
@@ -676,12 +697,33 @@ class CostAwareThreshold:
         hits = float((w[ix] * np.asarray(hit, bool)).sum())
         return hits / tops if tops > 0 else (0.0 if hits == 0 else math.inf)
 
-    def selection(self, beta, s_star):
-        """Mask of the pairs the frozen rule runs, and their order (highest s first)."""
+    def n_cut(self, t, m=None):
+        """Pairs the frozen rule runs with cut multiplier m (default: the
+        configured one) at the frozen t: min(n, round(m t n)); None for m = 1
+        (the rule is s >= s*)."""
+        m = self.c['cut_multiplier'] if m is None else float(m)
+        return None if m == 1.0 else int(min(self.n, round(m * float(t) * self.n)))
+
+    def selection(self, beta, s_star, t=None, m=None):
+        """Mask of the pairs the frozen rule runs, and their order (highest s
+        first). m (default: cut_multiplier) = 1: every pair with s >= s*; else the
+        first n_cut(t, m) pairs of the s order (stable argsort of -s, the order
+        the s >= s* path runs in), which needs the frozen t, and never fewer than
+        the pairs with s >= s* (ties at s* can make that set larger than t n), so
+        the cut always contains the m = 1 selection."""
+        m = self.c['cut_multiplier'] if m is None else float(m)
+        if m != 1.0 and t is None:
+            raise ValueError("CostAwareThreshold.selection: cut_multiplier != 1 needs the frozen t")
         _, score = self.scores(beta)
-        sel = score >= s_star
-        idx = np.flatnonzero(sel)
-        return sel, idx[np.argsort(-score[idx], kind='stable')]
+        k = self.n_cut(t, m)
+        if k is None:
+            sel = score >= s_star
+            idx = np.flatnonzero(sel)
+            return sel, idx[np.argsort(-score[idx], kind='stable')]
+        idx = np.argsort(-score, kind='stable')[:max(k, int((score >= s_star).sum()))]
+        sel = np.zeros(self.n, bool)
+        sel[idx] = True
+        return sel, idx
 
 
 def simulate_costaware(rank, cost, neffoverL, N, B, llr, cfg=None, streams='single'):
@@ -723,5 +765,5 @@ def simulate_costaware(rank, cost, neffoverL, N, B, llr, cfg=None, streams='sing
     rec = frozen or (hist[-1] if hist else None)
     run = released.copy()
     if rec is not None:
-        run |= st.selection(rec['beta'], rec['s_star'])[0]
+        run |= st.selection(rec['beta'], rec['s_star'], rec['t'])[0]
     return run, hist, frozen

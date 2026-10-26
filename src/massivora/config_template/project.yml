@@ -232,18 +232,21 @@ couple:
   # GaussDCA pairs itself and learns from their results where to stop.
   #   cascade: {source_db: gauss.sqlite3, min_neffoverL: 0.1,
   #             adaptive: {model: costaware}}
-  # model: costaware (recommended for screens): stratified random convergence
-  # batches, a score s = P(top-5 % plmDCA call | GaussDCA rank, N, B, Neff/L) /
+  # model: costaware (screens; with the default cut_multiplier 1.8 it costs
+  # about as much as the batch mode there, for higher hit recall): stratified
+  # random convergence batches, a score s = P(top-5 % plmDCA call | GaussDCA rank, N, B, Neff/L) /
   # expected GPU seconds, and a threshold t (share of the gated pairs with
   # s >= s*) re-estimated after every check_every finished pairs; frozen once t
   # changes by < freeze_rel_change on freeze_consecutive consecutive checks,
-  # then plmDCA runs on every pair with s >= s*, highest s first. Simulated on
-  # the H. pylori screen (917,537 gated pairs; 3,903 measured truth rows imputed):
-  # ~49 measured plmDCA-h (56 h under iid imputation; cost-model hours x ~1.21)
-  # against ~108 h for the batch mode, freeze after ~1,650 pairs -- provided the
-  # GaussDCA tail (rank >= 0.4) holds almost no top calls, as in the truth
-  # sample; 3-6 % of the top calls there would cost +8 to +38 h. Top-call recall
-  # >= 0.95 holds in about 95-98 % of runs, not always. The log's found /
+  # then plmDCA runs on the cut_multiplier x t x n highest-s pairs, highest s
+  # first (cut_multiplier 1: every pair with s >= s*). With cut_multiplier 1,
+  # simulated on the H. pylori screen (917,537 gated pairs; 3,903 measured truth
+  # rows imputed): ~49 measured plmDCA-h (56 h under iid imputation; cost-model
+  # hours x ~1.21) against ~108 h for the batch mode, freeze after ~1,650 pairs
+  # -- provided the GaussDCA tail (rank >= 0.4) holds almost no top calls, as in
+  # the truth sample; 3-6 % of the top calls there would cost +8 to +38 h. Top-call recall
+  # >= 0.95 holds in about 95-98 % of runs, not always (cut_multiplier 1.8:
+  # ~116 measured h on the screen; see cut_multiplier below). The log's found /
   # total_hat is NOT a run's recall (uncorrelated with it in simulation).
   # Below min_population gated pairs the convergence batches eat much of the set
   # and the finalist meets both recalls in only 92-96 % of runs for at most
@@ -271,6 +274,11 @@ couple:
   #     small_population_mode: base   # or full
   #     guard_hits_per_top: 0.3   # HT detector hits per top call (screen <= 0.26; 0: off)
   #     guard_min_obs: 500        # results before the guard is checked
+  #     cut_multiplier: 1.8       # run cut_multiplier x t x n pairs (>= 1). t alone meets
+  #                               # the top-call target but missed detector hits on the real 403-protein
+  #                               # sub-interactome (top 0.96, hits 0.82); 1.8 met both
+  #                               # >= 0.95 in 198/200 replays at ~2x the plmDCA hours
+  #                               # (screen simulation: ~116 h vs 49 h; batch mode 108 h)
   #     seed: 0
   #     lead: null                # claimable convergence pairs kept released (null: check_every)
   #     release_block: 1000       # claimable pairs kept released after the freeze

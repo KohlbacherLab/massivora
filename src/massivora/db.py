@@ -1206,7 +1206,9 @@ def reclaim_stale_claims(cur, table, timeout, released_only=False):
 #                         observed / released / in flight, t, s*, the relative
 #                         change, the consecutive passes, frozen, theta, beta and
 #                         the guard statistic; the frozen row also carries the
-#                         release pointer (final_next) into the frozen s order
+#                         effective cut (cut_multiplier, n_selected, s_cut = the
+#                         lowest selected s) and the release pointer (final_next)
+#                         into the frozen selection
 # Each step runs under BEGIN IMMEDIATE and is safe from any worker at any time:
 #   1. the population (names, ranks, depth features) and the rule's keys must
 #      match the k = 0 fingerprints, else the step refuses (ValueError);
@@ -1219,13 +1221,17 @@ def reclaim_stale_claims(cur, table, timeout, released_only=False):
 #      HT detector hits per HT top call exceed guard_hits_per_top switches the
 #      run to the batch mode (base_k2, log _GUARD_LOG), which continues from the
 #      convergence pairs as its exploration sample;
-#   5. on freeze, unclaimed convergence pairs with s < s* are withdrawn and the
-#      pairs with s >= s* are released, highest s first, release_block at a time;
+#   5. on freeze, unclaimed convergence pairs outside the selection are
+#      withdrawn and the selection is released, highest s first, release_block
+#      at a time; the selection is the first min(n, round(cut_multiplier x t x n))
+#      pairs of the frozen s order, never fewer than the pairs with s >= s*
+#      (cut_multiplier 1: every pair with s >= s*);
 #   6. otherwise blocks of check_every stratified random pairs are released
 #      until `lead` released pairs are claimable (pairs in flight count as
 #      processed: never drawn again, counted in the stratum allocation).
-# A frozen state is read back from the log (beta, s*, pointer), never recomputed
-# from new data, so a restarted worker carries on with the same selection.
+# A frozen state is read back from the log (beta, s*, t, cut_multiplier,
+# pointer), never recomputed from new data, so a restarted worker carries on with
+# the same selection.
 # Executors claim eagerly, so pairs in flight are bounded by each executor's
 # pipeline (about 200 per GPU worker), not by `lead`, and the withdrawal at the
 # freeze usually finds few unclaimed convergence pairs.
@@ -1245,14 +1251,16 @@ _COSTAWARE_DDL = (
     "t_prev REAL, rel_change REAL, check_ok INTEGER, streak INTEGER, frozen INTEGER, s_star REAL, "
     "theta REAL, found REAL, total_hat REAL, missed_hat REAL, beta TEXT, est_s REAL, released INTEGER, "
     "withdrawn INTEGER, reclaimed INTEGER, n_selected INTEGER, final_next INTEGER, reason TEXT, "
-    "pop_hash TEXT, cfg_hash TEXT, hit_density REAL, switched TEXT)",
+    "pop_hash TEXT, cfg_hash TEXT, hit_density REAL, switched TEXT, cut_multiplier REAL, s_cut REAL)",
 )
 _COSTAWARE_LOG_COLS = ('k', 'at', 'mode', 'n_pop', 'n_obs', 'n_released', 'n_inflight', 'n_failed', 't', 't_prev',
                        'rel_change', 'check_ok', 'streak', 'frozen', 's_star', 'theta', 'found', 'total_hat',
                        'missed_hat', 'beta', 'est_s', 'released', 'withdrawn', 'reclaimed', 'n_selected',
-                       'final_next', 'reason', 'pop_hash', 'cfg_hash', 'hit_density', 'switched')
+                       'final_next', 'reason', 'pop_hash', 'cfg_hash', 'hit_density', 'switched', 'cut_multiplier',
+                       's_cut')
 # columns added after the first cost-aware runs (ALTER TABLE on an older DB)
-_COSTAWARE_LOG_ADDED = (('pop_hash', 'TEXT'), ('cfg_hash', 'TEXT'), ('hit_density', 'REAL'), ('switched', 'TEXT'))
+_COSTAWARE_LOG_ADDED = (('pop_hash', 'TEXT'), ('cfg_hash', 'TEXT'), ('hit_density', 'REAL'), ('switched', 'TEXT'),
+                        ('cut_multiplier', 'REAL'), ('s_cut', 'REAL'))
 
 _COSTAWARE_CACHE = {}
 
@@ -1275,7 +1283,9 @@ def _costaware_model(pop, c):
 def _costaware_cfg_hash(c):
     import json
     from massivora.adaptive_cascade import COSTAWARE_RULE_KEYS
-    return hashlib.sha1(json.dumps({k: c[k] for k in COSTAWARE_RULE_KEYS}, sort_keys=True).encode()).hexdigest()
+    # cut_multiplier 1 is left out: the fingerprint of a run from before the key
+    rule = {k: c[k] for k in COSTAWARE_RULE_KEYS if not (k == 'cut_multiplier' and float(c[k]) == 1.0)}
+    return hashlib.sha1(json.dumps(rule, sort_keys=True).encode()).hexdigest()
 
 
 def _costaware_log(cur, row):
@@ -1318,13 +1328,15 @@ def _costaware_release_final(cur, table, ca, frozen, c):
     release_block released pairs are claimable. Returns (released, exhausted)."""
     import json
     model, names = ca['model'], ca['pop']['names']
-    okey = (frozen['beta'], frozen['s_star'], frozen['mode'])
+    # the frozen row's multiplier (none: a run frozen before the key, s >= s*)
+    m = 1.0 if frozen['cut_multiplier'] is None else float(frozen['cut_multiplier'])
+    okey = (frozen['beta'], frozen['s_star'], frozen['t'], m, frozen['mode'])
     order = ca['order'].get(okey)
     if order is None:
         if frozen['mode'] == 'full':
             order = model.order_rank
         else:
-            order = model.selection(json.loads(frozen['beta']), float(frozen['s_star']))[1]
+            order = model.selection(json.loads(frozen['beta']), float(frozen['s_star']), float(frozen['t']), m)[1]
         ca['order'] = {okey: order}
     ptr = int(frozen['final_next'] or 0)
     if ptr >= len(order):
@@ -1366,8 +1378,9 @@ def _costaware_check_run(cur, last0, pop, c, mode):
                          f"GaussDCA source before the plmDCA stage starts, or start a fresh plmDCA DB")
     if last0['cfg_hash'] != cfg_hash:
         raise ValueError("couple.cascade.adaptive: the cost-aware rule's configuration (seed, check_every, z, "
-                         "tilt, strata, guard, ...) changed since this run started; one run must keep one rule. "
-                         "Restore the configuration or start a fresh plmDCA DB")
+                         "tilt, strata, guard, cut_multiplier, ...) changed since this run started; one run must "
+                         "keep one rule. Restore the configuration (a run started before cut_multiplier existed "
+                         "needs cut_multiplier: 1) or start a fresh plmDCA DB")
 
 
 def _adaptive_costaware_step(cfg, c, pop, full=False):
@@ -1416,7 +1429,7 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
                         streak=0, frozen=int(full), beta=None, released=0, final_next=0,
                         s_star=-math.inf if full else None, n_selected=n if full else None,
                         reason='small population: every gated pair' if full else 'start',
-                        pop_hash=pop.get('hash'), cfg_hash=_costaware_cfg_hash(c))
+                        pop_hash=pop.get('hash'), cfg_hash=_costaware_cfg_hash(c), cut_multiplier=c['cut_multiplier'])
             _costaware_log(cur, last)
         else:
             cur.execute(f"SELECT {', '.join(_COSTAWARE_LOG_COLS)} FROM cascade_adaptive_log WHERE k = 0")
@@ -1504,7 +1517,8 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
                     row.update(switched='base', reason=f"guard: {density:.3f} detector hits per top call > "
                                                        f"{c['guard_hits_per_top']:g} (not screen-like): batch mode")
                 if frozen_now:
-                    sel = model.selection(est['beta'], est['s_star'])[0]
+                    sel, order = model.selection(est['beta'], est['s_star'], est['t'])
+                    _, score = model.scores(est['beta'])
                     out = [names[i] for i in unclaimed if not sel[i]]
                     if out:
                         cur.executemany(f"UPDATE {table} SET status = ? WHERE name = ? AND status = ? "
@@ -1514,7 +1528,8 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
                         for nm in out:
                             rel_m[index[nm]] = False
                     withdrawn = len(out)
-                    row.update(withdrawn=withdrawn, n_selected=int(sel.sum()))
+                    row.update(withdrawn=withdrawn, n_selected=int(sel.sum()), cut_multiplier=c['cut_multiplier'],
+                               s_cut=float(score[order[-1]]) if len(order) else math.inf)
                 _costaware_log(cur, row)
                 t_prev, beta = est['t'], est['beta']
                 n_est += 1
@@ -1561,8 +1576,11 @@ def _adaptive_costaware_step(cfg, c, pop, full=False):
     if n_est or released or withdrawn:
         logging.info(f"cascade.adaptive (costaware): {n} gated pairs; {n_est} estimate(s), last k = {last['k']}: "
                      f"t = {float(last['t']):.4f}, s* = {last['s_star']}, {last['n_obs']} observed; "
-                     + (f"FROZEN: released {released} (pairs with s >= s*, highest s first), withdrew {withdrawn}"
-                        if frozen else f"released {released} convergence pairs"))
+                     + (f"FROZEN: released {released} of the {last['n_selected']} selected pairs ("
+                        + ("every gated pair, rank order" if mode == 'full' else
+                           f"cut_multiplier {last['cut_multiplier'] or 1:g}, s >= "
+                           f"{last['s_star'] if last['s_cut'] is None else last['s_cut']}, highest s first")
+                        + f"), withdrew {withdrawn}" if frozen else f"released {released} convergence pairs"))
     if released:
         status = 'released'
     elif n_claimable:

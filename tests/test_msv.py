@@ -1437,7 +1437,7 @@ def test_gpu_executor_runs_a_costaware_cascade_to_the_end(tmp_path, couple, monk
     pop = mdb._adaptive_population(cfg, cfg['couple']['cascade'])
     model = CostAwareThreshold(pop['rank'], pop['cost'], pop['neffoverL'], pop['N'], pop['B'],
                                costaware_config(adaptive))
-    sel, _ = model.selection(json.loads(fr[0]['beta']), fr[0]['s_star'])
+    sel, _ = model.selection(json.loads(fr[0]['beta']), fr[0]['s_star'], fr[0]['t'])
     want = {pop['names'][i] for i in np.flatnonzero(sel)} | {nm for _, nm, r in released if r == 'explore'}
     assert {nm for nm, r in rows.items() if r['status'] == STATUS['DONE']} == want
     if len(want) - sum(r == 'explore' for _, _, r in released) > 7:
