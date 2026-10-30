@@ -25,7 +25,7 @@ from massivora.alignment import (BinaryAlignment, SharedSourceError,
                                  check_shared_source_strategy,
                                  resolve_shared_source)
 from massivora.config import load_project_and_system_config
-from massivora.db import (STATUS, compute_file_hash, connect_db_rw,
+from massivora.db import (STATUS, apply_cascade, compute_file_hash, connect_db_rw,
                           ensure_columns, get_db_path, get_hashed_file_path,
                           get_table_names, quote_identifier)
 from massivora.utils import (SHM_PREFIX, ShardWriter, compute_id_range,
@@ -103,6 +103,7 @@ class BaseCouplingExecutor(object):
         self.plm_opt_exe = None
 
         ensure_columns(self._config)
+        apply_cascade(self._config)
 
         # Maintain database connection for the lifetime of this executor
         self.db_conn = connect_db_rw(self._config)
@@ -1925,6 +1926,11 @@ class PLMCouplingExecutorGPU(SessionGPUExecutor, BuiltinPLMCalibrator):
             (config.get('align') or {}).get('col_gap_threshold', 0.5))
         # Upper bound on the sites a pair optimises in lockstep (plm_cuda.slots).
         self.site_batch = int(coupling_cfg.get('site_batch', 24))
+        # The GPU stops a site on ‖∇f‖∞ ≤ eps_g. eps_conv is NLopt's f/x
+        # tolerance on the CPU path, a different rule, so it is not reused.
+        self.eps_g = float(coupling_cfg.get('eps_g', 1e-3))
+        # fp16 L-BFGS history: 1.12x, an approximation (rounds the curvature pairs)
+        self.fp16_history = bool(coupling_cfg.get('fp16_history', False))
         # One Session per GPU, whatever couple.gpu_sessions (GaussDCA's) says:
         # one pair already saturates the GPU, so more Sessions only split its
         # L2 and bandwidth between them. Measured on an H100 over a
@@ -1961,8 +1967,11 @@ class PLMCouplingExecutorGPU(SessionGPUExecutor, BuiltinPLMCalibrator):
         columns = params.get('columns')
         if columns is not None:
             MSA = np.ascontiguousarray(MSA[:, columns])
-        return sess.score(MSA, W, params['q'], lambdaH=self.lambda_h, lambdaJ=self.lambda_J,
-                          maxeval=self.maxit, site_batch=params['site_batch'])
+        score = sess.score(MSA, W, params['q'], lambdaH=self.lambda_h, lambdaJ=self.lambda_J,
+                           maxeval=self.maxit, site_batch=params['site_batch'], eps_g=self.eps_g,
+                           fp16_history=self.fp16_history)
+        params['stats'] = getattr(sess, 'last_stats', None)     # logged by collect_score
+        return score
 
     @staticmethod
     def _kept_columns(align):
@@ -2018,6 +2027,11 @@ class PLMCouplingExecutorGPU(SessionGPUExecutor, BuiltinPLMCalibrator):
         return MSA, W, params
 
     def collect_score(self, score, params):
+        stats = params.get('stats')
+        if stats:
+            logging.debug(f"plmDCA GPU pair {params['pair_id']}: {stats['converged']} converged, "
+                          f"{stats['stalled']} stalled, {stats['max_iter']} max_iter, "
+                          f"{stats['ls_failed']} ls_failed")
         self._keep_gpu_weights(params)
         score = np.asarray(score).astype(np.float16)
         if self.fast_approximation:

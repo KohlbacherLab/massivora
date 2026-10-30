@@ -1,4 +1,6 @@
 import hashlib
+import logging
+import math
 import os
 import re
 import sqlite3
@@ -10,7 +12,9 @@ STATUS = {
     'RUNNING': 1,
     'PENDING': 2,
     'RETRYING': 3,
-    'FAILED': 4
+    'FAILED': 4,
+    # left out by couple.cascade; never claimed, terminal like DONE/FAILED
+    'SKIPPED': 5
 }
 
 
@@ -586,3 +590,90 @@ def create_job_db(cfg: dict):
     conn.commit()
     conn.close()
 
+
+
+# ORDER BY clauses `couple.cascade.rank_by` may choose from.
+# The 0.30 default keeps ~97 % of plmDCA's top-5 % calls on the he2021 benchmark
+# and H. pylori, at ~4.5x less screen compute; 0.16 keeps only ~90 % (8.3x).
+CASCADE_RANKS = {
+    'log_lr_raw': 'log_lr_raw DESC',
+    'high_precision_hit': 'high_precision_hit DESC, log_lr_raw DESC',
+}
+
+
+def apply_cascade(cfg: dict):
+    """
+    Restrict a coupling run to the best pairs of a finished GaussDCA run.
+
+    With `couple.cascade` set, only the `keep_fraction` best-ranked DONE pairs
+    of the source run stay claimable; every other pair the source scored is
+    marked SKIPPED. Pairs the source did not finish stay claimable, since
+    nothing ranks them. Only NOOPT and SKIPPED rows change, so running,
+    finished and retried pairs are left alone. Idempotent, and a larger
+    `keep_fraction` hands skipped pairs back, so every worker calls it at start.
+
+    Parameters
+    ----------
+    `cfg` — dict
+        Configuration dict. `couple.cascade` keys: `source_db` (SQLite file of
+        the GaussDCA run, relative to project_path; default this project's DB),
+        `source_table` (default `couple.db_table`), `keep_fraction` (default
+        0.30) and `rank_by` (a key of `CASCADE_RANKS`, default `log_lr_raw`)
+
+    Returns
+    -------
+    `tuple` or `None`
+        (pairs ranked, pairs kept, rows changed), or None without a cascade
+    """
+    cascade = (cfg.get('couple') or {}).get('cascade')
+    if not cascade:
+        return None
+    fraction = float(cascade.get('keep_fraction', 0.30))
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(f"couple.cascade.keep_fraction must be in (0, 1], got {fraction}")
+    rank_by = cascade.get('rank_by', 'log_lr_raw')
+    if rank_by not in CASCADE_RANKS:
+        raise ValueError(f"couple.cascade.rank_by must be one of {sorted(CASCADE_RANKS)}, got {rank_by!r}")
+
+    couple_table = get_table_names(cfg)['couplings']
+    source_table = cascade.get('source_table', couple_table)
+    source_cfg = dict(cfg)
+    if cascade.get('source_db'):
+        source_cfg['database'] = {**cfg['database'], 'filename': cascade['source_db']}
+    if (get_db_config(source_cfg).get('filename') == get_db_config(cfg).get('filename')
+            and source_table == couple_table):
+        raise ValueError("couple.cascade needs the GaussDCA run in another DB (source_db) "
+                         "or another table (source_table)")
+
+    src = connect_db_ro(source_cfg)
+    try:
+        cur = src.cursor()
+        cur.execute(
+            f"SELECT name FROM {quote_identifier(source_table)} WHERE status = ? "
+            f"ORDER BY {CASCADE_RANKS[rank_by]}, id",
+            (STATUS['DONE'],))
+        ranked = [row[0] for row in cur.fetchall()]
+    finally:
+        src.close()
+    n_keep = math.ceil(fraction * len(ranked))
+    skip = set(ranked[n_keep:])
+
+    table = quote_identifier(couple_table)
+    conn = connect_db_rw(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT id, name, status FROM {table} WHERE status IN (?, ?)",
+                    (STATUS['NOOPT'], STATUS['SKIPPED']))
+        changes = []
+        for pair_id, name, status in cur.fetchall():
+            new = STATUS['SKIPPED'] if name in skip else STATUS['NOOPT']
+            if new != status:
+                changes.append((new, pair_id, status))
+        # The status guard keeps a pair another worker claimed meanwhile
+        cur.executemany(f"UPDATE {table} SET status = ? WHERE id = ? AND status = ?", changes)
+        conn.commit()
+    finally:
+        conn.close()
+    logging.info(f"cascade: keeping {n_keep} of {len(ranked)} GaussDCA pairs from "
+                 f"{source_table} (top {fraction:g} by {rank_by}); {len(changes)} rows changed")
+    return len(ranked), n_keep, len(changes)

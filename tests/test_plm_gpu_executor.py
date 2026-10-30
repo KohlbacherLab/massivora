@@ -5,6 +5,7 @@ device, signals -- is covered in test_msv.py; these cover what plmDCA adds:
 its own loading and analysis, fitting a pair's site batch to the device
 budget, and reweighting on the GPU before the gap columns are dropped.
 """
+import logging
 import sys
 import types
 
@@ -31,10 +32,13 @@ def _fake_plm_cuda(couple, monkeypatch, free_mb=1024,
             self.device, self.l2_share = device, l2_share
             Session.made.append(self)
 
-        def score(self, MSA, W, q, lambdaH, lambdaJ, maxeval, site_batch):
+        last_stats = {'converged': 5, 'stalled': 1, 'max_iter': 2, 'ls_failed': 0}
+
+        def score(self, MSA, W, q, lambdaH, lambdaJ, maxeval, site_batch, eps_g, fp16_history):
             Session.calls.append({'B': MSA.shape[0], 'N': MSA.shape[1], 'q': q, 'W': W,
                                   'maxeval': maxeval, 'site_batch': site_batch,
-                                  'lambdas': (lambdaH, lambdaJ)})
+                                  'lambdas': (lambdaH, lambdaJ), 'eps_g': eps_g,
+                                  'fp16_history': fp16_history})
             return _symmetric(MSA.shape[1], seed=int(MSA[0, 0])).astype(np.float32)
 
         def neighbour_counts(self, MSA, identical_threshold):
@@ -98,9 +102,25 @@ def test_gpu_plmdca_threads_store_their_scores(tmp_path, couple, monkeypatch):
     assert [s.l2_share for s in fake.Session.made] == [1.0]
     for call in fake.Session.calls:
         assert call['site_batch'] == 24 and call['maxeval'] == 77
+        assert call['eps_g'] == 1e-3        # the stop rule before eps_g was configurable
+        assert call['fp16_history'] is False
         assert call['lambdas'] == pytest.approx((0.02, 0.03))
         assert call['W'].sum() == pytest.approx(1.0)       # the weights divided by Beff
     assert fake.Session.reweighted == []                    # the store had them
+
+
+def test_gpu_plmdca_takes_eps_g_and_logs_stop_reasons(tmp_path, couple, monkeypatch, caplog):
+    """couple.eps_g and couple.fp16_history reach the device; eps_conv (the CPU
+    path's NLopt tolerance) does not."""
+    cfg = _couple_project(tmp_path, n_pairs=2, gpu_workers=2, gpu_host_processes=0,
+                          eps_conv=3e-4, eps_g=5e-4, fp16_history=True)
+    _store_alignments(tmp_path, 2)
+    fake = _fake_plm_cuda(couple, monkeypatch)
+    with caplog.at_level(logging.DEBUG):
+        couple.PLMCouplingExecutorGPU(cfg).run()
+    assert [c['eps_g'] for c in fake.Session.calls] == [5e-4, 5e-4]
+    assert [c['fp16_history'] for c in fake.Session.calls] == [True, True]
+    assert caplog.text.count('5 converged, 1 stalled, 2 max_iter, 0 ls_failed') == 2
 
 
 def test_gpu_plmdca_halves_the_site_batch_to_fit_the_device(tmp_path, couple, monkeypatch):
