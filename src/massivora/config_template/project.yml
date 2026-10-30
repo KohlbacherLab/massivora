@@ -120,6 +120,11 @@ couple:
   gpu_host_processes: auto  # processes loading alignments and analysing scores; 'auto' or integer (0: in the coordinator)
   gpu_workers: 16  # pairs in flight; at least gpu_sessions x GPUs + gpu_host_processes
 
+  # Fused screen mode: skip the concatenate stage; the coupling stage then
+  # concatenates each pair in its host processes (gpu_host_processes) and, with
+  # keep_concatenated: false, couples it from memory without writing its zarr.
+  keep_concatenated: true
+
   # Cascade: couple only the best pairs of a finished GaussDCA run; the rest
   # are marked SKIPPED. Pairs the GaussDCA run did not finish are still coupled.
   # cascade:
