@@ -24,12 +24,13 @@ from dask.distributed import (Client, Nanny, Scheduler, SpecCluster,
 from massivora import cpp_bindings
 from massivora.alignment import (BinaryAlignment, SharedSourceError,
                                  check_shared_source_strategy,
-                                 resolve_shared_source)
+                                 resolve_run_table_cache, resolve_shared_source)
 from massivora.config import load_project_and_system_config
-from massivora.db import (STATUS, apply_cascade, compute_file_hash, connect_db_rw,
+from massivora.db import (STATUS, adaptive_cascade_step, adaptive_mode, apply_cascade, compute_file_hash,
+                          connect_db_rw, reclaim_stale_claims,
                           ensure_columns, get_db_path, get_hashed_file_path,
                           get_table_names, quote_identifier)
-from massivora.utils import (SHM_PREFIX, ShardWriter, compute_id_range,
+from massivora.utils import (DOWNSAMPLE_SEED, SHM_PREFIX, ShardWriter, compute_id_range, downsample_rng,
                              gpu_is_available, massivora_pkg_dir,
                              saved_columns_to_bitmask, setup_logging,
                              visible_gpu_devices, worker_id)
@@ -72,11 +73,20 @@ class BaseCouplingExecutor(object):
         down_cfg = config.get('concatenate').get('downsample')
         self.downsample = bool(down_cfg.get('enabled', False))
         self.downsample_to = int(down_cfg.get('to', 30000))
+        # Seed of the B-cap draw; with the pair's name it fixes the rows kept
+        self.downsample_seed = int(down_cfg.get('seed', DOWNSAMPLE_SEED))
         self.reweighting_threshold = float(
             config.get('concatenate').get('reweighting_threshold', 0.8))
         # What concatenate() does with a pair that glues a sequence to itself
         self.shared_source_strategy = check_shared_source_strategy(
             config.get('concatenate').get('shared-source_strategy', 'skip'))
+        # Where the monomers' shared-source run tables (built once per protein)
+        # are kept: 'auto' (default) under <project_path>/shared_source_cache,
+        # 'off' in memory per process, 'monomer' next to each monomer, or a
+        # directory (tmpfs on a ZFS host, say). The MSA tree is never written
+        # unless 'monomer' is asked for.
+        self.shared_source_cache = resolve_run_table_cache(
+            config.get('concatenate').get('shared-source_cache', 'auto'), project_path)
 
         coupling_cfg = config.get('couple')
         # False: pairs concatenated here are coupled from memory and not
@@ -115,6 +125,22 @@ class BaseCouplingExecutor(object):
 
         ensure_columns(self._config)
         apply_cascade(self._config)
+        # couple.cascade.adaptive with model: costaware re-estimates its threshold
+        # after every check_every finished pairs, so results are committed (and the
+        # threshold stepped) at least that often, not only when claims run dry.
+        mode = adaptive_mode(self._config)
+        self._adaptive_costaware = mode in ('costaware', 'full')
+        self._adaptive_check = (int(((coupling_cfg.get('cascade') or {}).get('adaptive') or {}).get('check_every') or 50)
+                                if self._adaptive_costaware else None)
+        # couple.claim_timeout (seconds, default off): claims older than this that
+        # never finished (a worker killed past its SIGTERM grace) are handed back
+        # at start and whenever a claim comes back empty.
+        ct = coupling_cfg.get('claim_timeout')
+        self._claim_timeout = float(ct) if ct is not None else None
+        if self._claim_timeout is not None:
+            if not self._claim_timeout > 0:
+                raise ValueError(f"couple.claim_timeout must be > 0 seconds, got {ct}")
+            self._reclaim_stale()
 
         # Maintain database connection for the lifetime of this executor
         self.db_conn = connect_db_rw(self._config)
@@ -161,9 +187,12 @@ class BaseCouplingExecutor(object):
             return BinaryAlignment(os.path.join(alignment_dir, pair_name))
         concatenated = _monomer(os.path.join(alignment_dir, pid1)) + \
             _monomer(os.path.join(alignment_dir, pid2))
-        resolve_shared_source(concatenated, self.shared_source_strategy, pair_name)
+        resolve_shared_source(concatenated, self.shared_source_strategy, pair_name,
+                              cache=getattr(self, 'shared_source_cache', None))
         if downsample:
-            concatenated.Downsample_Randomly(to=downsample_to)
+            seed = getattr(self, 'downsample_seed', DOWNSAMPLE_SEED)
+            concatenated.Downsample_Randomly(to=downsample_to,
+                                             seed=downsample_rng(seed, pair_name))
         concatenated.Mask_Gap_Columns(self._config.get('align').get('col_gap_threshold', 0.5))
         return concatenated
 
@@ -185,7 +214,115 @@ class BaseCouplingExecutor(object):
 
     # -- DB helpers --
 
+    def _reclaim_stale(self):
+        conn = connect_db_rw(self._config)
+        try:
+            n = reclaim_stale_claims(conn.cursor(), quote_identifier(self.couple_table), self._claim_timeout)
+            conn.commit()
+        finally:
+            conn.close()
+        return n
+
+    # step statuses after which there is something to claim
+    _ADAPTIVE_WORK = ('released', 'claimable')
+
+    def _adaptive_step(self):
+        """One couple.cascade.adaptive step. In the cost-aware mode a failing step
+        (e.g. 'database is locked' past the busy timeout, or a changed population)
+        is logged and returns None instead of ending the worker: results already
+        committed stay, the next step retries, and the claimed pairs are finished
+        or handed back as usual."""
+        if not getattr(self, '_adaptive_costaware', False):
+            return adaptive_cascade_step(self._config)
+        try:
+            step = adaptive_cascade_step(self._config)
+        except Exception:
+            logging.exception("couple.cascade.adaptive: the threshold step failed; committed results are kept "
+                              "and the next step retries")
+            self._adaptive_last = 'error'
+            return None
+        self._adaptive_last = step['status']
+        self._adaptive_report(step)
+        return step
+
+    def _adaptive_report(self, step):
+        """Say once why there is nothing to claim: the selection is complete, or
+        released pairs are still claimed (by other workers, or by a dead one)."""
+        status = step.get('status')
+        key = (status, step.get('claimed'))
+        if key == getattr(self, '_adaptive_reported', None):
+            return
+        if status == 'inflight':
+            self._adaptive_reported = key
+            own = 0
+            try:
+                own = self.db_conn.execute(
+                    f"SELECT COUNT(*) FROM {quote_identifier(self.couple_table)} WHERE job_id = ? AND status IN (?, ?)",
+                    (str(self.job_id), STATUS['RUNNING'], STATUS['RETRYING'])).fetchone()[0]
+            except Exception:
+                pass
+            others = int(step.get('claimed') or 0) - int(own)
+            if others <= 0:
+                logging.info(f"couple.cascade.adaptive: nothing new to claim; this worker finishes the {own} "
+                             f"pair(s) it holds")
+                return
+            age = step.get('oldest_claim_s')
+            rt = (((self._config.get('couple') or {}).get('cascade') or {}).get('adaptive') or {}).get(
+                'running_timeout', 3600)
+            logging.warning(f"couple.cascade.adaptive: nothing left to claim, but {others} released pair(s) are "
+                            f"claimed by other workers or by a worker that died (oldest claim {age or 0:.0f} s "
+                            f"ago); until they finish the run is NOT complete. Dead claims are handed back after "
+                            f"running_timeout ({float(rt):.0f} s; couple.claim_timeout if set) by the next step: "
+                            f"start a worker again after that to finish them.")
+        elif status in ('done', 'stopped'):
+            self._adaptive_reported = key
+            logging.info(f"couple.cascade.adaptive: selection complete ({step.get('mode', '')} {status}): every "
+                         f"released pair has finished")
+
+    def _adaptive_tick(self):
+        """model: costaware: step the threshold after results were committed (one
+        estimate per check_every new results; tops up the released pairs).
+        Returns the step's status ('error' if it failed), None if the mode is off."""
+        if not getattr(self, '_adaptive_costaware', False):
+            return None
+        self._adaptive_step()
+        return self._adaptive_last
+
+    def _adaptive_has_work(self):
+        """The last cost-aware step left pairs to claim (released, reclaimed, or
+        released by another worker)."""
+        return bool(getattr(self, '_adaptive_costaware', False)
+                    and getattr(self, '_adaptive_last', None) in self._ADAPTIVE_WORK)
+
+    def _commit_every(self, default):
+        if getattr(self, '_adaptive_costaware', False):
+            return max(1, min(int(default), int(self._adaptive_check)))
+        return int(default)
+
     def _claim_batch(self, job_id, batch_size, id_range=None):
+        rows = self._claim_batch_once(job_id, batch_size, id_range)
+        if not rows and int(batch_size) > 0 and getattr(self, '_claim_timeout', None) is not None:
+            if self._reclaim_stale():
+                rows = self._claim_batch_once(job_id, batch_size, id_range)
+        # couple.cascade.adaptive: an empty claim may mean the released batch is used
+        # up; re-estimate the threshold and either release the next batch or stop.
+        # A step that leaves pairs claimable without releasing new ones (stale claims
+        # handed back, another worker's release; the batch mode's 'wait') is claimed
+        # again too, a few times at most (pairs outside id_range stay unclaimable).
+        if not rows and int(batch_size) > 0 and ((self._config.get('couple') or {}).get('cascade') or {}).get('adaptive') is not None:
+            retries = 0
+            while retries < 4:
+                step = self._adaptive_step()
+                if step is None or step['status'] not in self._ADAPTIVE_WORK + ('wait',):
+                    break
+                if step['status'] != 'released':
+                    retries += 1
+                rows = self._claim_batch_once(job_id, batch_size, id_range)
+                if rows:
+                    break
+        return rows
+
+    def _claim_batch_once(self, job_id, batch_size, id_range=None):
         n = int(batch_size)
         if n <= 0:
             return []
@@ -219,16 +356,24 @@ class BaseCouplingExecutor(object):
                 params['start_id'] = start_id
                 params['end_id'] = end_id
 
+            # couple.cascade.adaptive, model costaware: claim in release order (the
+            # frozen selection runs highest s first); pairs it never released last.
+            if getattr(self, '_adaptive_costaware', False):
+                source, p, order = (f"{table} t LEFT JOIN cascade_adaptive a ON a.name = t.name", "t.",
+                                    "(a.seq IS NULL), a.seq, t.id")
+                where_range_sql = where_range_sql.replace(" id ", " t.id ")
+            else:
+                source, p, order = table, "", "id"
             # For couple job, status null is unclaimable
             cursor.execute(
                 f"""
                 WITH to_claim AS (
-                    SELECT id, status AS prev_status
-                    FROM {table}
-                    WHERE status IN (:noopt, :pending)
-                    AND claimed_at IS NULL
+                    SELECT {p}id AS id, {p}status AS prev_status
+                    FROM {source}
+                    WHERE {p}status IN (:noopt, :pending)
+                    AND {p}claimed_at IS NULL
                     {where_range_sql}
-                    ORDER BY id
+                    ORDER BY {order}
                     LIMIT :n
                 )
                 UPDATE {table}
@@ -715,9 +860,11 @@ class BaseCouplingExecutor(object):
 
         last_commit = float(time.time())
         terminating = False
+        no_more_to_claim = False
+        commit_every_tasks = self._commit_every(commit_every_tasks)
 
         def flush(force=False):
-            nonlocal done_updates, fail_ids, skipped_ids, last_commit
+            nonlocal done_updates, fail_ids, skipped_ids, last_commit, no_more_to_claim
             if not done_updates and not fail_ids and not skipped_ids:
                 return 0
 
@@ -733,6 +880,10 @@ class BaseCouplingExecutor(object):
             fail_ids = []
             skipped_ids = []
             last_commit = float(time.time())
+            if n and not terminating:
+                self._adaptive_tick()
+                if self._adaptive_has_work():
+                    no_more_to_claim = False
             return n
 
         def _on_term(signum, frame):
@@ -1039,7 +1190,7 @@ class PLMCouplingExecutor(BaseCouplingExecutor, BuiltinPLMCalibrator):
         analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
                                        chainA_length=params['lengthes'][0],
                                        EC_threshold=0)
-        calibrated = self.Calibrate(analyzer, params["Beff"])
+        calibrated = self.Calibrate(analyzer, params["Beff"], n_sequences=params["B"])
 
         result = {
             'id': params["pair_id"],
@@ -1488,6 +1639,12 @@ def _host_init(cls, state):
         os._exit(0)
 
     threading.Thread(target=leave_with_coordinator, daemon=True).start()
+    # The coordinator handles SIGTERM / SIGINT (finish what is on the GPUs, hand
+    # the rest back) and then shuts this pool down. A signal sent to the whole
+    # process group (Ctrl-C, coreutils `timeout`) must not kill the pairs this
+    # process is loading or analysing first.
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, signal.SIG_IGN)
 
 
 class PairArrays(object):
@@ -1608,6 +1765,19 @@ class SessionGPUExecutor(BaseCouplingExecutor):
     def collect_score(self, score, params):
         raise NotImplementedError
 
+    def _skipped_row(self, params):
+        """The DB row of a pair the stage loaded and reweighted but did not
+        score (`params['skipped']` says why): status SKIPPED, with its depth
+        (number, effnumber, neffoverL) and no score, so the cascade can
+        rank it as a pair below the gate and nothing claims it again."""
+        Beff, N = params.get('Beff'), int(params['N'])
+        return {'id': params['pair_id'], 'status': STATUS['SKIPPED'],
+                'effnumber': Beff, 'number': int(params['B']), 'length': N,
+                'pcontact': None, 'neffoverL': None if Beff is None else float(Beff) / N,
+                'log_lr_raw': None, 'confidence_flag': False, 'high_precision_hit': False,
+                'file_hash': params.get('file_hash'), 'score_file_id': None,
+                'score_offset': None, 'score_len': None}
+
     def _keep_gpu_weights(self, params):
         """A pair reweighted on the GPU: keep the weights with the stored
         alignment, where the CPU path's To_Zarr puts them, so a later run
@@ -1717,6 +1887,7 @@ class SessionGPUExecutor(BaseCouplingExecutor):
         work = queue.Queue(maxsize=self.gpu_workers * 2)
         # skipped: shared-source pairs, marked FAILED without a retry
         done_updates, fail_updates, released, skipped = [], [], [], []
+        skipped_by_stage = [0]              # pairs the stage left unscored (depth gate)
         lock = threading.Lock()
         # An illegal address and its like corrupt the context every session in
         # this process shares; from then on every pair would fail and spend its
@@ -1727,11 +1898,23 @@ class SessionGPUExecutor(BaseCouplingExecutor):
         halt = threading.Event()
         underestimated = threading.Event()
 
+        first_signal = []
+
         def on_signal(signum, frame):
-            halt.set()
             # A second signal gets the handler that was there before: it stops
-            # the job at once.
-            signal.signal(signum, previous_handlers.get(signum, signal.SIG_DFL))
+            # the job at once. Copies within a second are one signal: coreutils
+            # `timeout` (without --foreground) sends its signal to the job and
+            # again to its process group, and taking the copy as a second signal
+            # killed the job before it handed its claimed pairs back (they
+            # stayed RUNNING).
+            now = time.monotonic()
+            if first_signal:
+                if now - first_signal[0] > 1.0:
+                    signal.signal(signum, previous_handlers.get(signum, signal.SIG_DFL))
+                    os.kill(os.getpid(), signum)
+                return
+            first_signal.append(now)
+            halt.set()
             logging.warning(f"{self.GPU_LABEL}: received signal %d; finishing the pairs on the "
                             "GPUs and handing the rest back", signum)
 
@@ -1783,7 +1966,7 @@ class SessionGPUExecutor(BaseCouplingExecutor):
                 try:
                     if pair is None:
                         return
-                    score, spent = None, {}
+                    score, spent, params = None, {}, None
                     if not halt.is_set():
                         t0 = time.monotonic()
                         arrays, params = load(pair)
@@ -1793,6 +1976,14 @@ class SessionGPUExecutor(BaseCouplingExecutor):
                         finally:
                             arrays.release()
                     if score is None:
+                        if params is not None and params.get('skipped'):
+                            # The stage decided against scoring this pair
+                            # (a depth gate, say): DONE with its depth, no score
+                            with lock:
+                                done_updates.append(self._skipped_row(params))
+                                skipped_by_stage[0] += 1
+                            clock.add(**spent)
+                            continue
                         with lock:
                             released.append(pair['id'])
                         continue
@@ -1818,9 +2009,11 @@ class SessionGPUExecutor(BaseCouplingExecutor):
         for t in threads:
             t.start()
 
+        commit_every = self._commit_every(64)
+
         def flush(force=False):
             with lock:
-                if not force and len(done_updates) + len(fail_updates) + len(skipped) < 64:
+                if not force and len(done_updates) + len(fail_updates) + len(skipped) < commit_every:
                     return
                 # Scores behind these rows must be on disk before the rows are committed.
                 self._flush_scores()
@@ -1830,6 +2023,8 @@ class SessionGPUExecutor(BaseCouplingExecutor):
                 self._db_apply_results(d, f, s)
             if r:
                 self._db_unclaim(r)
+            if (d or f or s) and not halt.is_set():
+                self._adaptive_tick()
 
         try:
             while True:
@@ -1842,8 +2037,13 @@ class SessionGPUExecutor(BaseCouplingExecutor):
                 work.join()
                 with lock:
                     had_failures = bool(fail_updates)
+                self._adaptive_last = None
                 flush(force=True)
-                if halt.is_set() or not had_failures:
+                # model: costaware: the last commit may have left pairs to claim
+                # (the freeze, claims reclaimed after running_timeout, another
+                # worker's release)
+                more = self._adaptive_has_work()
+                if halt.is_set() or not (had_failures or more):
                     break
             for _ in threads:
                 work.put(None)
@@ -1858,6 +2058,9 @@ class SessionGPUExecutor(BaseCouplingExecutor):
             self.close_db_connection()
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
+        if skipped_by_stage[0]:
+            logging.info(f"{self.GPU_LABEL}: %d pairs left unscored by the stage (SKIPPED)",
+                         skipped_by_stage[0])
         if lost.is_set():
             raise RuntimeError(f"{self.GPU_LABEL}: the CUDA context was lost (see the first "
                                "DeviceLostError above); the pairs not yet run were handed "
@@ -1874,6 +2077,22 @@ class GaussCouplingExecutorGPU(SessionGPUExecutor, BuiltinGaussCalibrator):
         super().__init__(config)
         coupling_cfg = config.get('couple')
         self.pseudocount = float(coupling_cfg.get('pseudocount', 0.8))
+        # The cascade's depth gate (couple.cascade.min_neffoverL, applied by
+        # apply_cascade to the ranked pairs): a pair below it is never handed
+        # to plmDCA, so it is not worth a GaussDCA score either. Read here,
+        # applied after reweighting (_run_on_session); None keeps every pair.
+        self.min_neffoverL = self._depth_gate(coupling_cfg)
+
+    @staticmethod
+    def _depth_gate(coupling_cfg):
+        cascade = coupling_cfg.get('cascade') or {}
+        gate = cascade.get('min_neffoverL') if isinstance(cascade, dict) else None
+        if gate is None or (isinstance(gate, str) and gate.strip().lower() in ('', 'null', 'none')):
+            return None
+        gate = float(gate)
+        if gate < 0:
+            raise ValueError(f"couple.cascade.min_neffoverL must be >= 0, got {gate}")
+        return gate
 
     def _gpu_module(self):
         from massivora.cpp_bindings import gauss_cuda
@@ -1891,6 +2110,13 @@ class GaussCouplingExecutorGPU(SessionGPUExecutor, BuiltinGaussCalibrator):
             W = 1.0 / m.astype(np.int64)        # exactly as Reweight_Sequence
             params['Beff'] = float(W.sum())
             params['weights'] = W
+        if self.min_neffoverL is not None:
+            neff_over_L = params['Beff'] / params['N']
+            if neff_over_L < self.min_neffoverL:
+                params['skipped'] = (f"Neff/L {neff_over_L:.3f} below "
+                                     f"couple.cascade.min_neffoverL {self.min_neffoverL:g}")
+                params.pop('weights', None)
+                return None
         return sess.score(MSA, W, q=params['q'], pseudocount=self.pseudocount)
 
     def load_pair_arrays(self, pair, **kwargs):
@@ -2055,7 +2281,7 @@ class PLMCouplingExecutorGPU(SessionGPUExecutor, BuiltinPLMCalibrator):
         analyzer = ComplexAnalyzer(score, saved_columns=params['saved_columns'],
                                    chainA_length=params['lengthes'][0],
                                    EC_threshold=0)
-        calibrated = self.Calibrate(analyzer, params["Beff"])
+        calibrated = self.Calibrate(analyzer, params["Beff"], n_sequences=params["B"])
         return {
             'id': params['pair_id'],
             'effnumber': params['Beff'],

@@ -1,4 +1,5 @@
 import fcntl
+import hashlib
 import importlib
 import logging
 import mmap
@@ -17,6 +18,23 @@ import numpy as np
 # definition. The C++ optimizer applies the same prefix in
 # bindings_src/plm_opt_site.cpp and must be kept in sync with this value.
 SHM_PREFIX = "Massivora_"
+
+#: Default of concatenate.downsample.seed, the seed of the B-cap draw.
+DOWNSAMPLE_SEED = 0
+
+
+def downsample_rng(seed, pair_name):
+    """The random generator of one pair's downsampling draw (B > downsample.to).
+
+    Fixed by the configured seed and the pair's name alone, so a pair keeps the
+    same rows whichever process, worker order or machine concatenates it; the
+    name enters through sha256 because Python's hash() is salted per process.
+    """
+    seed = int(seed)
+    if seed < 0:
+        raise ValueError(f"concatenate.downsample.seed must be >= 0, not {seed}")
+    words = struct.unpack('<4I', hashlib.sha256(str(pair_name).encode()).digest()[:16])
+    return np.random.default_rng([seed, *words])
 
 
 def massivora_pkg_dir():

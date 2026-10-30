@@ -468,7 +468,7 @@ def _coupling_result_info(output_dir, couple_table, row, location, calibrator):
         from massivora.analyzer import ComplexAnalyzer
         analyzer = ComplexAnalyzer(score, saved_columns=record['saved_columns'],
                                    chainA_length=record['lengthes'][0], EC_threshold=0)
-        calibrated = calibrator.Calibrate(analyzer, float(n_eff))
+        calibrated = calibrator.Calibrate(analyzer, float(n_eff), n_sequences=number)
     except Exception as e:
         logging.warning(f"massiveilance on {WORKER_NAME}: cannot calibrate '{row['name']}' "
                         f"from its score record: {e}")
@@ -601,7 +601,13 @@ def fix_zombie_tasks(cfg, command):
                 new_status = STATUS['DONE']
                 # Backfill any metric the executor never got to write (its
                 # completion update was lost), leaving present values untouched.
+                # A calibrator key that is not a selected column is ignored
+                # rather than raising IndexError and aborting the recovery.
+                selected = set(r.keys())
                 for col, val in result.items():
+                    if col not in selected:
+                        logging.debug(f"zombie recovery: ignoring {col!r}, not a task column")
+                        continue
                     if val is not None and r[col] is None:
                         set_clauses.append(f"{col} = ?")
                         values.append(val)
